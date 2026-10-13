@@ -22,7 +22,7 @@ hmac = "0.13"
 globset = "0.4.20"
 keyring = "4.2.0"
 mongodb = "3.9.1"
-nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "hostname"] }
+nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "hostname", "socket", "uio"] }
 percent-encoding = "2.3.2"
 rand = { version = "0.10", default-features = false, features = ["std"] }
 redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager"] }

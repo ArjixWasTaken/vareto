@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use crate::ipc::{Client, Request, VERSION};
+use crate::ipc::{Client, Request, PROTOCOL, VERSION};
 use crate::paths;
 
 pub struct Daemon {
@@ -26,8 +26,9 @@ impl Daemon {
             }
         };
         let hello = client.call(&self.hello()).await?;
-        if hello["compatible"].as_bool() != Some(true) {
-            tracing::info!("daemon version {} != {VERSION}; restarting it", hello["version"]);
+        // A daemon from before `protocol` existed doesn't report one.
+        if hello["compatible"].as_bool() != Some(true) || hello["protocol"].as_u64() != Some(PROTOCOL.into()) {
+            tracing::info!("daemon version {} (protocol {}) != {VERSION} (protocol {PROTOCOL}); restarting it", hello["version"], hello["protocol"]);
             client.call(&Request::Shutdown).await.ok();
             for _ in 0..50 {
                 if Client::connect(&sock).await.is_err() {

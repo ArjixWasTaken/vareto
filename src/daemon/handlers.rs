@@ -15,7 +15,8 @@ use crate::render::{ExportWriter, Output, Sink};
 /// Hard cap on rows returned to the model in one response.
 const MAX_ROW_LIMIT: usize = 5_000;
 
-pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bool) -> Result<Value> {
+pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bool, fd: Option<std::os::fd::OwnedFd>) -> Result<Value> {
+    let _ = &fd;
     match req {
         Request::Status => status(state).await,
         Request::ListConnections => list_connections(state, force_readonly).await,

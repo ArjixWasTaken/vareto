@@ -1,16 +1,29 @@
 //! Daemon protocol: one length-delimited JSON request, one response, per frame.
+//! A request that streams data (COPY, LOAD DATA, exports) carries an open file
+//! descriptor with its frame (`SCM_RIGHTS`), so the data itself never crosses the
+//! socket: the daemon reads or writes the CLI's file, pipe or terminal directly.
 
+use std::collections::VecDeque;
+use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{ready, Context as TaskContext, Poll};
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, Interest, ReadBuf};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 pub const VERSION: &str = env!("VARETO_VERSION");
+/// Bumped when requests change incompatibly; a daemon answering `Hello` with another
+/// protocol (or none) is restarted, even when its version string matches.
+pub const PROTOCOL: u32 = 2;
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +65,18 @@ pub enum Request {
     /// Cancel the query a session is running. Sent on a second socket, since the
     /// session's own socket is waiting for that query.
     SessionCancel { session: u64 },
+}
+
+impl Request {
+    /// Requests sent with a file descriptor ([`send_with_fd`]).
+    pub fn takes_fd(&self) -> bool {
+        false
+    }
+
+    /// The request's `op` name, for messages.
+    pub fn op(&self) -> String {
+        serde_json::to_value(self).ok().and_then(|v| v["op"].as_str().map(str::to_string)).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,15 +233,129 @@ pub enum ExportFormat {
     Jsonl,
 }
 
-pub type Conn = Framed<UnixStream, LengthDelimitedCodec>;
+/// A unix stream that receives file descriptors along with its bytes. Every read goes
+/// through `recvmsg`: a plain `read` would silently drop descriptors attached to
+/// the bytes it returns. Received descriptors queue up until a request takes them.
+pub struct FdStream {
+    inner: UnixStream,
+    fds: Arc<Mutex<VecDeque<OwnedFd>>>,
+}
+
+impl FdStream {
+    /// The oldest descriptor received and not yet taken.
+    pub fn take_fd(&self) -> Option<OwnedFd> {
+        self.fds.lock().unwrap().pop_front()
+    }
+
+    /// Close descriptors nobody asked for.
+    pub fn drop_fds(&self) {
+        self.fds.lock().unwrap().clear();
+    }
+}
+
+/// At most this many descriptors per message (requests send one).
+const MAX_FDS: usize = 4;
+
+fn recv_with_fds(fd: RawFd, buf: &mut [u8], queue: &Mutex<VecDeque<OwnedFd>>) -> io::Result<usize> {
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+    let mut cmsg = nix::cmsg_space!([RawFd; MAX_FDS]);
+    let mut iov = [io::IoSliceMut::new(buf)];
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    let flags = MsgFlags::MSG_CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    let flags = MsgFlags::empty();
+    let msg = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg), flags).map_err(io::Error::from)?;
+    let mut q = queue.lock().unwrap();
+    for c in msg.cmsgs().map_err(io::Error::from)? {
+        if let ControlMessageOwned::ScmRights(fds) = c {
+            for f in fds {
+                // SAFETY: the kernel just installed `f` in this process for us.
+                let owned = unsafe { OwnedFd::from_raw_fd(f) };
+                #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+                nix::fcntl::fcntl(&owned, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC)).ok();
+                q.push_back(owned);
+            }
+        }
+    }
+    Ok(msg.bytes)
+}
+
+impl AsyncRead for FdStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            ready!(this.inner.poll_read_ready(cx))?;
+            let fd = this.inner.as_raw_fd();
+            let queue = &this.fds;
+            let unfilled = buf.initialize_unfilled();
+            match this.inner.try_io(Interest::READABLE, || recv_with_fds(fd, unfilled, queue)) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for FdStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+pub type Conn = Framed<FdStream, LengthDelimitedCodec>;
 
 pub fn framed(stream: UnixStream) -> Conn {
     let codec = LengthDelimitedCodec::builder().max_frame_length(MAX_FRAME).new_codec();
-    Framed::new(stream, codec)
+    Framed::new(FdStream { inner: stream, fds: Arc::default() }, codec)
 }
 
 pub async fn send<T: Serialize>(conn: &mut Conn, msg: &T) -> Result<()> {
     conn.send(bytes::Bytes::from(serde_json::to_vec(msg)?)).await?;
+    Ok(())
+}
+
+/// [`send`], with `fd` attached to the frame's first bytes. The receiver gets its
+/// own descriptor for the same open file; the caller may close `fd` afterwards.
+pub async fn send_with_fd<T: Serialize>(conn: &mut Conn, msg: &T, fd: BorrowedFd<'_>) -> Result<()> {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    // Whatever Framed buffered must go first, or the frames would interleave.
+    SinkExt::<bytes::Bytes>::flush(conn).await?;
+    let body = serde_json::to_vec(msg)?;
+    if body.len() > MAX_FRAME {
+        bail!("message too large");
+    }
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    let stream = &mut conn.get_mut().inner;
+    let fds = [fd.as_raw_fd()];
+    let sent = loop {
+        stream.writable().await?;
+        let raw = stream.as_raw_fd();
+        let res = stream.try_io(Interest::WRITABLE, || {
+            sendmsg::<()>(raw, &[io::IoSlice::new(&frame)], &[ControlMessage::ScmRights(&fds)], MsgFlags::empty(), None)
+                .map_err(io::Error::from)
+        });
+        match res {
+            Ok(n) => break n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    // The descriptor went with the first bytes; the rest is ordinary data.
+    stream.write_all(&frame[sent..]).await?;
     Ok(())
 }
 
@@ -240,10 +379,52 @@ impl Client {
 
     pub async fn call(&mut self, req: &Request) -> Result<Value> {
         send(&mut self.conn, req).await?;
+        self.response().await
+    }
+
+    /// [`Self::call`] for a request that takes a file descriptor ([`Request::takes_fd`]).
+    pub async fn call_with_fd(&mut self, req: &Request, fd: BorrowedFd<'_>) -> Result<Value> {
+        send_with_fd(&mut self.conn, req, fd).await?;
+        self.response().await
+    }
+
+    async fn response(&mut self) -> Result<Value> {
         match recv::<Response>(&mut self.conn).await? {
             Some(Response::Ok { result }) => Ok(result),
             Some(Response::Err { error, info }) => Err(ServerError { message: error, info }.into()),
             None => bail!("daemon closed the connection"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsFd as _;
+
+    #[tokio::test]
+    async fn descriptor_rides_with_its_frame() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (mut tx, mut rx) = (framed(a), framed(b));
+        let (pipe_r, pipe_w) = nix::unistd::pipe().unwrap();
+
+        send(&mut tx, &"before").await.unwrap();
+        assert_eq!(recv::<String>(&mut rx).await.unwrap().as_deref(), Some("before"));
+        assert!(rx.get_ref().take_fd().is_none());
+
+        send_with_fd(&mut tx, &"with fd", pipe_w.as_fd()).await.unwrap();
+        drop(pipe_w);
+        assert_eq!(recv::<String>(&mut rx).await.unwrap().as_deref(), Some("with fd"));
+        let fd = rx.get_ref().take_fd().expect("descriptor received");
+        // The receiver writes into the sender's pipe.
+        std::fs::File::from(fd).write_all(b"hello").unwrap();
+        let mut got = String::new();
+        std::fs::File::from(pipe_r).read_to_string(&mut got).unwrap();
+        assert_eq!(got, "hello");
+
+        send(&mut tx, &"after").await.unwrap();
+        assert_eq!(recv::<String>(&mut rx).await.unwrap().as_deref(), Some("after"));
+        assert!(rx.get_ref().take_fd().is_none());
     }
 }
