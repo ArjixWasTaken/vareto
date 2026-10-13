@@ -31,6 +31,17 @@ pub enum Request {
     ListDatabases { connection: String },
     ListTables { connection: String, database: Option<String>, pattern: Option<String> },
     DescribeTable { connection: String, database: Option<String>, table: String },
+    /// Pin a dedicated connection for an interactive shell. Sessions belong to the
+    /// socket that opened them and close with it.
+    SessionOpen { connection: String, #[serde(default)] database: Option<String> },
+    SessionQuery { session: u64, query: QuerySpec, #[serde(default)] limit: Option<usize> },
+    /// Switch the session's database (Postgres reconnects, MySQL `USE`, Mongo's
+    /// current db, Redis `SELECT`).
+    SessionUse { session: u64, database: String },
+    SessionClose { session: u64 },
+    /// Cancel the query a session is running. Sent on a second socket, since the
+    /// session's own socket is waiting for that query.
+    SessionCancel { session: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

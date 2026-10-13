@@ -183,6 +183,11 @@ impl Mongo {
         Ok(())
     }
 
+    pub async fn server_version(&self) -> Result<String> {
+        let info = self.client.database("admin").run_command(doc! { "buildInfo": 1 }).await?;
+        Ok(info.get_str("version")?.to_string())
+    }
+
     pub async fn list_databases(&self) -> Result<Output> {
         let names = self.client.list_database_names().await?;
         Ok(Output::Value(json!(names)))

@@ -10,7 +10,7 @@ use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
-use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Either, Executor, Row, TypeInfo, ValueRef};
+use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Connection as _, Either, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{Connection, Kind};
 use crate::render::{Collector, Column, Output, Sink};
@@ -209,42 +209,39 @@ impl SqlPool {
     /// the server (statement_timeout / max_execution_time) and locally. In read-only
     /// mode it runs inside a READ ONLY transaction that is always rolled back.
     pub async fn stream(&self, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Duration) -> Result<()> {
-        let ms = timeout.as_millis();
         let fut = async {
             match self {
-                SqlPool::Postgres(pool) => {
-                    let affected = |r: &sqlx::postgres::PgQueryResult| r.rows_affected();
-                    if readonly {
-                        let mut tx = pool.begin_with("BEGIN READ ONLY").await?;
-                        sqlx::raw_sql(AssertSqlSafe(format!("SET LOCAL statement_timeout = {ms}"))).execute(&mut *tx).await?;
-                        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
-                        tx.rollback().await.ok();
-                        out
-                    } else {
-                        let mut c = pool.acquire().await?;
-                        sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {ms}"))).execute(&mut *c).await?;
-                        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
-                    }
-                }
-                SqlPool::Mysql(pool) => {
-                    let affected = |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected();
-                    if readonly {
-                        let mut tx = pool.begin_with("START TRANSACTION READ ONLY").await?;
-                        sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(&mut *tx).await.ok();
-                        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
-                        tx.rollback().await.ok();
-                        out
-                    } else {
-                        let mut c = pool.acquire().await?;
-                        sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(&mut *c).await.ok();
-                        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
-                    }
-                }
+                SqlPool::Postgres(pool) => pg_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout)).await,
+                SqlPool::Mysql(pool) => mysql_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout)).await,
             }
         };
         tokio::time::timeout(timeout + Duration::from_secs(5), fut)
             .await
             .map_err(|_| anyhow::anyhow!("query timed out after {}s", timeout.as_secs()))?
+    }
+
+    /// A dedicated connection taken out of the pool (for an interactive session).
+    /// The statement timeout is set once, at the session level.
+    pub async fn detach(&self, timeout: Duration) -> Result<SqlConn> {
+        let mut c = match self {
+            SqlPool::Postgres(pool) => SqlConn::Postgres(pool.acquire().await?.detach()),
+            SqlPool::Mysql(pool) => SqlConn::Mysql(pool.acquire().await?.detach()),
+        };
+        c.set_timeout(timeout).await?;
+        Ok(c)
+    }
+
+    /// A new dedicated Postgres connection to another database (psql `\c`).
+    pub async fn connect_database(&self, database: &str, timeout: Duration) -> Result<SqlConn> {
+        let mut c = match self {
+            SqlPool::Postgres(pool) => {
+                let opts = (*pool.connect_options()).clone().database(database);
+                SqlConn::Postgres(sqlx::PgConnection::connect_with(&opts).await.with_context(|| format!("connecting to database {database:?}"))?)
+            }
+            SqlPool::Mysql(_) => bail!("MySQL switches databases with USE"),
+        };
+        c.set_timeout(timeout).await?;
+        Ok(c)
     }
 
     pub async fn close(&self) {
@@ -342,6 +339,105 @@ impl SqlPool {
             "indexes": idx.to_json(10_000),
             "foreign_keys": fks.to_json(10_000),
         }))
+    }
+}
+
+async fn pg_stream(c: &mut sqlx::PgConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>) -> Result<()> {
+    let affected = |r: &sqlx::postgres::PgQueryResult| r.rows_affected();
+    if readonly {
+        let mut tx = c.begin_with("BEGIN READ ONLY").await?;
+        if let Some(t) = timeout {
+            sqlx::raw_sql(AssertSqlSafe(format!("SET LOCAL statement_timeout = {}", t.as_millis()))).execute(&mut *tx).await?;
+        }
+        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        tx.rollback().await.ok();
+        out
+    } else {
+        if let Some(t) = timeout {
+            sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {}", t.as_millis()))).execute(&mut *c).await?;
+        }
+        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
+    }
+}
+
+async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>) -> Result<()> {
+    let affected = |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected();
+    let set_timeout = timeout.map(|t| format!("SET SESSION max_execution_time = {}", t.as_millis()));
+    if readonly {
+        let mut tx = c.begin_with("START TRANSACTION READ ONLY").await?;
+        if let Some(s) = set_timeout {
+            sqlx::raw_sql(AssertSqlSafe(s)).execute(&mut *tx).await.ok();
+        }
+        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        tx.rollback().await.ok();
+        out
+    } else {
+        if let Some(s) = set_timeout {
+            sqlx::raw_sql(AssertSqlSafe(s)).execute(&mut *c).await.ok();
+        }
+        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
+    }
+}
+
+/// A single connection pinned to an interactive session, so session state (USE,
+/// SET, transactions) carries over between statements.
+pub enum SqlConn {
+    Mysql(sqlx::MySqlConnection),
+    Postgres(sqlx::PgConnection),
+}
+
+impl SqlConn {
+    async fn set_timeout(&mut self, t: Duration) -> Result<()> {
+        let ms = t.as_millis();
+        match self {
+            SqlConn::Postgres(c) => {
+                sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {ms}"))).execute(c).await?;
+            }
+            SqlConn::Mysql(c) => {
+                // Not supported by MariaDB; the local timeout still applies.
+                sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(c).await.ok();
+            }
+        }
+        Ok(())
+    }
+
+    /// Run user SQL on this connection. `readonly` wraps it in a READ ONLY
+    /// transaction that is rolled back.
+    pub async fn stream(&mut self, sql: &str, sink: &mut dyn Sink, readonly: bool) -> Result<()> {
+        match self {
+            SqlConn::Postgres(c) => pg_stream(c, sql, sink, readonly, None).await,
+            SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None).await,
+        }
+    }
+
+    pub async fn run(&mut self, sql: &str, limit: usize, readonly: bool) -> Result<Output> {
+        let mut c = Collector::new(limit, None);
+        self.stream(sql, &mut c, readonly).await?;
+        Ok(c.finish())
+    }
+
+    /// A single scalar from an internal query.
+    pub async fn scalar(&mut self, sql: &str) -> Result<Value> {
+        match self.run(sql, 1, false).await? {
+            Output::Table { rows, .. } => Ok(rows.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null)),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        use sqlx::Connection as _;
+        match self {
+            SqlConn::Postgres(c) => c.is_in_transaction(),
+            SqlConn::Mysql(c) => c.is_in_transaction(),
+        }
+    }
+
+    pub async fn close(self) {
+        use sqlx::Connection as _;
+        match self {
+            SqlConn::Postgres(c) => c.close().await.ok(),
+            SqlConn::Mysql(c) => c.close().await.ok(),
+        };
     }
 }
 

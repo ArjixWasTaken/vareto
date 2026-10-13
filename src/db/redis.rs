@@ -11,6 +11,7 @@ use crate::config::Connection;
 use crate::render::Output;
 
 pub struct Redis {
+    client: redis::Client,
     con: ConnectionManager,
 }
 
@@ -34,6 +35,53 @@ pub fn build_url(conn: &Connection, host: &str, port: u16, password: Option<&str
         anyhow::bail!("unsupported Redis param {k:?}");
     }
     Ok(format!("redis://{auth}{}/{db}", crate::config::join_host_port(host, port)))
+}
+
+/// Run one command on a session connection. Returns the reply as JSON plus its
+/// [`kinds`] skeleton.
+pub async fn session_command(con: &mut redis::aio::MultiplexedConnection, args: &[String], timeout: Duration) -> Result<(Value, Value)> {
+    let mut cmd = redis::cmd(&args[0]);
+    for a in &args[1..] {
+        cmd.arg(a);
+    }
+    let v: RV = tokio::time::timeout(timeout, cmd.query_async(con))
+        .await
+        .map_err(|_| anyhow::anyhow!("command timed out"))??;
+    let kinds = kinds(&v);
+    Ok((to_json(v), kinds))
+}
+
+/// The reply types of a [`to_json`] value, in the same shape: each leaf becomes a
+/// one-letter code (`s` status, `b` bulk, `i` integer, `d` double, `n` nil, `e`
+/// error, `t` boolean, `x` binary bulk) so a shell can format it like redis-cli
+/// after the JSON itself has been masked.
+pub fn kinds(v: &RV) -> Value {
+    match v {
+        RV::Nil => json!("n"),
+        RV::Int(_) => json!("i"),
+        RV::BulkString(b) => json!(if std::str::from_utf8(b).is_ok() { "b" } else { "x" }),
+        RV::Array(items) | RV::Set(items) => Value::Array(items.iter().map(kinds).collect()),
+        RV::SimpleString(_) | RV::Okay => json!("s"),
+        RV::Map(pairs) => {
+            let mut obj = serde_json::Map::new();
+            let mut fallback = Vec::new();
+            for (k, v) in pairs {
+                match to_json(k.clone()) {
+                    Value::String(k) => {
+                        obj.insert(k, kinds(v));
+                    }
+                    _ => fallback.push(json!([kinds(k), kinds(v)])),
+                }
+            }
+            if fallback.is_empty() { Value::Object(obj) } else { Value::Array(fallback) }
+        }
+        RV::Attribute { data, .. } => kinds(data),
+        RV::Double(_) => json!("d"),
+        RV::Boolean(_) => json!("t"),
+        RV::VerbatimString { .. } => json!("b"),
+        RV::ServerError(_) => json!("e"),
+        _ => json!("b"),
+    }
 }
 
 /// Convert a reply to JSON; binary-unsafe bulk strings become `base64:...`.
@@ -82,7 +130,16 @@ impl Redis {
             .set_response_timeout(None);
         let mut con = client.get_connection_manager_with_config(cfg).await.context("connecting to Redis")?;
         let _: RV = redis::cmd("PING").query_async(&mut con).await.context("connecting to Redis")?;
-        Ok(Self { con })
+        Ok(Self { client, con })
+    }
+
+    /// A dedicated connection for an interactive session, so SELECT and MULTI stay
+    /// local to it.
+    pub async fn session(&self) -> Result<redis::aio::MultiplexedConnection> {
+        let cfg = redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(Duration::from_secs(10)))
+            .set_response_timeout(None);
+        self.client.get_multiplexed_async_connection_with_config(&cfg).await.context("connecting to Redis")
     }
 
     pub async fn command(&self, args: &[String], timeout: Duration) -> Result<Output> {

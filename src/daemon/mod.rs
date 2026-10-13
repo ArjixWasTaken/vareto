@@ -1,6 +1,7 @@
 //! The long-lived daemon: owns tunnels and DB pools, serves the unix socket.
 
 mod handlers;
+mod session;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,10 @@ pub struct State {
     pub conns: AsyncMutex<HashMap<String, Arc<Live>>>,
     /// SSH sessions shared by all forwards to the same SSH destination.
     pub ssh: Arc<SessionPool>,
+    /// Interactive shell sessions, by id.
+    pub sessions: AsyncMutex<HashMap<u64, Arc<session::Session>>>,
+    next_session: std::sync::atomic::AtomicU64,
+    next_client: std::sync::atomic::AtomicU64,
     last_activity: Mutex<Instant>,
     pub started: Instant,
     shutdown: Notify,
@@ -181,12 +186,14 @@ impl State {
     /// Close idle lazy tunnels; returns true when the daemon itself should exit.
     async fn reap(&self) -> bool {
         let Ok(cfg) = self.config() else { return false };
+        // An open shell keeps its tunnel up, however long it sits idle.
+        let in_use: Vec<String> = self.sessions.lock().await.values().filter_map(|s| s.tunnel()).collect();
         let idle: Vec<String> = self
             .tunnels
             .lock()
             .await
             .iter()
-            .filter(|(_, t)| !t.pinned && t.idle_for() > cfg.defaults.idle_timeout)
+            .filter(|(n, t)| !t.pinned && t.idle_for() > cfg.defaults.idle_timeout && !in_use.contains(n))
             .map(|(n, _)| n.clone())
             .collect();
         for name in idle {
@@ -194,7 +201,8 @@ impl State {
             self.close_tunnel(&name).await.ok();
         }
         let no_tunnels = self.tunnels.lock().await.is_empty();
-        no_tunnels && self.last_activity.lock().unwrap().elapsed() > cfg.defaults.daemon_idle_timeout
+        let no_sessions = self.sessions.lock().await.is_empty();
+        no_tunnels && no_sessions && self.last_activity.lock().unwrap().elapsed() > cfg.defaults.daemon_idle_timeout
     }
 
     async fn close_all(&self) {
@@ -240,6 +248,9 @@ pub async fn run() -> Result<()> {
         tunnels: Default::default(),
         conns: Default::default(),
         ssh: Default::default(),
+        sessions: Default::default(),
+        next_session: 1.into(),
+        next_client: 1.into(),
         last_activity: Mutex::new(Instant::now()),
         started: Instant::now(),
         shutdown: Notify::new(),
@@ -291,6 +302,13 @@ pub async fn run() -> Result<()> {
 }
 
 async fn serve_client(state: Arc<State>, stream: tokio::net::UnixStream) -> Result<()> {
+    let client = state.next_client.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let res = serve_client_inner(&state, client, stream).await;
+    session::close_owned(&state, client).await;
+    res
+}
+
+async fn serve_client_inner(state: &State, client: u64, stream: tokio::net::UnixStream) -> Result<()> {
     let mut conn = ipc::framed(stream);
     let mut force_readonly = false;
     let mut greeted = false;
@@ -308,7 +326,7 @@ async fn serve_client(state: Arc<State>, stream: tokio::net::UnixStream) -> Resu
                 state.shutdown.notify_one();
                 return Ok(());
             }
-            req => handlers::handle(&state, req, force_readonly).await,
+            req => handlers::handle(state, req, client, force_readonly).await,
         };
         let resp = match resp {
             Ok(result) => Response::Ok { result },

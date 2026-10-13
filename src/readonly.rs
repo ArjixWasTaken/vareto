@@ -106,6 +106,28 @@ pub fn check_redis(args: &[String], readonly: bool) -> Result<()> {
     bail!("read-only connection: Redis command {name} is not on the read-only allowlist");
 }
 
+/// Commands an interactive session may use on its own dedicated connection.
+const REDIS_SESSION_STATE: &[&str] = &["SELECT"];
+/// Transactions: only on writable connections, and only in a session.
+const REDIS_SESSION_TX: &[&str] = &["MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"];
+
+/// [`check_redis`] for an interactive session, which has its own connection: it may
+/// switch databases, and use transactions when writable.
+pub fn check_redis_session(args: &[String], readonly: bool) -> Result<()> {
+    let Some(name) = args.first() else { bail!("empty Redis command") };
+    let name = name.to_ascii_uppercase();
+    if REDIS_SESSION_STATE.contains(&name.as_str()) {
+        return Ok(());
+    }
+    if REDIS_SESSION_TX.contains(&name.as_str()) {
+        if readonly {
+            bail!("read-only connection: {name} is not allowed");
+        }
+        return Ok(());
+    }
+    check_redis(args, readonly)
+}
+
 // ---------------------------------------------------------------- SQL
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,14 +151,7 @@ const SQL_DENIED_FUNCTIONS: &[&str] = &[
 
 /// Parse `sql` and reject anything that is not a single read statement.
 pub fn check_sql(dialect: SqlDialect, sql: &str) -> Result<()> {
-    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
-    use sqlparser::parser::Parser;
-
-    let stmts = match dialect {
-        SqlDialect::Mysql => Parser::parse_sql(&MySqlDialect {}, sql),
-        SqlDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
-    }
-    .map_err(|e| anyhow::anyhow!("read-only connection: could not parse SQL ({e}); only plain read statements are allowed"))?;
+    let stmts = parse(dialect, sql).map_err(|e| anyhow::anyhow!("read-only connection: could not parse SQL ({e}); only plain read statements are allowed"))?;
     let stmt = match stmts.as_slice() {
         [] => bail!("empty SQL"),
         [one] => one,
@@ -149,15 +164,36 @@ pub fn check_sql(dialect: SqlDialect, sql: &str) -> Result<()> {
     }
 }
 
+/// A statement that only changes harmless session state (`USE db` on MySQL,
+/// `SET search_path` on Postgres). Interactive sessions on read-only connections
+/// allow it, and run it outside the read-only transaction so it persists.
+pub fn session_statement(dialect: SqlDialect, sql: &str) -> bool {
+    use sqlparser::ast::{Expr, Set, Statement};
+    let Ok(stmts) = parse(dialect, sql) else { return false };
+    let [stmt] = stmts.as_slice() else { return false };
+    match (dialect, stmt) {
+        (SqlDialect::Mysql, Statement::Use(_)) => true,
+        (SqlDialect::Postgres, Statement::Set(Set::SingleAssignment { variable, values, hivevar: false, .. })) => {
+            variable.to_string().eq_ignore_ascii_case("search_path")
+                && values.iter().all(|v| matches!(v, Expr::Identifier(_) | Expr::Value(_)))
+        }
+        _ => false,
+    }
+}
+
+fn parse(dialect: SqlDialect, sql: &str) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+    use sqlparser::parser::Parser;
+    match dialect {
+        SqlDialect::Mysql => Parser::parse_sql(&MySqlDialect {}, sql),
+        SqlDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+    }
+}
+
 /// The table a query reads from, when it reads from exactly one (used to apply
 /// `table.column` mask rules). Best effort; `None` when unknown or ambiguous.
 pub fn single_table(dialect: SqlDialect, sql: &str) -> Option<String> {
-    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
-    let stmts = match dialect {
-        SqlDialect::Mysql => sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, sql),
-        SqlDialect::Postgres => sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, sql),
-    }
-    .ok()?;
+    let stmts = parse(dialect, sql).ok()?;
     let mut found: Option<String> = None;
     let mut many = false;
     let _ = sqlparser::ast::visit_relations(&stmts, |r| {
@@ -338,5 +374,27 @@ mod tests {
         assert!(check_redis(&a("SET k v"), false).is_ok());
         assert!(check_redis(&a("SUBSCRIBE ch"), false).is_err());
         assert!(check_redis(&a("SELECT 2"), false).is_err());
+    }
+
+    #[test]
+    fn redis_session() {
+        let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert!(check_redis_session(&a("SELECT 2"), true).is_ok());
+        assert!(check_redis_session(&a("MULTI"), false).is_ok());
+        assert!(check_redis_session(&a("MULTI"), true).is_err());
+        assert!(check_redis_session(&a("get k"), true).is_ok());
+        assert!(check_redis_session(&a("SET k v"), true).is_err());
+        assert!(check_redis_session(&a("SUBSCRIBE ch"), false).is_err());
+    }
+
+    #[test]
+    fn session_statements() {
+        assert!(session_statement(SqlDialect::Mysql, "USE shop"));
+        assert!(session_statement(SqlDialect::Postgres, "SET search_path TO app, public"));
+        assert!(session_statement(SqlDialect::Postgres, "set search_path = 'app'"));
+        assert!(!session_statement(SqlDialect::Postgres, "SET default_transaction_read_only = off"));
+        assert!(!session_statement(SqlDialect::Postgres, "SET search_path TO app; DROP TABLE t"));
+        assert!(!session_statement(SqlDialect::Mysql, "SET SESSION TRANSACTION READ WRITE"));
+        assert!(!session_statement(SqlDialect::Mysql, "SELECT 1"));
     }
 }

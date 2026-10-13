@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::{Backend, State};
+use super::{session, Backend, State};
 use crate::config::{ConfigStore, Connection, ConnectionConfig, Kind, Route, Source};
 use crate::ipc::{ExportFormat, QuerySpec, Request, SaveConnection};
 use crate::readonly::{self, SqlDialect};
@@ -15,7 +15,7 @@ use crate::render::{ExportWriter, Output, Sink};
 /// Hard cap on rows returned to the model in one response.
 const MAX_ROW_LIMIT: usize = 5_000;
 
-pub async fn handle(state: &State, req: Request, force_readonly: bool) -> Result<Value> {
+pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bool) -> Result<Value> {
     match req {
         Request::Status => status(state).await,
         Request::ListConnections => list_connections(state, force_readonly).await,
@@ -64,11 +64,19 @@ pub async fn handle(state: &State, req: Request, force_readonly: bool) -> Result
                 Backend::Redis(r) => r.describe(&table, t).await,
             }
         }
+        Request::SessionOpen { connection, database } => session::open(state, client, &connection, database, force_readonly).await,
+        Request::SessionQuery { session, query, limit } => {
+            let limit = limit.unwrap_or(state.config()?.defaults.row_limit).clamp(1, MAX_ROW_LIMIT);
+            session::query(state, client, session, query, limit).await
+        }
+        Request::SessionUse { session, database } => session::use_db(state, client, session, &database).await,
+        Request::SessionClose { session } => session::close(state, Some(client), session).await,
+        Request::SessionCancel { session } => session::cancel(state, session).await,
         Request::Hello { .. } | Request::Shutdown => unreachable!("handled by the connection loop"),
     }
 }
 
-async fn setup(state: &State, name: &str, force_readonly: bool) -> Result<(Connection, std::sync::Arc<super::Live>, Duration)> {
+pub(super) async fn setup(state: &State, name: &str, force_readonly: bool) -> Result<(Connection, std::sync::Arc<super::Live>, Duration)> {
     let cfg = state.config()?;
     let mut conn = cfg.connection(name)?.clone();
     conn.readonly |= force_readonly;
@@ -82,7 +90,7 @@ async fn run_query(state: &State, name: &str, q: &QuerySpec, limit: usize, force
         let mut conn = cfg.connection(name)?.clone();
         conn.readonly |= force_readonly;
         // Validate before connecting, so rejected queries never open a tunnel.
-        check(&conn, q)?;
+        check(&conn, q, false)?;
         let live = state.live(&conn).await?;
         (conn, live, cfg.defaults.query_timeout)
     };
@@ -104,19 +112,20 @@ async fn run_query(state: &State, name: &str, q: &QuerySpec, limit: usize, force
     Ok(out)
 }
 
-fn dialect(kind: Kind) -> SqlDialect {
+pub(super) fn dialect(kind: Kind) -> SqlDialect {
     if kind == Kind::Postgres { SqlDialect::Postgres } else { SqlDialect::Mysql }
 }
 
-/// Kind/query compatibility and read-only guards.
-fn check(conn: &Connection, q: &QuerySpec) -> Result<()> {
+/// Kind/query compatibility and read-only guards. `session`: an interactive
+/// session's dedicated connection, which may also change harmless session state.
+pub(super) fn check(conn: &Connection, q: &QuerySpec, session: bool) -> Result<()> {
     let kind = conn.cfg.kind;
     match q {
         QuerySpec::Sql { sql } => {
             if !matches!(kind, Kind::Mysql | Kind::Postgres) {
                 bail!("connection {:?} is {}, not SQL", conn.name, kind.as_str());
             }
-            if conn.readonly {
+            if conn.readonly && !(session && readonly::session_statement(dialect(kind), sql)) {
                 readonly::check_sql(dialect(kind), sql)?;
             }
         }
@@ -132,7 +141,11 @@ fn check(conn: &Connection, q: &QuerySpec) -> Result<()> {
             if kind != Kind::Redis {
                 bail!("connection {:?} is {}, not Redis", conn.name, kind.as_str());
             }
-            readonly::check_redis(args, conn.readonly)?;
+            if session {
+                readonly::check_redis_session(args, conn.readonly)?;
+            } else {
+                readonly::check_redis(args, conn.readonly)?;
+            }
         }
     }
     Ok(())
@@ -148,7 +161,7 @@ async fn export(state: &State, name: &str, q: &QuerySpec, path: &str, format: Ex
     let timeout = cfg.defaults.export_timeout;
     let mut conn = cfg.connection(name)?.clone();
     conn.readonly |= force_readonly;
-    check(&conn, q)?;
+    check(&conn, q, false)?;
     let live = state.live(&conn).await?;
 
     let started = std::time::Instant::now();
@@ -196,6 +209,7 @@ async fn status(state: &State) -> Result<Value> {
         "config_files": [main, saved],
         "tunnels": tunnels,
         "ssh_sessions": state.ssh.len(),
+        "shell_sessions": state.sessions.lock().await.len(),
         "connected": conns,
     }))
 }
