@@ -4,7 +4,7 @@
 (function (global) {
   'use strict';
 
-  const BATCH = 20;
+  let BATCH = 20;
   const MAX_DOCS = 5000;
 
   class MongoServerError extends Error {
@@ -485,6 +485,7 @@
     '    distinct, insertOne, insertMany, updateOne, updateMany, replaceOne, deleteOne,',
     '    deleteMany, getIndexes, createIndex, dropIndex, drop, stats',
     '  Cursor methods: sort, limit, skip, projection, toArray, forEach, map, next, hasNext, count',
+    "  Settings: config.get(key) / config.set(key, value) for displayBatchSize and loopIterationLimit",
     '  Types: ObjectId, ISODate, Long (NumberLong), Int32 (NumberInt), Decimal128 (NumberDecimal),',
     '    UUID, Timestamp, Binary, MinKey, MaxKey',
   ].join('\n');
@@ -557,10 +558,36 @@
     },
   };
 
+  // mongosh's `config` API, for the settings this shell has.
+  const settings = {
+    displayBatchSize: {
+      get: () => BATCH,
+      set: (v) => {
+        if (!(Number.isInteger(v) && v > 0)) throw new RangeError('displayBatchSize must be a positive integer');
+        BATCH = v;
+      },
+    },
+    loopIterationLimit: { get: () => global.__vareto_loop_limit(), set: (v) => global.__vareto_loop_limit(v) },
+  };
+  function setting(key) {
+    if (!Object.prototype.hasOwnProperty.call(settings, key)) {
+      throw new Error(`unknown config option '${key}' (available: ${Object.keys(settings).join(', ')})`);
+    }
+    return settings[key];
+  }
+  const config = {
+    get: (key) => setting(key).get(),
+    set: (key, value) => {
+      setting(key).set(value);
+      return `Setting "${key}" has been changed`;
+    },
+  };
+
   const db = dbProxy(new DB(null));
   Object.assign(global, {
     db: db,
     __shell: shell,
+    config: config,
     print: print,
     printjson: (v) => print(inspect(v)),
     console: { log: print, info: print, warn: print, error: print },

@@ -308,7 +308,12 @@ at most 5000 rows (`--limit`; the default is `row_limit`).
 The mongosh flavor runs JavaScript in the CLI with [boa](https://boajs.dev). Each `db.*`
 call becomes a structured operation, so the daemon never executes JavaScript. Methods
 the operations can't express, such as `bulkWrite`, sessions or change streams, aren't
-available. History is kept in `~/.local/state/vareto/history/<connection>`.
+available. A runaway loop such as `while (true) {}` is stopped after 100 million
+iterations in one function call, with an error JavaScript can't catch. The rest of the
+session, including its variables, is kept. Change the limit with
+`config.set('loopIterationLimit', n)`; `config.set('displayBatchSize', n)` sets how many
+documents a cursor prints at a time. History is kept in
+`~/.local/state/vareto/history/<connection>`.
 
 ## CLI
 

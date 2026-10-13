@@ -17,6 +17,12 @@ use crate::ipc::{MongoQuery, QuerySpec};
 
 const PRELUDE: &str = include_str!("mongo_prelude.js");
 
+/// Loop iterations one function call may run before the engine stops it (about
+/// 5 s in a release build). It stops runaway loops like `while (true) {}` with an
+/// error JavaScript can't catch, which unwinds normally and keeps the session's
+/// variables. Users change it with `config.set('loopIterationLimit', n)`.
+const LOOP_ITERATION_LIMIT: u64 = 100_000_000;
+
 enum ToJs {
     Eval(String),
     Reply(String),
@@ -64,12 +70,46 @@ fn native_print(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     Ok(JsValue::undefined())
 }
 
+/// `__vareto_loop_limit(n?)`: set the loop iteration limit when given; returns it.
+fn native_loop_limit(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(v) = args.first().filter(|v| !v.is_undefined()) {
+        let n = v.to_number(ctx)?;
+        if !(n >= 1.0 && n.fract() == 0.0) {
+            return Err(JsNativeError::range().with_message("loopIterationLimit must be a positive integer").into());
+        }
+        ctx.runtime_limits_mut().set_loop_iteration_limit(n as u64);
+    }
+    Ok(JsValue::from(ctx.runtime_limits().loop_iteration_limit() as f64))
+}
+
+/// A native function's signature.
+type Native = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
+
+/// Register the natives the prelude needs and load it.
+fn setup(ctx: &mut Context, call: Native, print: Native) -> JsResult<()> {
+    ctx.runtime_limits_mut().set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
+    ctx.register_global_callable(js_string!("__vareto_call"), 1, NativeFunction::from_fn_ptr(call))?;
+    ctx.register_global_callable(js_string!("__vareto_print"), 1, NativeFunction::from_fn_ptr(print))?;
+    ctx.register_global_callable(js_string!("__vareto_loop_limit"), 1, NativeFunction::from_fn_ptr(native_loop_limit))?;
+    eval_str(ctx, PRELUDE).map(|_| ())
+}
+
 fn eval_str(ctx: &mut Context, code: &str) -> JsResult<JsValue> {
     ctx.eval(Source::from_bytes(code))
 }
 
 /// An error as the prelude words it (`MongoServerError: ...`, `TypeError: ...`).
 fn format_error(ctx: &mut Context, e: boa_engine::JsError) -> String {
+    use boa_engine::error::{EngineError, RuntimeLimitError};
+    match e.as_engine() {
+        Some(EngineError::RuntimeLimit(RuntimeLimitError::LoopIteration)) => {
+            let n = ctx.runtime_limits().loop_iteration_limit();
+            return format!("RuntimeLimitError: a loop ran more than {n} iterations and was stopped (raise the limit with config.set('loopIterationLimit', n))");
+        }
+        // Engine errors carry a backtrace; the first line says it all.
+        Some(other) => return other.to_string().lines().next().unwrap_or_default().to_string(),
+        None => {}
+    }
     let fallback = e.to_string();
     let Ok(v) = e.into_opaque(ctx) else { return fallback };
     let formatted = ctx
@@ -86,11 +126,7 @@ fn format_error(ctx: &mut Context, e: boa_engine::JsError) -> String {
 fn js_main(tx: Sender<FromJs>, rx: Receiver<ToJs>) {
     BRIDGE.with(|b| *b.borrow_mut() = Some((tx, rx)));
     let mut ctx = Context::default();
-    let setup = ctx
-        .register_global_callable(js_string!("__vareto_call"), 1, NativeFunction::from_fn_ptr(native_call))
-        .and_then(|()| ctx.register_global_callable(js_string!("__vareto_print"), 1, NativeFunction::from_fn_ptr(native_print)))
-        .and_then(|()| eval_str(&mut ctx, PRELUDE).map(|_| ()));
-    let ready = setup.map_err(|e| format!("loading the mongosh prelude: {e}"));
+    let ready = setup(&mut ctx, native_call, native_print).map_err(|e| format!("loading the mongosh prelude: {e}"));
     let ok = ready.is_ok();
     bridge_send(FromJs::Ready(ready));
     if !ok {
@@ -381,9 +417,7 @@ mod tests {
 
     fn engine() -> Context {
         let mut ctx = Context::default();
-        ctx.register_global_callable(js_string!("__vareto_call"), 1, NativeFunction::from_fn_ptr(mock_call)).unwrap();
-        ctx.register_global_callable(js_string!("__vareto_print"), 1, NativeFunction::from_fn_ptr(mock_print)).unwrap();
-        eval_str(&mut ctx, PRELUDE).unwrap();
+        setup(&mut ctx, mock_call, mock_print).unwrap();
         ctx
     }
 
@@ -430,6 +464,23 @@ mod tests {
         assert_eq!(req["query"]["collection"], "system.profile");
         assert_eq!(req["query"]["upsert"], true);
         assert_eq!(req["query"]["update"], json!({"$set": {"b": 2}}));
+    }
+
+    #[test]
+    fn runaway_loops_stop_and_keep_the_session() {
+        let mut ctx = engine();
+        assert_eq!(eval_to_string(&mut ctx, "config.get('loopIterationLimit')"), "100000000");
+        eval_str(&mut ctx, "config.set('loopIterationLimit', 1000); const kept = 41").unwrap();
+        // JavaScript can't catch it, so `catch` doesn't swallow the stop.
+        let e = eval_str(&mut ctx, "try { while (true) {} } catch (e) { 'caught' }").unwrap_err();
+        assert_eq!(
+            format_error(&mut ctx, e),
+            "RuntimeLimitError: a loop ran more than 1000 iterations and was stopped (raise the limit with config.set('loopIterationLimit', n))"
+        );
+        assert_eq!(eval_to_string(&mut ctx, "kept + 1"), "42");
+        assert_eq!(eval_to_string(&mut ctx, "let n = 0; for (let i = 0; i < 500; i++) n++; n"), "500");
+        assert!(eval_str(&mut ctx, "config.set('loopIterationLimit', -1)").is_err());
+        assert!(eval_str(&mut ctx, "config.set('nope', 1)").is_err());
     }
 
     #[test]
