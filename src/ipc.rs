@@ -166,6 +166,12 @@ pub struct MongoQuery {
     /// The command document (run_command).
     #[serde(default)]
     pub command: Option<Value>,
+    /// Driver options for find / aggregate, in the server's camelCase (`hint`,
+    /// `collation`, `min`, `max`, `comment`, `returnKey`, `allowDiskUse`, ...). The
+    /// shell's cursor methods use it; `maxTimeMS` can only lower the query timeout.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]

@@ -78,6 +78,23 @@ fn server_message(e: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!(msg)
 }
 
+/// Driver options from the query's `options` document, and the server time limit:
+/// the query timeout, or `maxTimeMS` when that is lower.
+fn options<T: serde::de::DeserializeOwned + Default>(q: &MongoQuery, op: &str, timeout: Duration) -> Result<(T, Duration)> {
+    let Some(o) = &q.options else { return Ok((T::default(), timeout)) };
+    let mut doc = to_doc(o, "options")?;
+    // The driver reads maxTimeMS as a Duration, not as milliseconds.
+    let max_time = match doc.remove("maxTimeMS") {
+        Some(v) => {
+            let ms = v.as_i64().or(v.as_i32().map(i64::from)).or(v.as_f64().map(|f| f as i64)).context("maxTimeMS must be a number")?;
+            Duration::from_millis(ms.max(0) as u64).min(timeout)
+        }
+        None => timeout,
+    };
+    let opts = mongodb::bson::from_document(doc).with_context(|| format!("invalid {op} options"))?;
+    Ok((opts, max_time))
+}
+
 fn update_detail(r: &mongodb::results::UpdateResult) -> Value {
     let mut v = json!({ "matched": r.matched_count, "modified": r.modified_count });
     if let Some(id) = &r.upserted_id {
@@ -143,7 +160,8 @@ impl Mongo {
         let filter = opt_doc(&q.filter, "filter")?;
         match q.op {
             MongoOp::Find => {
-                let mut find = coll.find(filter).max_time(timeout);
+                let (opts, max_time): (mongodb::options::FindOptions, _) = options(q, "find", timeout)?;
+                let mut find = coll.find(filter).with_options(opts).max_time(max_time);
                 // One extra so the collector can tell the result was truncated.
                 let server_limit = match (limit.map(|l| l as u64 + 1), q.cursor_limit.filter(|&l| l > 0)) {
                     (Some(a), Some(b)) => Some(a.min(b)),
@@ -176,7 +194,8 @@ impl Mongo {
                     .iter()
                     .map(|s| to_doc(s, "pipeline stage"))
                     .collect::<Result<Vec<_>>>()?;
-                let mut cursor = coll.aggregate(pipeline).max_time(timeout).await?;
+                let (opts, max_time): (mongodb::options::AggregateOptions, _) = options(q, "aggregate", timeout)?;
+                let mut cursor = coll.aggregate(pipeline).with_options(opts).max_time(max_time).await?;
                 while let Some(d) = cursor.try_next().await? {
                     if !sink.doc(to_json(d))? {
                         break;

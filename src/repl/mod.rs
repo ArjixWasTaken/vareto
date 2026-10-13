@@ -123,17 +123,18 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<bool> {
     let ro = daemon.force_readonly;
     tokio::task::spawn_blocking(move || {
         let mut s = Session::open(rt, client, ro, &opts.connection, opts.database.clone(), opts.limit)?;
+        let interactive = opts.execute.is_none() && std::io::stdin().is_terminal();
         let mut f: Box<dyn Flavor> = match s.kind {
             Kind::Mysql => Box::new(mysql::Mysql::new(&s)),
             Kind::Postgres => Box::new(psql::Psql::new()),
             Kind::Redis => Box::new(redis::Redis::new()),
             Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
-            Kind::Mongodb => Box::new(mongo::Mongo::new()?),
+            Kind::Mongodb => Box::new(mongo::Mongo::new(interactive)?),
         };
         let ok = if let Some(cmds) = &opts.execute {
             script(f.as_mut(), &mut s, cmds)
-        } else if std::io::stdin().is_terminal() {
-            interactive(f.as_mut(), &mut s, &opts.connection)
+        } else if interactive {
+            run_interactive(f.as_mut(), &mut s, &opts.connection)
         } else {
             let mut text = String::new();
             for l in std::io::stdin().lock().lines() {
@@ -200,7 +201,7 @@ impl Highlighter for Helper {}
 impl Validator for Helper {}
 impl rustyline::Helper for Helper {}
 
-fn interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> bool {
+fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> bool {
     let config = rustyline::Config::builder().auto_add_history(false).max_history_size(5000).map(|b| b.build());
     let mut ed: rustyline::Editor<Helper, DefaultHistory> = match config.and_then(rustyline::Editor::with_config) {
         Ok(e) => e,

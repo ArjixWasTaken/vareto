@@ -302,6 +302,14 @@ try:
           and 'Type "it" for more' in r.stdout and "{ i: 19 }\n]" in r.stdout and "[ { i: 20 }, { i: 21 }" in r.stdout
           and "\n1\n" in r.stdout and "{ i: 24 }" in r.stdout, r.stdout + r.stderr)
 
+    r = shell("mongo-rw", "use scratch\n"
+                          "db.bulk.bulkWrite([{insertOne: {document: {_id: 1}}}, {updateOne: {filter: {_id: 2}, update: {$set: {a: 1}}, upsert: true}}, {deleteOne: {filter: {_id: 1}}}]).upsertedCount\n"
+                          "db.bulk.find({_id: 2}).hint({_id: 1}).returnKey().toArray()\n"
+                          "db.bulk.explain().count({a: 1}).queryPlanner.namespace\n"
+                          "db.customers.watch()\n")
+    check("mongosh: bulkWrite, cursor options, explain, unsupported methods say why", r.returncode != 0
+          and r.stdout.startswith("switched to db scratch\n1\n[ { _id: 2 } ]\nscratch.bulk")
+          and "watch() is not available in the vareto shell (change streams" in r.stderr, r.stdout + r.stderr)
     r = shell("lite", ".tables\n.mode column\nselect id, body, score from notes order by id;\ninsert into notes (body) values ('x');\n")
     check("sqlite3: dot commands, column mode, read-only file", r.returncode != 0 and r.stdout.startswith("notes")
           and "id  body    score\n--  ------  -----\n 1  first     1.5" in r.stdout and "read-only" in r.stderr,

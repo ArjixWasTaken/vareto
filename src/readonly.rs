@@ -12,7 +12,9 @@ use crate::ipc::{MongoOp, MongoQuery};
 const MONGO_READ_COMMANDS: &[&str] = &[
     "listIndexes", "listCollections", "listDatabases", "collStats", "dbStats", "dataSize", "buildInfo",
     "buildinfo", "hello", "isMaster", "ismaster", "ping", "serverStatus", "usersInfo", "rolesInfo",
-    "connectionStatus", "hostInfo", "count", "distinct",
+    "connectionStatus", "hostInfo", "count", "distinct", "listCommands", "currentOp", "getParameter",
+    "getLog", "top", "connPoolStats", "replSetGetStatus", "replSetGetConfig", "listShards", "balancerStatus",
+    "balancerCollectionStatus", "getDefaultRWConcern", "getClusterParameter",
 ];
 
 pub fn check_mongo(q: &MongoQuery) -> Result<()> {
@@ -34,6 +36,12 @@ fn check_mongo_command(cmd: &Value) -> Result<()> {
     let Some((name, arg)) = cmd.as_object().and_then(|m| m.iter().next()) else { bail!("command must be a non-empty document") };
     match name.as_str() {
         n if MONGO_READ_COMMANDS.contains(&n) => Ok(()),
+        // `{profile: -1}` reads the profiling level; other values set it.
+        "profile" if arg.as_f64() == Some(-1.0) => Ok(()),
+        "aggregate" => match cmd.get("pipeline").and_then(Value::as_array).into_iter().flatten().find_map(find_write_stage) {
+            Some(stage) => bail!("read-only connection: aggregation stage {stage} writes data"),
+            None => Ok(()),
+        },
         // explain runs (the plan of) its inner command, which must itself be a read.
         "explain" => match arg.as_object().and_then(|m| m.keys().next()).map(String::as_str) {
             Some("find" | "count" | "distinct") => Ok(()),
@@ -410,6 +418,7 @@ mod tests {
             cursor_limit: None,
             upsert: None,
             command: None,
+            options: None,
         }
     }
 
@@ -436,6 +445,11 @@ mod tests {
         assert!(check_mongo(&cmd(json!({"explain": {"delete": "c"}}))).is_err());
         assert!(check_mongo(&cmd(json!({"drop": "c"}))).is_err());
         assert!(check_mongo(&cmd(json!({"createIndexes": "c"}))).is_err());
+        assert!(check_mongo(&cmd(json!({"profile": -1}))).is_ok());
+        assert!(check_mongo(&cmd(json!({"profile": 2}))).is_err());
+        assert!(check_mongo(&cmd(json!({"aggregate": 1, "pipeline": [{"$currentOp": {}}], "cursor": {}}))).is_ok());
+        assert!(check_mongo(&cmd(json!({"aggregate": "c", "pipeline": [{"$merge": "x"}], "cursor": {}}))).is_err());
+        assert!(check_mongo(&cmd(json!({"insert": "c", "documents": []}))).is_err());
     }
 
     #[test]

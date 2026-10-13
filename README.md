@@ -306,11 +306,29 @@ masking applies, `query_timeout` applies to each statement, and each statement r
 at most 5000 rows (`--limit`; the default is `row_limit`).
 
 The mongosh flavor runs JavaScript in the CLI with [boa](https://boajs.dev). Each `db.*`
-call becomes a structured operation, so the daemon never executes JavaScript. Methods
-the operations can't express, such as `bulkWrite`, `currentOp`, sessions or change
-streams, aren't available, and calling one says so. As in mongosh, any other unknown
-name on `db` is a collection (`db.foo`), so a mistyped method fails with a hint
-rather than silently doing nothing. A runaway loop such as `while (true) {}` is stopped after 100 million
+call becomes a structured operation or a database command, so the daemon never executes
+JavaScript. It covers mongosh's method reference:
+
+- **CRUD:** including `bulkWrite` and the Bulk API, `findAndModify`, and the legacy
+  `insert`/`update`/`remove`.
+- **Cursors:** cursor options such as `hint`, `collation`, `min`/`max`, `returnKey` and
+  `maxTimeMS`.
+- **Indexes:** including hidden and Atlas Search indexes.
+- **Query tools:** `explain()`, plan caches and `mapReduce`.
+- **Administration:** users and roles, profiling and log levels, `currentOp`/`killOp`,
+  and the read-only `rs.*`/`sh.*` helpers.
+- **Shell helpers:** BSON constructors, and `load`, `cat`, `ls`, `sleep`.
+
+What needs a long-lived cursor or client-side state isn't available, and calling it says
+why. That covers change streams (`watch`), tailable cursors, sessions and transactions,
+in-use encryption, `connect()`/`Mongo()`, server lifecycle and cluster topology changes
+(`fsyncLock`, `shutdownServer`, `rs.reconfig`, `sh.addShard`, ...), and local-filesystem
+writes. As in mongosh, any other unknown name on `db` is a collection (`db.foo`), so a
+mistyped method fails with a hint rather than silently doing nothing. Read-only
+connections also allow the informational commands behind these helpers (`currentOp`,
+`listCommands`, `getLog`, `replSetGetStatus`, `{profile: -1}`, `aggregate` without
+`$out`/`$merge`, ...).
+A runaway loop such as `while (true) {}` is stopped after 100 million
 iterations in one function call, with an error JavaScript can't catch. The rest of the
 session, including its variables, is kept. Change the limit with
 `config.set('loopIterationLimit', n)`; `config.set('displayBatchSize', n)` sets how many

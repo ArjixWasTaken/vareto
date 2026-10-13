@@ -85,12 +85,58 @@ fn native_loop_limit(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
 /// A native function's signature.
 type Native = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
+/// `__vareto_native(op, arg)`: mongosh's local helpers (`cat`, `ls`, `sleep`, ...).
+/// Results are strings; lists are JSON.
+fn native_helper(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let op = arg_string(args, ctx)?;
+    let arg = args.get(1).cloned().unwrap_or_default().to_string(ctx)?.to_std_string_escaped();
+    let fail = |e: String| -> boa_engine::JsError { JsNativeError::error().with_message(e).into() };
+    let out = match op.as_str() {
+        "cat" => std::fs::read_to_string(&arg).map_err(|e| fail(format!("{arg}: {e}")))?,
+        "ls" | "listFiles" => {
+            let mut entries: Vec<Value> = std::fs::read_dir(&arg)
+                .map_err(|e| fail(format!("{arg}: {e}")))?
+                .filter_map(Result::ok)
+                .map(|e| {
+                    let meta = e.metadata().ok();
+                    let dir = meta.as_ref().is_some_and(|m| m.is_dir());
+                    let path = std::path::Path::new(&arg).join(e.file_name());
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if op == "ls" {
+                        json!(format!("{}{}", path.display(), if dir { "/" } else { "" }))
+                    } else {
+                        let mut v = json!({ "name": path.display().to_string(), "baseName": name, "isDirectory": dir });
+                        if !dir {
+                            v["size"] = json!(meta.map(|m| m.len()).unwrap_or(0));
+                        }
+                        v
+                    }
+                })
+                .collect();
+            entries.sort_by_key(|v| v.to_string());
+            Value::Array(entries).to_string()
+        }
+        "pwd" => std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+        "hostname" => nix::unistd::gethostname().map(|h| h.to_string_lossy().to_string()).unwrap_or_default(),
+        "sleep" => {
+            std::thread::sleep(std::time::Duration::from_millis(arg.parse().unwrap_or(0)));
+            String::new()
+        }
+        "version" => crate::ipc::VERSION.to_string(),
+        "passwordPrompt" => rpassword::prompt_password("Enter password: ").map_err(|e| fail(format!("passwordPrompt: {e}")))?,
+        other => return Err(fail(format!("unknown native helper {other:?}"))),
+    };
+    Ok(JsValue::from(JsString::from(out.as_str())))
+}
+
 /// Register the natives the prelude needs and load it.
-fn setup(ctx: &mut Context, call: Native, print: Native) -> JsResult<()> {
+fn setup(ctx: &mut Context, call: Native, print: Native, interactive: bool) -> JsResult<()> {
     ctx.runtime_limits_mut().set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
     ctx.register_global_callable(js_string!("__vareto_call"), 1, NativeFunction::from_fn_ptr(call))?;
     ctx.register_global_callable(js_string!("__vareto_print"), 1, NativeFunction::from_fn_ptr(print))?;
     ctx.register_global_callable(js_string!("__vareto_loop_limit"), 1, NativeFunction::from_fn_ptr(native_loop_limit))?;
+    ctx.register_global_callable(js_string!("__vareto_native"), 2, NativeFunction::from_fn_ptr(native_helper))?;
+    ctx.global_object().set(js_string!("__vareto_interactive"), interactive, false, ctx)?;
     eval_str(ctx, PRELUDE).map(|_| ())
 }
 
@@ -123,10 +169,10 @@ fn format_error(ctx: &mut Context, e: boa_engine::JsError) -> String {
     }
 }
 
-fn js_main(tx: Sender<FromJs>, rx: Receiver<ToJs>) {
+fn js_main(tx: Sender<FromJs>, rx: Receiver<ToJs>, interactive: bool) {
     BRIDGE.with(|b| *b.borrow_mut() = Some((tx, rx)));
     let mut ctx = Context::default();
-    let ready = setup(&mut ctx, native_call, native_print).map_err(|e| format!("loading the mongosh prelude: {e}"));
+    let ready = setup(&mut ctx, native_call, native_print, interactive).map_err(|e| format!("loading the mongosh prelude: {e}"));
     let ok = ready.is_ok();
     bridge_send(FromJs::Ready(ready));
     if !ok {
@@ -209,13 +255,13 @@ pub struct Mongo {
 }
 
 impl Mongo {
-    pub fn new() -> Result<Self> {
+    pub fn new(interactive: bool) -> Result<Self> {
         let (to_js, js_rx) = channel();
         let (js_tx, from_js) = channel();
         std::thread::Builder::new()
             .name("mongosh-js".into())
             .stack_size(16 * 1024 * 1024)
-            .spawn(move || js_main(js_tx, js_rx))
+            .spawn(move || js_main(js_tx, js_rx, interactive))
             .context("starting the JavaScript engine")?;
         match from_js.recv() {
             Ok(FromJs::Ready(Ok(()))) => {}
@@ -302,7 +348,11 @@ fn shell_command(line: &str) -> Option<String> {
     let quoted = || serde_json::to_string(arg).unwrap_or_default();
     match cmd {
         "use" if !arg.is_empty() && !arg.contains(char::is_whitespace) => Some(format!("__shell.use({})", quoted())),
-        "show" if !arg.is_empty() && !arg.contains(char::is_whitespace) => Some(format!("__shell.show({})", quoted())),
+        "show" if !arg.is_empty() => {
+            // `show log <name>` takes an argument.
+            let words: Vec<String> = arg.split_whitespace().map(|w| serde_json::to_string(w).unwrap_or_default()).collect();
+            (words.len() <= 2).then(|| format!("__shell.show({})", words.join(", ")))
+        }
         "it" if arg.is_empty() => Some("__shell.it()".into()),
         "help" if arg.is_empty() => Some("__shell.help()".into()),
         _ => None,
@@ -420,7 +470,7 @@ mod tests {
 
     fn engine() -> Context {
         let mut ctx = Context::default();
-        setup(&mut ctx, mock_call, mock_print).unwrap();
+        setup(&mut ctx, mock_call, mock_print, false).unwrap();
         ctx
     }
 
@@ -501,13 +551,94 @@ mod tests {
         );
 
         // Known but unsupported: a clear error rather than a collection.
-        assert_eq!(eval_to_string(&mut ctx, "typeof db.currentOp"), "function");
-        let e = eval_str(&mut ctx, "db.currentOp()").unwrap_err();
-        assert_eq!(format_error(&mut ctx, e), "TypeError: db.currentOp() is not available in the vareto shell");
+        assert_eq!(eval_to_string(&mut ctx, "typeof db.fsyncLock"), "function");
+        let e = eval_str(&mut ctx, "db.fsyncLock()").unwrap_err();
+        assert_eq!(
+            format_error(&mut ctx, e),
+            "TypeError: db.fsyncLock() is not available in the vareto shell (server and cluster administration is left to mongosh)"
+        );
+        let e = eval_str(&mut ctx, "rs.stepDown()").unwrap_err();
+        assert!(format_error(&mut ctx, e).starts_with("TypeError: rs.stepDown() is not available"));
+        let e = eval_str(&mut ctx, "db.users.watch()").unwrap_err();
+        assert!(format_error(&mut ctx, e).contains("change streams"));
         // A typo is a collection; calling it explains that.
         let e = eval_str(&mut ctx, "db.users.fnd()").unwrap_err();
         assert!(format_error(&mut ctx, e).contains("db.foo is the collection \"foo\""));
         assert_eq!(eval_to_string(&mut ctx, "db.users.fnd.getName()"), "users.fnd");
+    }
+
+    fn last_request() -> Value {
+        SEEN.with(|s| s.borrow_mut().pop()).unwrap()
+    }
+
+    #[test]
+    fn cursor_options_and_explain() {
+        let mut ctx = engine();
+        eval_str(&mut ctx, "db.users.find({a: 1}).hint({a: 1}).collation({locale: 'en'}).comment('c').maxTimeMS(50).returnKey().toArray()").unwrap();
+        let q = last_request()["query"].clone();
+        assert_eq!(q["options"], json!({"hint": {"a": 1}, "collation": {"locale": "en"}, "comment": "c", "maxTimeMS": 50, "returnKey": true}));
+        // find(filter, projection, options) splits sort/limit/skip out of options.
+        eval_str(&mut ctx, "db.users.find({}, {a: 1}, {sort: {a: -1}, limit: 3, allowDiskUse: true}).toArray()").unwrap();
+        let q = last_request()["query"].clone();
+        assert_eq!((q["sort"].clone(), q["cursor_limit"].clone(), q["options"].clone()), (json!({"a": -1}), json!(3), json!({"allowDiskUse": true})));
+        eval_str(&mut ctx, "db.users.aggregate([{$match: {}}], {allowDiskUse: true}).toArray()").unwrap();
+        assert_eq!(last_request()["query"]["options"], json!({"allowDiskUse": true}));
+
+        eval_str(&mut ctx, "db.users.explain('executionStats').aggregate([{$match: {a: 1}}])").unwrap();
+        assert_eq!(
+            last_request()["query"]["command"],
+            json!({"explain": {"aggregate": "users", "pipeline": [{"$match": {"a": 1}}], "cursor": {}}, "verbosity": "executionStats"})
+        );
+        eval_str(&mut ctx, "db.users.find({a: 1}).sort({b: 1}).hint('a_1').explain()").unwrap();
+        assert_eq!(last_request()["query"]["command"]["explain"], json!({"find": "users", "filter": {"a": 1}, "sort": {"b": 1}, "hint": "a_1"}));
+    }
+
+    #[test]
+    fn bulk_writes_use_write_commands() {
+        let mut ctx = engine();
+        SEEN.with(|s| s.borrow_mut().clear());
+        eval_str(
+            &mut ctx,
+            "db.users.bulkWrite([{insertOne: {document: {_id: 1}}}, {insertOne: {document: {_id: 2}}}, \
+             {updateOne: {filter: {_id: 1}, update: {$set: {a: 1}}, upsert: true}}, {deleteMany: {filter: {a: 2}}}])",
+        )
+        .unwrap();
+        let cmds: Vec<Value> = SEEN.with(|s| s.borrow().iter().map(|r| r["query"]["command"].clone()).collect());
+        assert_eq!(
+            cmds,
+            vec![
+                json!({"insert": "users", "documents": [{"_id": 1}, {"_id": 2}], "ordered": true}),
+                json!({"update": "users", "updates": [{"q": {"_id": 1}, "u": {"$set": {"a": 1}}, "multi": false, "upsert": true}], "ordered": true}),
+                json!({"delete": "users", "deletes": [{"q": {"a": 2}, "limit": 0}], "ordered": true}),
+            ]
+        );
+        // The Bulk API builds the same operations.
+        eval_str(&mut ctx, "const b = db.users.initializeUnorderedBulkOp(); b.find({x: 1}).upsert().updateOne({$set: {y: 1}}); b.find({z: 1}).removeOne(); b.execute()").unwrap();
+        let last = last_request()["query"]["command"].clone();
+        assert_eq!(last, json!({"delete": "users", "deletes": [{"q": {"z": 1}, "limit": 1}], "ordered": false}));
+        // Options beyond upsert route a single update through the command too.
+        eval_str(&mut ctx, "db.users.updateOne({_id: 1}, {$set: {'a.$[e]': 1}}, {arrayFilters: [{e: 0}]})").unwrap();
+        assert_eq!(last_request()["query"]["command"]["updates"][0]["arrayFilters"], json!([{"e": 0}]));
+    }
+
+    #[test]
+    fn database_helpers() {
+        let mut ctx = engine();
+        eval_str(&mut ctx, "db.aggregate([{$currentOp: {}}]).toArray()").unwrap();
+        assert_eq!(
+            last_request()["query"]["command"],
+            json!({"aggregate": 1, "pipeline": [{"$currentOp": {}}], "cursor": {"batchSize": 5000}})
+        );
+        eval_str(&mut ctx, "db.setLogLevel(2, 'storage.journal')").unwrap();
+        assert_eq!(
+            last_request()["query"]["command"],
+            json!({"setParameter": 1, "logComponentVerbosity": {"storage": {"journal": {"verbosity": 2}}}})
+        );
+        eval_str(&mut ctx, "db.createUser({user: 'app', pwd: 'x', roles: ['read']})").unwrap();
+        assert_eq!(last_request()["query"]["command"], json!({"createUser": "app", "pwd": "x", "roles": ["read"]}));
+        assert_eq!(eval_to_string(&mut ctx, "typeof isInteractive() + ' ' + _isWindows()"), "boolean false");
+        assert_eq!(eval_to_string(&mut ctx, "util.inspect([Code('x'), DBRef('c', 1), HexData(0, 'ff'), BSONRegExp('a', 'xi')])"),
+            "[\n  Code('x'),\n  DBRef('c', 1),\n  Binary.createFromBase64('/w==', 0),\n  BSONRegExp('a', 'ix')\n]");
     }
 
     #[test]
@@ -558,6 +689,7 @@ mod tests {
     fn shell_syntax() {
         assert_eq!(shell_command("use shop").as_deref(), Some("__shell.use(\"shop\")"));
         assert_eq!(shell_command("show dbs;").as_deref(), Some("__shell.show(\"dbs\")"));
+        assert_eq!(shell_command("show log startupWarnings").as_deref(), Some("__shell.show(\"log\", \"startupWarnings\")"));
         assert_eq!(shell_command("it").as_deref(), Some("__shell.it()"));
         assert_eq!(shell_command("it = 3"), None);
         assert_eq!(shell_command("db.users.find()"), None);
