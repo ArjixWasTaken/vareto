@@ -12,7 +12,7 @@ use boa_engine::{js_string, Context, JsNativeError, JsResult, JsString, JsValue,
 use serde_json::{json, Value};
 
 use super::session::Session;
-use super::complete::Kind;
+use super::complete::{rule, Kind, Offer, Rule};
 use super::{error_text, names, Completions, Flavor, Flow};
 use crate::ipc::{MongoQuery, QuerySpec};
 
@@ -282,11 +282,22 @@ pub fn complete(code: &str) -> bool {
     ![".", ",", "=", "&&", "||", "?", ":"].iter().any(|d| t.ends_with(d))
 }
 
+/// Completion rules of mongosh: `use <db>`, `show <what>`, a collection's name in quotes.
+const MONGO_RULES: &[Rule] = &[
+    rule(&["USE"], Offer::Databases),
+    rule(&["SHOW"], Offer::Values(&["dbs", "databases", "collections", "tables", "users", "roles", "profile", "log"])),
+    rule(&["DB.GETCOLLECTION", "'"], Offer::Tables),
+    rule(&["DB.GETCOLLECTION", "\""], Offer::Tables),
+    rule(&["DB.GETSIBLINGDB", "'"], Offer::Databases),
+    rule(&["DB.GETSIBLINGDB", "\""], Offer::Databases),
+];
+
 pub struct Mongo {
     buf: Vec<String>,
     tx: Sender<ToJs>,
     rx: Receiver<FromJs>,
     collections: Vec<String>,
+    databases: Vec<String>,
     /// What the prelude's objects have ([`NAMES_JS`]).
     names: Value,
 }
@@ -310,7 +321,7 @@ impl Mongo {
             Ok(FromJs::Names(n)) => serde_json::from_str(&n).unwrap_or_default(),
             _ => Value::Null,
         };
-        Ok(Self { buf: Vec::new(), tx: to_js, rx: from_js, collections: Vec::new(), names })
+        Ok(Self { buf: Vec::new(), tx: to_js, rx: from_js, collections: Vec::new(), databases: Vec::new(), names })
     }
 
     fn eval(&mut self, code: String, s: &mut Session) -> Result<Flow> {
@@ -464,10 +475,11 @@ impl Flavor for Mongo {
 
     fn refresh(&mut self, s: &mut Session) {
         self.collections = s.list_tables(s.database.clone(), None).map(|v| names(&v)).unwrap_or_default();
+        self.databases = s.list_databases().map(|v| names(&v)).unwrap_or_default();
     }
 
     fn completions(&self) -> Completions {
-        let mut w: Vec<String> = ["show dbs", "show collections", "show users", "use", "it", "exit", "help", "db.", "ObjectId(", "ISODate("]
+        let mut w: Vec<String> = ["show", "use", "it", "exit", "help", "db.", "ObjectId(", "ISODate("]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -502,7 +514,14 @@ impl Flavor for Mongo {
                 (w, k)
             })
             .collect();
-        Completions { other, dotted: true, ..Completions::default() }
+        Completions {
+            rules: MONGO_RULES.to_vec(),
+            tables: self.collections.clone(),
+            databases: self.databases.clone(),
+            other,
+            dotted: true,
+            ..Completions::default()
+        }
     }
 }
 

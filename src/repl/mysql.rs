@@ -8,6 +8,7 @@ use crate::textfmt::StreamFormat;
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Mode, Open, SqlBuf};
 use super::table::{self, QueryResult, Style};
+use super::complete::{rule, Offer, Rule};
 use super::{elapsed, error_text, names, pairs, read_script, run_script, Flavor, Flow, Completions, COLUMN_LIMIT, SQL_KEYWORDS};
 
 /// Command-line options of the real client that the shell supports.
@@ -26,6 +27,36 @@ pub struct MysqlOptions {
     /// `--local-infile[=0|1]`; unset: the client's default (MySQL off, MariaDB on).
     pub local_infile: Option<bool>,
 }
+
+/// Character sets `charset` / `SET NAMES` complete to.
+const CHARSETS: &[&str] = &["utf8mb4", "utf8mb3", "utf8", "latin1", "ascii", "binary", "ucs2", "utf16", "utf32", "cp1251", "gbk", "big5", "sjis"];
+
+/// Completion rules of the mysql client (on top of the SQL ones).
+const MYSQL_RULES: &[Rule] = &[
+    rule(&["USE"], Offer::Databases),
+    rule(&["\\u"], Offer::Databases),
+    rule(&["CONNECT"], Offer::Databases),
+    rule(&["\\r"], Offer::Databases),
+    rule(&["DATABASE"], Offer::Databases),
+    rule(&["SCHEMA"], Offer::Databases),
+    rule(&["SHOW", "TABLES", "FROM"], Offer::Databases),
+    rule(&["SHOW", "TABLES", "IN"], Offer::Databases),
+    rule(&["SHOW", "FULL", "TABLES", "FROM"], Offer::Databases),
+    rule(&["SHOW", "FULL", "TABLES", "IN"], Offer::Databases),
+    rule(&["SHOW", "TABLE", "STATUS", "FROM"], Offer::Databases),
+    rule(&["SHOW", "COLUMNS", "FROM"], Offer::Tables),
+    rule(&["SHOW", "FULL", "COLUMNS", "FROM"], Offer::Tables),
+    rule(&["SHOW", "FIELDS", "FROM"], Offer::Tables),
+    rule(&["SHOW", "INDEX", "FROM"], Offer::Tables),
+    rule(&["SHOW", "INDEXES", "FROM"], Offer::Tables),
+    rule(&["SHOW", "KEYS", "FROM"], Offer::Tables),
+    rule(&["SHOW", "CREATE", "TABLE"], Offer::Tables),
+    rule(&["SHOW", "CREATE", "DATABASE"], Offer::Databases),
+    rule(&["CHARSET"], Offer::Values(CHARSETS)),
+    rule(&["\\C"], Offer::Values(CHARSETS)),
+    rule(&["SET", "NAMES"], Offer::Values(CHARSETS)),
+    rule(&["SET", "CHARACTER", "SET"], Offer::Values(CHARSETS)),
+];
 
 /// How a statement's result is shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +82,7 @@ pub struct Mysql {
     pager_cmd: Option<String>,
     tables: Vec<String>,
     columns: Vec<(String, String)>,
+    databases: Vec<String>,
 }
 
 const HELP: &str = "\
@@ -157,6 +189,7 @@ impl Mysql {
             pager_cmd: None,
             tables: Vec::new(),
             columns: Vec::new(),
+            databases: Vec::new(),
         })
     }
 
@@ -695,6 +728,7 @@ impl Flavor for Mysql {
         } else {
             Vec::new()
         };
+        self.databases = s.list_databases().map(|v| names(&v)).unwrap_or_default();
     }
 
     fn completions(&self) -> Completions {
@@ -703,12 +737,14 @@ impl Flavor for Mysql {
             "notee", "nowarning", "pager", "print", "prompt", "rehash", "resetconnection", "system", "tee", "warnings", "charset",
         ];
         Completions {
+            sql: true,
+            rules: MYSQL_RULES.to_vec(),
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: cmds.iter().map(|w| w.to_string()).collect(),
             tables: self.tables.clone(),
             columns: self.columns.clone(),
-            other: Vec::new(),
-            dotted: false,
+            databases: self.databases.clone(),
+            ..Completions::default()
         }
     }
 }

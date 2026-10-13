@@ -8,6 +8,7 @@ use crate::textfmt::StreamFormat;
 use super::session::Session;
 use super::sqlbuf::{Dialect, SqlBuf};
 use super::table::{self, QueryResult, Style};
+use super::complete::{rule, Offer, Rule};
 use super::{elapsed, error_text, names, pairs, read_script, run_script, Flavor, Flow, Completions, COLUMN_LIMIT, SQL_KEYWORDS};
 use crate::db::sql::quote_lit;
 
@@ -45,6 +46,26 @@ pub struct Sqlite {
     /// `.headers` was given (`.mode column` then keeps that choice).
     headers_set: bool,
 }
+
+const ON_OFF: &[&str] = &["on", "off"];
+
+/// Completion rules of sqlite3's dot commands (on top of the SQL ones).
+const SQLITE_RULES: &[Rule] = &[
+    rule(&[".SCHEMA"], Offer::Tables),
+    rule(&[".INDEXES"], Offer::Tables),
+    rule(&[".INDICES"], Offer::Tables),
+    rule(&[".TABLES"], Offer::Tables),
+    rule(&[".MODE"], Offer::Values(&["box", "column", "csv", "json", "line", "list", "table"])),
+    rule(&[".HEADERS"], Offer::Values(ON_OFF)),
+    rule(&[".HEADER"], Offer::Values(ON_OFF)),
+    rule(&[".TIMER"], Offer::Values(ON_OFF)),
+    rule(&[".IMPORT"], Offer::Nothing),
+    rule(&[".IMPORT", "*"], Offer::Tables),
+    rule(&[".READ"], Offer::Nothing),
+    rule(&[".OUTPUT"], Offer::Nothing),
+    rule(&[".ONCE"], Offer::Nothing),
+    rule(&[".NULLVALUE"], Offer::Nothing),
+];
 
 const HELP: &str = "\
 .databases               List names and files of attached databases
@@ -423,12 +444,13 @@ impl Flavor for Sqlite {
     fn completions(&self) -> Completions {
         let dots = [".tables", ".schema", ".indexes", ".databases", ".mode", ".headers", ".timer", ".read", ".help", ".quit", ".exit", ".nullvalue", ".import", ".output", ".once"];
         Completions {
+            sql: true,
+            rules: SQLITE_RULES.to_vec(),
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: dots.iter().map(|w| w.to_string()).collect(),
             tables: self.tables.clone(),
             columns: self.columns.clone(),
-            other: Vec::new(),
-            dotted: false,
+            ..Completions::default()
         }
     }
 }

@@ -310,8 +310,16 @@ Tab opens a completion popup under the cursor:
   pick.
 - **One word at a time:** in `db.product.fi` or `users.em`, only the part after
   the last dot is completed.
-- **Context:** tables after `FROM`/`JOIN`/`UPDATE`/..., columns after
-  `SELECT`/`WHERE`/`ON`/..., and client commands after `\`.
+- **Context:** each shell has its own rules for what fits where. For example:
+  - databases after `use`, `\u`, `\c` or `show tables from`
+  - schemas after `\dn` or `set search_path to`
+  - tables after `FROM`, `JOIN`, `UPDATE`, `DESCRIBE`, `\d` or `.schema`
+  - columns after `SELECT`, `WHERE` or `ON`, limited to the tables the statement
+    names (`u.` completes the columns of the table aliased `u`)
+  - values after `\x`, `\pset format`, `.mode` or `charset`
+  - variables after `\set` or `:`
+  - Redis keys only where a command takes a key
+  - in mongosh, databases after `use` and targets after `show`
 
 Two fzf-style finders open below the line:
 - **Ctrl-T** finds a completion for the word at the cursor, searching all of

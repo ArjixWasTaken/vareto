@@ -14,6 +14,7 @@ use super::psql_vars::{bool_value, interpolate, split_args, split_meta, Vars};
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Mode, Open, SqlBuf};
 use super::table::{self, QueryResult};
+use super::complete::{rule, Offer, Rule};
 use super::{elapsed, error_info, error_text, names, pairs, read_script, run_script, Flavor, Flow, Completions, COLUMN_LIMIT, SQL_KEYWORDS};
 
 /// One level of `\if`.
@@ -45,11 +46,73 @@ pub struct Psql {
     script_dirs: Vec<std::path::PathBuf>,
     tables: Vec<String>,
     columns: Vec<(String, String)>,
+    databases: Vec<String>,
+    schemas: Vec<String>,
     /// A `COPY … FROM STDIN` taking its data from the input lines, up to `\.`.
     copy_in: Option<InlineCopy>,
     /// `\restrict KEY` (as pg_dump writes): meta-commands are refused until `\unrestrict KEY`.
     restricted: Option<String>,
 }
+
+const ON_OFF: &[&str] = &["on", "off"];
+
+/// Completion rules of psql (on top of the SQL ones).
+const PSQL_RULES: &[Rule] = &[
+    rule(&["\\c"], Offer::Databases),
+    rule(&["\\connect"], Offer::Databases),
+    rule(&["\\l"], Offer::Databases),
+    rule(&["\\l+"], Offer::Databases),
+    rule(&["\\dn"], Offer::Schemas),
+    rule(&["\\dn+"], Offer::Schemas),
+    rule(&["SET", "SEARCH_PATH", "TO"], Offer::Schemas),
+    rule(&["SET", "SEARCH_PATH", "="], Offer::Schemas),
+    rule(&["SCHEMA"], Offer::Schemas),
+    rule(&["\\d"], Offer::Tables),
+    rule(&["\\d+"], Offer::Tables),
+    rule(&["\\dS"], Offer::Tables),
+    rule(&["\\dS+"], Offer::Tables),
+    rule(&["\\dt"], Offer::Tables),
+    rule(&["\\dt+"], Offer::Tables),
+    rule(&["\\dv"], Offer::Tables),
+    rule(&["\\dv+"], Offer::Tables),
+    rule(&["\\dm"], Offer::Tables),
+    rule(&["\\dE"], Offer::Tables),
+    rule(&["\\dp"], Offer::Tables),
+    rule(&["\\z"], Offer::Tables),
+    rule(&["\\sv"], Offer::Tables),
+    rule(&["\\sv+"], Offer::Tables),
+    rule(&["\\ev"], Offer::Tables),
+    rule(&["\\copy"], Offer::Tables),
+    rule(&["\\x"], Offer::Values(&["on", "off", "auto"])),
+    rule(&["\\a"], Offer::Nothing),
+    rule(&["\\t"], Offer::Values(ON_OFF)),
+    rule(&["\\timing"], Offer::Values(ON_OFF)),
+    rule(&["\\set"], Offer::Vars),
+    rule(&["\\set", "*"], Offer::Nothing),
+    rule(&["\\unset"], Offer::Vars),
+    rule(&["\\getenv", "*"], Offer::Vars),
+    rule(&["\\gset"], Offer::Nothing),
+    rule(&[":"], Offer::Vars),
+    rule(&["\\pset"], Offer::Values(&[
+        "border", "columns", "csv_fieldsep", "expanded", "fieldsep", "fieldsep_zero", "footer", "format", "linestyle", "null",
+        "numericlocale", "pager", "recordsep", "recordsep_zero", "tableattr", "title", "tuples_only",
+    ])),
+    rule(&["\\pset", "FORMAT"], Offer::Values(&["aligned", "asciidoc", "csv", "html", "unaligned", "wrapped"])),
+    rule(&["\\pset", "BORDER"], Offer::Values(&["0", "1", "2"])),
+    rule(&["\\pset", "LINESTYLE"], Offer::Values(&["ascii", "unicode"])),
+    rule(&["\\pset", "EXPANDED"], Offer::Values(&["on", "off", "auto"])),
+    rule(&["\\pset", "FOOTER"], Offer::Values(ON_OFF)),
+    rule(&["\\pset", "TUPLES_ONLY"], Offer::Values(ON_OFF)),
+    rule(&["\\pset", "NUMERICLOCALE"], Offer::Values(ON_OFF)),
+    rule(&["\\pset", "PAGER"], Offer::Values(&["on", "off", "always"])),
+    rule(&["\\pset", "NULL"], Offer::Nothing),
+    rule(&["\\pset", "TITLE"], Offer::Nothing),
+    rule(&["\\pset", "FIELDSEP"], Offer::Nothing),
+    rule(&["\\pset", "RECORDSEP"], Offer::Nothing),
+    rule(&["\\pset", "CSV_FIELDSEP"], Offer::Nothing),
+    rule(&["\\pset", "TABLEATTR"], Offer::Nothing),
+    rule(&["\\pset", "COLUMNS"], Offer::Nothing),
+];
 
 /// An inline `COPY … FROM STDIN` in progress: the data lines go into `pipe`, which
 /// the daemon reads.
@@ -329,6 +392,8 @@ impl Psql {
             script_dirs: Vec::new(),
             tables: Vec::new(),
             columns: Vec::new(),
+            databases: Vec::new(),
+            schemas: Vec::new(),
             copy_in: None,
             restricted: None,
         };
@@ -1833,6 +1898,18 @@ impl Flavor for Psql {
             )
             .map(|v| pairs(&v))
             .unwrap_or_default();
+        self.databases = s.list_databases().map(|v| names(&v)).unwrap_or_default();
+        self.schemas = s
+            .query_limit(
+                crate::ipc::QuerySpec::Sql {
+                    sql: "SELECT nspname::text FROM pg_catalog.pg_namespace \
+                          WHERE nspname !~ '^pg_' AND nspname <> 'information_schema' ORDER BY 1"
+                        .into(),
+                },
+                Some(COLUMN_LIMIT),
+            )
+            .map(|v| names(&v))
+            .unwrap_or_default();
         self.superuser = s
             .sql("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user")
             .ok()
@@ -1852,12 +1929,16 @@ impl Flavor for Psql {
             "\\dC", "\\dd", "\\ddp", "\\do", "\\dF", "\\des", "\\det", "\\deu", "\\dew", "\\dg", "\\dt+", "\\d+",
         ];
         Completions {
+            sql: true,
+            rules: PSQL_RULES.to_vec(),
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: metas.iter().map(|w| w.to_string()).collect(),
             tables: self.tables.clone(),
             columns: self.columns.clone(),
-            other: Vec::new(),
-            dotted: false,
+            databases: self.databases.clone(),
+            schemas: self.schemas.clone(),
+            vars: self.vars.keys().cloned().collect(),
+            ..Completions::default()
         }
     }
 }

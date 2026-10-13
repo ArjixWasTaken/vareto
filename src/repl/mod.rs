@@ -336,9 +336,9 @@ impl reedline::Completer for ShellCompleter {
         let suggestions: Vec<reedline::Suggestion> = cands
             .into_iter()
             .map(|c| {
-                let label = c.kind.label();
+                let note = c.note();
                 reedline::Suggestion {
-                    display_override: (!label.is_empty()).then(|| format!("{:<width$}  {label}", c.text)),
+                    display_override: Some(format!("{:<width$}  {note}", c.text)),
                     value: c.text,
                     span: reedline::Span::new(start, pos),
                     append_whitespace: false,
@@ -466,7 +466,7 @@ const FIND_HISTORY: &str = "vareto:find-history";
 struct Pick {
     text: String,
     value: String,
-    note: &'static str,
+    note: String,
     /// Width the text is padded to, so the notes line up.
     width: usize,
 }
@@ -516,8 +516,8 @@ fn run_finder(ed: &mut reedline::Reedline, which: &str, words: &Mutex<Completion
     let pos = ed.current_insertion_point();
     let (new, cursor) = if which == FIND_COMPLETION {
         let (start, typed, all) = complete::complete_all(&words.lock().unwrap(), &buffer, pos);
-        let width = all.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0).min(48);
-        let picks = all.into_iter().map(|(text, kind)| Pick { value: text.clone(), text, note: kind.label(), width }).collect();
+        let width = all.iter().map(|c| c.text.chars().count()).max().unwrap_or(0).min(48);
+        let picks = all.into_iter().map(|c| Pick { note: c.note(), value: c.text.clone(), text: c.text, width }).collect();
         let Some(v) = finder(picks, typed) else { return };
         (format!("{}{v}{}", &buffer[..start], &buffer[pos..]), start + v.len())
     } else {
@@ -530,7 +530,7 @@ fn run_finder(ed: &mut reedline::Reedline, which: &str, words: &Mutex<Completion
             .into_iter()
             .map(|h| h.command_line)
             .filter(|c| seen.insert(c.clone()))
-            .map(|c| Pick { text: c.replace('\n', " ↵ "), value: c, note: "", width: 0 })
+            .map(|c| Pick { text: c.replace('\n', " ↵ "), value: c, note: String::new(), width: 0 })
             .collect();
         let Some(v) = finder(picks, buffer.trim()) else { return };
         let len = v.len();
@@ -565,7 +565,12 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
     // fzf's bindings: Ctrl-T finds a completion, Ctrl-R a history entry.
     keys.add_binding(KeyModifiers::CONTROL, KeyCode::Char('t'), ReedlineEvent::ExecuteHostCommand(FIND_COMPLETION.into()));
     keys.add_binding(KeyModifiers::CONTROL, KeyCode::Char('r'), ReedlineEvent::ExecuteHostCommand(FIND_HISTORY.into()));
-    let menu = IdeMenu::default().with_name("completion_menu").with_marker("").with_default_border();
+    // The whole line, not just up to the cursor: `select | from users u` needs the FROM.
+    let menu = IdeMenu::default()
+        .with_name("completion_menu")
+        .with_marker("")
+        .with_default_border()
+        .with_input_mode(reedline::InputMode::FullBuffer);
     let mut ed = Reedline::create()
         .with_history(Box::new(StatementHistory { inner: history, accept: accept.clone() }))
         .with_completer(Box::new(ShellCompleter { words: words.clone() }))

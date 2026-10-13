@@ -4,7 +4,6 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::session::Session;
-use super::complete::Kind;
 use super::{error_text, Completions, Flavor, Flow};
 use crate::ipc::QuerySpec;
 
@@ -13,6 +12,19 @@ pub struct Redis {
     tx: bool,
     keys: Vec<String>,
 }
+
+/// Commands whose first argument is a key (with `*`: every argument is), for
+/// completion: a key is offered there and nowhere else.
+const KEYED_COMMANDS: &[&str] = &[
+    "GET", "SET", "SETNX", "SETEX", "PSETEX", "GETSET", "GETDEL", "GETEX", "GETRANGE", "SETRANGE", "APPEND", "STRLEN", "INCR",
+    "INCRBY", "INCRBYFLOAT", "DECR", "DECRBY", "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "TYPE",
+    "DUMP", "RESTORE", "RENAME", "RENAMENX", "MOVE", "OBJECT", "HGET", "HSET", "HSETNX", "HMGET", "HMSET", "HGETALL", "HDEL",
+    "HKEYS", "HVALS", "HLEN", "HEXISTS", "HINCRBY", "HSCAN", "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX",
+    "LSET", "LREM", "LTRIM", "LINSERT", "SADD", "SREM", "SMEMBERS", "SCARD", "SISMEMBER", "SSCAN", "SPOP", "SRANDMEMBER",
+    "ZADD", "ZREM", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZSCORE", "ZCARD", "ZCOUNT", "ZRANK", "ZINCRBY", "ZSCAN", "XADD",
+    "XRANGE", "XREVRANGE", "XLEN", "PFADD", "PFCOUNT*", "DEL*", "UNLINK*", "EXISTS*", "TOUCH*", "MGET*", "WATCH*", "SUNION*",
+    "SINTER*", "SDIFF*",
+];
 
 const COMMANDS: &[&str] = &[
     "GET", "SET", "DEL", "EXISTS", "EXPIRE", "TTL", "TYPE", "KEYS", "SCAN", "MGET", "MSET", "INCR", "DECR", "INCRBY",
@@ -231,9 +243,12 @@ impl Flavor for Redis {
     }
 
     fn completions(&self) -> Completions {
-        let commands = COMMANDS.iter().map(|c| (c.to_string(), Kind::Command));
-        let keys = self.keys.iter().map(|k| (k.clone(), Kind::Key));
-        Completions { other: commands.chain(keys).collect(), ..Completions::default() }
+        Completions {
+            commands: COMMANDS.iter().map(|c| c.to_string()).collect(),
+            keys: self.keys.clone(),
+            keyed_commands: KEYED_COMMANDS.iter().map(|c| c.to_string()).collect(),
+            ..Completions::default()
+        }
     }
 }
 
