@@ -423,10 +423,49 @@
     dropIndexes() { return command(this._db._name, { dropIndexes: this._name, index: '*' }); }
     drop() { command(this._db._name, { drop: this._name }); return true; }
     stats() { return command(this._db._name, { collStats: this._name }); }
+    dataSize() { return this.stats().size; }
+    storageSize() { return this.stats().storageSize; }
+    totalIndexSize() { return this.stats().totalIndexSize; }
+    totalSize() { const s = this.stats(); return s.storageSize + s.totalIndexSize; }
+    isCapped() { return this.stats().capped === true; }
+    // findOneAnd* run the findAndModify command; they return the document
+    // (before the change, unless returnDocument: 'after').
+    _findAndModify(filter, change, opts) {
+      opts = opts || {};
+      const cmd = Object.assign({ findAndModify: this._name, query: filter || {} }, change);
+      if (opts.sort) cmd.sort = opts.sort;
+      if (opts.projection) cmd.fields = opts.projection;
+      if (opts.upsert) cmd.upsert = true;
+      if (opts.returnDocument === 'after' || opts.returnNewDocument) cmd.new = true;
+      const v = command(this._db._name, cmd).value;
+      return v === undefined ? null : v;
+    }
+    findOneAndUpdate(filter, update, opts) { return this._findAndModify(filter, { update: update }, opts); }
+    findOneAndReplace(filter, doc, opts) { return this._findAndModify(filter, { update: doc }, opts); }
+    findOneAndDelete(filter, opts) { return this._findAndModify(filter, { remove: true }, opts); }
     renameCollection(to) {
       const db = this._db.getName();
       return command('admin', { renameCollection: `${db}.${this._name}`, to: `${db}.${to}` });
     }
+  }
+
+  // mongosh methods this shell can't offer: calling them says so, instead of the
+  // name silently becoming a (sub)collection.
+  const UNSUPPORTED_DB = new Set([
+    'aggregate', 'auth', 'changeUserPassword', 'cloneDatabase', 'commandHelp', 'copyDatabase', 'createRole',
+    'createUser', 'currentOp', 'dropAllUsers', 'dropRole', 'dropUser', 'fsyncLock', 'fsyncUnlock',
+    'getLogComponents', 'getProfilingStatus', 'getReplicationInfo', 'grantRolesToUser', 'killOp', 'listCommands',
+    'logout', 'printCollectionStats', 'printReplicationInfo', 'printShardingStatus', 'revokeRolesFromUser',
+    'rotateCertificates', 'setLogLevel', 'setProfilingLevel', 'shutdownServer', 'updateUser', 'watch',
+  ]);
+  const UNSUPPORTED_COLLECTION = new Set([
+    'analyzeShardKey', 'bulkWrite', 'compactStructuredEncryptionData', 'configureQueryAnalyzer', 'createSearchIndex',
+    'createSearchIndexes', 'dropSearchIndex', 'getPlanCache', 'getSearchIndexes', 'getShardDistribution',
+    'getShardVersion', 'hideIndex', 'initializeOrderedBulkOp', 'initializeUnorderedBulkOp', 'latencyStats',
+    'mapReduce', 'reIndex', 'unhideIndex', 'updateSearchIndex', 'validate', 'watch',
+  ]);
+  function unsupported(what) {
+    return () => { throw new TypeError(`${what}() is not available in the vareto shell`); };
   }
 
   // Unknown properties are sub-collections: db.system.profile.
@@ -434,6 +473,7 @@
     return new Proxy(new Collection(db, name), {
       get(target, prop, recv) {
         if (typeof prop === 'symbol' || prop in target) return Reflect.get(target, prop, recv);
+        if (UNSUPPORTED_COLLECTION.has(prop)) return unsupported(`db.${name}.${prop}`);
         return collectionProxy(db, `${name}.${prop}`);
       },
     });
@@ -449,7 +489,18 @@
     getSiblingDB(name) { return dbProxy(new DB(name)); }
     getMongo() { return { getDB: (n) => this.getSiblingDB(n), getDBNames: () => host({ kind: 'databases' }) }; }
     getCollectionNames() { return host({ kind: 'collections', database: this._name }); }
-    getCollectionInfos() { return command(this._name, { listCollections: 1 }).cursor.firstBatch; }
+    getCollectionInfos(filter, opts) {
+      const cmd = { listCollections: 1, filter: filter || {} };
+      if (opts && opts.nameOnly) cmd.nameOnly = true;
+      return command(this._name, cmd).cursor.firstBatch;
+    }
+    listCollections(filter, opts) { return this.getCollectionInfos(filter, opts); }
+    getUsers() { return command(this._name, { usersInfo: 1 }).users; }
+    hello() { return command(this._name, { hello: 1 }); }
+    isMaster() { return this.hello(); }
+    createView(name, source, pipeline, opts) {
+      return command(this._name, Object.assign({ create: name, viewOn: source, pipeline: pipeline || [] }, opts || {}));
+    }
     runCommand(cmd) { return command(this._name, typeof cmd === 'string' ? { [cmd]: 1 } : cmd); }
     adminCommand(cmd) { return command('admin', typeof cmd === 'string' ? { [cmd]: 1 } : cmd); }
     stats() { return command(this._name, { dbStats: 1 }); }
@@ -465,6 +516,7 @@
     return new Proxy(db, {
       get(target, prop, recv) {
         if (typeof prop === 'symbol' || prop in target || prop.startsWith('_')) return Reflect.get(target, prop, recv);
+        if (UNSUPPORTED_DB.has(prop)) return unsupported(`db.${prop}`);
         return collectionProxy(target, prop);
       },
     });
@@ -481,9 +533,13 @@
     '    it                       Show more results from the last cursor',
     '    exit | quit              Quit the shell',
     '',
+    '  Database methods: getName, getCollection, getCollectionNames, getCollectionInfos (listCollections),',
+    '    getSiblingDB, runCommand, adminCommand, stats, serverStatus, hostInfo, hello, getUsers, version,',
+    '    createCollection, createView, dropDatabase',
     '  Collection methods: find, findOne, aggregate, countDocuments, estimatedDocumentCount,',
     '    distinct, insertOne, insertMany, updateOne, updateMany, replaceOne, deleteOne,',
-    '    deleteMany, getIndexes, createIndex, dropIndex, drop, stats',
+    '    deleteMany, findOneAndUpdate, findOneAndReplace, findOneAndDelete, getIndexes,',
+    '    createIndex, dropIndex, drop, stats, dataSize, storageSize, totalIndexSize, isCapped',
     '  Cursor methods: sort, limit, skip, projection, toArray, forEach, map, next, hasNext, count',
     "  Settings: config.get(key) / config.set(key, value) for displayBatchSize and loopIterationLimit",
     '  Types: ObjectId, ISODate, Long (NumberLong), Int32 (NumberInt), Decimal128 (NumberDecimal),',
@@ -553,6 +609,12 @@
       print(typeof v === 'string' ? v : inspect(v));
     },
     formatError(e) {
+      // Calling something that isn't a method, which on db is usually a collection
+      // (`db.listColections()`, `db.users.fnd()`): the engine doesn't say which.
+      if (e instanceof TypeError && /not a callable function/.test(e.message)) {
+        return `TypeError: ${e.message} (unknown names on db and on collections are collections, ` +
+          'e.g. db.foo is the collection "foo"; type "help" for the methods)';
+      }
       if (e instanceof Error) return `${e.name}: ${e.message}`;
       return `Uncaught ${inspect(e)}`;
     },

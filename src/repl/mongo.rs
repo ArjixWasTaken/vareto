@@ -400,6 +400,9 @@ mod tests {
         let req: Value = serde_json::from_str(&arg_string(args, ctx)?).unwrap();
         SEEN.with(|s| s.borrow_mut().push(req.clone()));
         let ok = match req["kind"].as_str() {
+            Some("query") if req["query"]["op"] == "run_command" => json!({
+                "result": {"cursor": {"firstBatch": [{"name": "users", "type": "collection"}]}, "value": {"n": 1}, "ok": 1},
+            }),
             Some("query") => json!({
                 "documents": [{"_id": {"$oid": "507f1f77bcf86cd799439011"}, "n": {"$numberLong": "9007199254740993"}}],
                 "truncated": true,
@@ -481,6 +484,30 @@ mod tests {
         assert_eq!(eval_to_string(&mut ctx, "let n = 0; for (let i = 0; i < 500; i++) n++; n"), "500");
         assert!(eval_str(&mut ctx, "config.set('loopIterationLimit', -1)").is_err());
         assert!(eval_str(&mut ctx, "config.set('nope', 1)").is_err());
+    }
+
+    #[test]
+    fn db_methods_and_mistakes() {
+        let mut ctx = engine();
+        assert_eq!(eval_to_string(&mut ctx, "db.listCollections({name: 'users'})[0].name"), "users");
+        let req = SEEN.with(|s| s.borrow_mut().pop()).unwrap();
+        assert_eq!(req["query"]["command"], json!({"listCollections": 1, "filter": {"name": "users"}}));
+
+        assert_eq!(eval_to_string(&mut ctx, "db.users.findOneAndUpdate({a: 1}, {$inc: {n: 1}}, {returnDocument: 'after'}).n"), "1");
+        let req = SEEN.with(|s| s.borrow_mut().pop()).unwrap();
+        assert_eq!(
+            req["query"]["command"],
+            json!({"findAndModify": "users", "query": {"a": 1}, "update": {"$inc": {"n": 1}}, "new": true})
+        );
+
+        // Known but unsupported: a clear error rather than a collection.
+        assert_eq!(eval_to_string(&mut ctx, "typeof db.currentOp"), "function");
+        let e = eval_str(&mut ctx, "db.currentOp()").unwrap_err();
+        assert_eq!(format_error(&mut ctx, e), "TypeError: db.currentOp() is not available in the vareto shell");
+        // A typo is a collection; calling it explains that.
+        let e = eval_str(&mut ctx, "db.users.fnd()").unwrap_err();
+        assert!(format_error(&mut ctx, e).contains("db.foo is the collection \"foo\""));
+        assert_eq!(eval_to_string(&mut ctx, "db.users.fnd.getName()"), "users.fnd");
     }
 
     #[test]
