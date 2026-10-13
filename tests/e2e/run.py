@@ -332,6 +332,9 @@ try:
           and "0xDEADBEEF" in r.stdout and "1 row in set, 1 warning" in r.stdout
           and "Warning (Code 1292): Truncated incorrect INTEGER value: '12abc'" in r.stdout
           and "Connection id:" in r.stdout and "| after_reset |" in r.stdout, r.stdout + r.stderr)
+    r = shell("mysql8", "show databases;\nselect cast('ab' as binary) as b;\n")
+    check("mysql 8: _bin text (SHOW DATABASES) prints as text, real binary as hex", r.returncode == 0
+          and "| information_schema |" in r.stdout and "0x6162" in r.stdout, r.stdout + r.stderr)
     r = shell("mysql8", "delete from users;\n", "--safe-updates")
     check("mysql: --safe-updates refuses an unkeyed DELETE", r.returncode == 1 and "ERROR 1175" in r.stderr, r.stderr)
     r = shell("mysql8", "select id, email from users order by id;\n", "-B", "-N")

@@ -14,7 +14,7 @@ use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Connection as _, Either, Executor, Row, TypeInfo, ValueRef};
+use sqlx::{AssertSqlSafe, ConnectOptions, Connection as _, Either, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{Connection, Kind};
 use crate::readonly::SqlDialect;
@@ -217,15 +217,7 @@ where
             Either::Right(row) => {
                 any_rows = true;
                 if types.is_none() {
-                    let cols: Vec<Column> = row
-                        .columns()
-                        .iter()
-                        .map(|c| Column {
-                            name: c.name().to_string(),
-                            type_name: Some(c.type_info().name().to_string()),
-                            table: None,
-                        })
-                        .collect();
+                    let cols = sink_columns(row.columns());
                     types = Some(cols.iter().map(|c| c.type_name.clone().unwrap_or_default()).collect());
                     sink.columns(cols)?;
                 }
@@ -247,8 +239,31 @@ where
 fn sink_columns<C: sqlx::Column>(cols: &[C]) -> Vec<Column> {
     use sqlx::TypeInfo as _;
     cols.iter()
-        .map(|c| Column { name: c.name().to_string(), type_name: Some(c.type_info().name().to_string()), table: None })
+        .map(|c| {
+            let info = c.type_info();
+            let name = mysql_text_type(info.name(), &format!("{info:?}")).unwrap_or(info.name()).to_string();
+            Column { name: c.name().to_string(), type_name: Some(name), table: None }
+        })
         .collect()
+}
+
+/// sqlx names a MySQL column BINARY/VARBINARY/BLOB from its BINARY flag, which the
+/// server also sets on text with a `_bin` collation (`SHOW DATABASES`, information
+/// schema). Only the `binary` character set (collation 63) holds bytes, as the mysql
+/// client decides: for anything else, the text type. `debug` is the type info's
+/// `Debug` text, the only place sqlx shows the collation.
+fn mysql_text_type(name: &str, debug: &str) -> Option<&'static str> {
+    let text = match name {
+        "BINARY" => "CHAR",
+        "VARBINARY" => "VARCHAR",
+        "TINYBLOB" => "TINYTEXT",
+        "BLOB" => "TEXT",
+        "MEDIUMBLOB" => "MEDIUMTEXT",
+        "LONGBLOB" => "LONGTEXT",
+        _ => return None,
+    };
+    let collation: u16 = debug.split("Collation(").nth(1)?.split(')').next()?.trim().parse().ok()?;
+    (collation != 63).then_some(text)
 }
 
 /// The columns of `sql` without running it, for a query that returned no rows
@@ -977,6 +992,17 @@ pub fn quote_lit(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mysql_bin_collations_are_text() {
+        let dbg = |n: u16| format!("MySqlTypeInfo {{ type: VarString, flags: ColumnFlags(BINARY), collation: Collation({n}), max_size: Some(256) }}");
+        assert_eq!(mysql_text_type("VARBINARY", &dbg(46)), Some("VARCHAR"));
+        assert_eq!(mysql_text_type("BLOB", &dbg(83)), Some("TEXT"));
+        assert_eq!(mysql_text_type("VARBINARY", &dbg(63)), None);
+        assert_eq!(mysql_text_type("VARCHAR", &dbg(46)), None);
+        // The Debug text really carries the collation.
+        assert!(format!("{:?}", sqlx::mysql::MySqlTypeInfo::__enum()).contains("Collation("));
+    }
 
     #[test]
     fn copy_frames() {
