@@ -119,6 +119,10 @@ struct MysqlArgs {
     /// mysql: show warnings after every statement.
     #[arg(long)]
     show_warnings: bool,
+    /// mysql: allow LOAD DATA LOCAL INFILE (default: off for MySQL, on for MariaDB, as
+    /// in their clients).
+    #[arg(long, num_args = 0..=1, default_missing_value = "1", value_name = "0|1")]
+    local_infile: Option<u8>,
 }
 
 #[derive(Subcommand)]
@@ -268,6 +272,7 @@ async fn run_cli(daemon: &Daemon, cmd: Cmd) -> Result<()> {
                 skip_column_names: mysql.skip_column_names,
                 column_type_info: mysql.column_type_info,
                 show_warnings: mysql.show_warnings,
+                local_infile: mysql.local_infile.map(|v| v != 0),
             };
             let code = repl::run(daemon, opts).await?;
             if code != 0 {

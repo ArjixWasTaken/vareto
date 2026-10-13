@@ -184,6 +184,16 @@ pub enum Op {
     CopyOut { sql: String, fd: OwnedFd },
     /// The result columns of a statement, without running it.
     Describe { sql: String },
+    /// MySQL `LOAD DATA LOCAL INFILE` from the client's descriptor.
+    LoadData {
+        sql: String,
+        fd: OwnedFd,
+        client_allowed: bool,
+        in_transaction: bool,
+        file_error: Option<String>,
+        warnings: bool,
+        peer: Option<OwnedFd>,
+    },
     /// A query whose formatted rows go to the client's descriptor, unlimited.
     Stream { sql: String, format: crate::textfmt::StreamFormat, fd: OwnedFd, warnings: bool },
 }
@@ -198,6 +208,9 @@ fn check_op(conn: &Connection, op: &Op) -> Result<()> {
         Op::CopyOut { sql, .. } if conn.readonly => readonly::check_copy_out(sql),
         Op::CopyOut { .. } => Ok(()),
         Op::Stream { sql, .. } => check(conn, &QuerySpec::Sql { sql: sql.clone() }, true),
+        Op::LoadData { .. } if kind != Kind::Mysql => bail!("LOAD DATA LOCAL INFILE is for MySQL and MariaDB"),
+        Op::LoadData { .. } if conn.readonly => bail!("read-only connection: LOAD DATA writes to a table"),
+        Op::LoadData { .. } => Ok(()),
         Op::Describe { .. } if !matches!(kind, Kind::Mysql | Kind::Postgres | Kind::Sqlite) => bail!("only SQL statements can be described"),
         Op::Describe { .. } => Ok(()),
     }
@@ -324,6 +337,27 @@ async fn special(inner: &mut Inner, conn: &Connection, op: Op, timeout: Duration
             (r.map(|r| r.map(|n| json!({ "rows": n }))), long)
         }
         Op::Describe { sql } => (tokio::time::timeout(timeout + grace, c.describe(&sql)).await.map(|r| r.map(|cols| json!({ "columns": cols }))), timeout),
+        Op::LoadData { sql, fd, client_allowed, in_transaction, file_error, warnings, peer } => {
+            let crate::db::sql::SqlConn::Mysql(my) = c else { bail!("LOAD DATA LOCAL INFILE is for MySQL and MariaDB") };
+            let started = Instant::now();
+            let req = crate::db::load_data::LoadRequest {
+                sql: &sql,
+                src: fd,
+                client_allowed,
+                in_transaction,
+                file_error,
+                list_warnings: warnings,
+                cancelled,
+                peer,
+            };
+            let r = tokio::time::timeout(long + grace, async {
+                let mut v = crate::db::load_data::load(my, req).await.map_err(crate::db::sql::server_error)?;
+                v["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+                Ok(v)
+            })
+            .await;
+            (r, long)
+        }
         Op::Stream { sql, format, fd, warnings } => {
             let started = Instant::now();
             let kind = conn.cfg.kind;

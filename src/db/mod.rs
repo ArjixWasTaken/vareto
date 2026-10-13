@@ -1,5 +1,6 @@
 pub mod mongo;
 pub mod redis;
+pub mod load_data;
 pub mod sql;
 
 use serde_json::{json, Map, Value};

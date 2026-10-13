@@ -23,6 +23,8 @@ pub struct MysqlOptions {
     pub skip_column_names: bool,
     pub column_type_info: bool,
     pub show_warnings: bool,
+    /// `--local-infile[=0|1]`; unset: the client's default (MySQL off, MariaDB on).
+    pub local_infile: Option<bool>,
 }
 
 /// How a statement's result is shown.
@@ -229,13 +231,15 @@ impl Mysql {
     fn long_command(&mut self, line: &str, s: &mut Session) -> Option<Result<Flow>> {
         let t = line.trim().trim_end_matches(';').trim();
         let (cmd, arg) = t.split_once(char::is_whitespace).map(|(c, a)| (c, a.trim())).unwrap_or((t, ""));
+        // `delimiter`'s argument is taken literally: `delimiter ;` sets `;`.
+        let raw_arg = line.trim().split_once(char::is_whitespace).map(|(_, a)| a.trim()).unwrap_or("");
         let short = match cmd.to_lowercase().as_str() {
             "quit" | "exit" => 'q',
             "help" | "?" => 'h',
             "use" if !arg.is_empty() => 'u',
             "status" => 's',
             "source" if !arg.is_empty() => '.',
-            "delimiter" if !arg.is_empty() => 'd',
+            "delimiter" if !raw_arg.is_empty() => 'd',
             "clear" => 'c',
             "connect" => 'r',
             "edit" => 'e',
@@ -256,8 +260,7 @@ impl Mysql {
             "charset" if !arg.is_empty() => 'C',
             _ => return None,
         };
-        // `delimiter`'s argument is taken literally (it may end in `;`).
-        let arg = if short == 'd' { line.trim().split_once(char::is_whitespace).map(|(_, a)| a.trim()).unwrap_or("") } else { arg };
+        let arg = if short == 'd' { raw_arg } else { arg };
         Some(self.command(short, arg, s))
     }
 
@@ -437,6 +440,11 @@ impl Mysql {
     fn execute(&mut self, sql: &str, shape: Shape, s: &mut Session) -> Result<()> {
         self.last = sql.to_string();
         self.statements += 1;
+        if let Some(Ok(load)) = crate::db::load_data::parse(sql) {
+            if load.local {
+                return self.load_data(sql, &load.file, s);
+            }
+        }
         if let Some(v) = self.stream_to_output(sql, shape, s)? {
             // The rows went straight to the output.
             self.print_warning_list(&v);
@@ -463,6 +471,38 @@ impl Mysql {
             }
             outln!();
         }
+    }
+
+    /// `LOAD DATA LOCAL INFILE`: the daemon reads the file this process opens and
+    /// inserts its records ([`crate::db::load_data`]).
+    fn load_data(&mut self, sql: &str, path: &str, s: &mut Session) -> Result<()> {
+        // A file that can't be opened is reported after the server's checks, as the
+        // real client does; the daemon gets an empty stand-in.
+        let (file, file_error) = match std::fs::File::open(path) {
+            Ok(f) => (f, None),
+            Err(e) => {
+                let desc = e.to_string();
+                let desc = desc.split(" (os error").next().unwrap_or(&desc).to_string();
+                let msg = format!("2 (HY000): File '{path}' not found (OS errno {} - {desc})", e.raw_os_error().unwrap_or(0));
+                (std::fs::File::open("/dev/null")?, Some(msg))
+            }
+        };
+        let client_allowed = self.opts.local_infile.unwrap_or(self.mariadb);
+        let v = s.load_data(sql, std::os::fd::AsFd::as_fd(&file), client_allowed, file_error)?;
+        let secs = elapsed(&v);
+        let warnings = v["warnings"]["count"].as_u64().unwrap_or(0);
+        if !(self.opts.batch && !self.opts.table) {
+            let warn = if warnings > 0 { format!(", {}", plural(warnings, "warning")) } else { String::new() };
+            outln!("Query OK, {} affected{warn} ({secs:.2} sec)", plural(v["affected"].as_u64().unwrap_or(0), "row"));
+            outln!(
+                "Records: {}  Deleted: {}  Skipped: {}  Warnings: {warnings}\n",
+                v["records"].as_u64().unwrap_or(0),
+                v["deleted"].as_u64().unwrap_or(0),
+                v["skipped"].as_u64().unwrap_or(0)
+            );
+        }
+        self.print_warning_list(&v);
+        Ok(())
     }
 
     /// `--batch` output to a file or pipe: the daemon writes the rows there, with no

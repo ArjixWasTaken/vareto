@@ -188,6 +188,20 @@ impl Session {
         res
     }
 
+    /// MySQL `LOAD DATA LOCAL INFILE`, the daemon reading `src`. `file_error`: the
+    /// file couldn't be opened (reported after the server's checks).
+    pub fn load_data(&mut self, sql: &str, src: BorrowedFd<'_>, client_allowed: bool, file_error: Option<String>) -> Result<Value> {
+        let req = Request::SessionLoadData {
+            session: self.id,
+            sql: sql.into(),
+            client_local_infile: client_allowed,
+            in_transaction: self.tx != Tx::Idle,
+            file_error,
+            warnings: self.show_warnings,
+        };
+        self.call_with_fd(req, src)
+    }
+
     /// Update the transaction state after `sql` ran.
     pub fn track(&mut self, sql: &str, ok: bool) {
         self.tx = next_tx(self.kind, self.tx, sql, ok);

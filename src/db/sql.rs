@@ -547,6 +547,10 @@ async fn mysql_stream(
 /// A database error as the server words it, without sqlx's wrapper (and without
 /// Postgres's `at line N`, which is a line in the server's own C source), with
 /// its structured fields. MySQL keeps its code: `1146 (42S02): Table 'x' doesn't exist`.
+pub fn server_error(e: anyhow::Error) -> anyhow::Error {
+    server_message(e)
+}
+
 fn server_message(e: anyhow::Error) -> anyhow::Error {
     let Some(sqlx::Error::Database(d)) = e.downcast_ref::<sqlx::Error>() else { return e };
     crate::db::DbError::from_sqlx(d.as_ref()).into()
@@ -756,8 +760,16 @@ impl SqlConn {
                 sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {ms}"))).execute(c).await?;
             }
             SqlConn::Mysql(c) => {
-                // Not supported by MariaDB; the local timeout still applies.
-                sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(c).await.ok();
+                // MariaDB calls it max_statement_time (in seconds). Setting the wrong one
+                // would leave an "unknown variable" warning that table-less statements
+                // (`SELECT 1`) keep reporting.
+                let version: String = sqlx::query_scalar("SELECT VERSION()").fetch_one(&mut *c).await?;
+                let set = if version.to_lowercase().contains("mariadb") {
+                    format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0)
+                } else {
+                    format!("SET SESSION max_execution_time = {ms}")
+                };
+                sqlx::raw_sql(AssertSqlSafe(set)).execute(c).await.ok();
             }
             // No server-side statement timeout; the local one applies.
             SqlConn::Sqlite(_) => {}

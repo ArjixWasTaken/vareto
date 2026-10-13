@@ -68,6 +68,20 @@ pub enum Request {
     /// request (a shell's `\o` file or pipe, or redirected stdout), with no row
     /// limit. Returns `{"rows": n}` (and MySQL `warnings`).
     SessionStream { session: u64, sql: String, format: crate::textfmt::StreamFormat, #[serde(default)] warnings: bool },
+    /// MySQL `LOAD DATA LOCAL INFILE`: the daemon reads the file from the descriptor
+    /// sent with the request and inserts its records (see `db::load_data`).
+    /// `file_error`: the client couldn't open the file. Returns the `Records:` counts.
+    SessionLoadData {
+        session: u64,
+        sql: String,
+        client_local_infile: bool,
+        #[serde(default)]
+        in_transaction: bool,
+        #[serde(default)]
+        file_error: Option<String>,
+        #[serde(default)]
+        warnings: bool,
+    },
     /// The result columns of a statement without running it (psql `\gdesc`).
     SessionDescribe { session: u64, sql: String },
     SessionClose { session: u64 },
@@ -79,7 +93,7 @@ pub enum Request {
 impl Request {
     /// Requests sent with a file descriptor ([`send_with_fd`]).
     pub fn takes_fd(&self) -> bool {
-        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. })
+        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. } | Request::SessionLoadData { .. })
     }
 
     /// The request's `op` name, for messages.

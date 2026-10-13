@@ -30,8 +30,8 @@ env.update(
 def sh(*args, check=True, **kw):
     return subprocess.run(args, env=env, check=check, text=True, capture_output=True, **kw)
 
-def compose(*args):
-    return sh("docker", "compose", "-f", str(HERE / "docker-compose.yml"), *args)
+def compose(*args, **kw):
+    return sh("docker", "compose", "-f", str(HERE / "docker-compose.yml"), *args, **kw)
 
 failures = []
 def check(name, cond, detail=""):
@@ -426,6 +426,57 @@ try:
     lines = r.stdout.splitlines()
     check("mysql: --batch to a pipe streams every row", r.returncode == 0 and len(lines) == 20001 and lines[0] == "n\tt"
           and lines[1] == "1\ta\\tb" and lines[-1] == "20000\ta\\tb", (len(lines), r.stdout[:200] + r.stderr))
+    # LOAD DATA LOCAL INFILE, emulated by the daemon: the same file through the real
+    # mariadb client (inside its container) and through vareto must give the same
+    # rows and the same Records/Deleted/Skipped/Warnings line.
+    ld = ('id,a,b\n1,"a,b",x\n2,NULL,\\N\n3,"say ""hi""",\n4\n5,e,f,extra\n,empty-id,z\n'
+          '6,"multi\nline",q\n\n7,"tab\\there",d\n1,dup-key,z\n')
+    clean = 'id,a,b\n1,"a,b",x\n2,b,y\n1,"replaced, once",z\n3,"c",\\N\n2,"replaced again",w\n'
+    files = {"ld.csv": ld, "ld-clean.csv": clean}
+    for name, text in files.items():
+        (work / name).write_text(text)
+        compose("exec", "-T", "mariadb", "sh", "-c", f"cat > /tmp/{name}", input=text)
+    load_variants = [
+        ("ld.csv", "", "fields terminated by ',' optionally enclosed by '\"' ignore 1 lines"),
+        # REPLACE is strict: the short row is an error, and nothing is loaded.
+        ("ld.csv", "replace", "fields terminated by ',' enclosed by '\"' ignore 1 lines (id, @a, b) set a = upper(@a)"),
+        ("ld-clean.csv", "replace", "fields terminated by ',' enclosed by '\"' ignore 1 lines (id, @a, b) set a = upper(@a)"),
+    ]
+    def load_outcome(text):
+        for l in text.splitlines():
+            if l.startswith("Records:"):
+                return l
+            if l.startswith("ERROR"):
+                return l.replace(" at line 1", "")
+        return text
+    for i, (name, dup, opts) in enumerate(load_variants):
+        for ddl in (f"drop table if exists ld_real{i}, ld_ours{i}", f"create table ld_real{i} (id int primary key, a varchar(20), b varchar(20))",
+                    f"create table ld_ours{i} like ld_real{i}"):
+            v("sql", "maria-rw", ddl)
+        real = compose("exec", "-T", "mariadb", "mariadb", "-uapp", "-pmy pass@1", "shop", "-vvv", "-e",
+                       f"load data local infile '/tmp/{name}' {dup} into table ld_real{i} {opts}", check=False)
+        r = shell("maria-rw", f"load data local infile '{work / name}' {dup} into table ld_ours{i} {opts};\n", "--force")
+        real_out, ours_out = load_outcome(real.stdout + real.stderr), load_outcome(r.stdout + r.stderr)
+        rows = [vj("sql", "maria-rw", f"select * from ld_{w}{i} order by id")["rows"] for w in ("real", "ours")]
+        check(f"mysql: LOAD DATA LOCAL matches the real client ({name}, {dup or 'default'}): {ours_out}",
+              rows[0] == rows[1] and real_out == ours_out, (real_out, ours_out, rows))
+    # Atomic: an error in the second batch leaves nothing behind.
+    big_ld = work / "ld-big.txt"
+    big_ld.write_text("".join(f"{n}\n" for n in range(1, 3001)))
+    r = shell("maria-rw", "drop table if exists ld_atomic;\ncreate table ld_atomic (id int primary key);\n"
+                          "delimiter //\ncreate trigger ld_guard before insert on ld_atomic for each row "
+                          "if new.id = 1500 then signal sqlstate '45000' set message_text = 'boom'; end if//\ndelimiter ;\n"
+                          f"load data local infile '{big_ld}' into table ld_atomic;\n", "--force")
+    n = vj("sql", "maria-rw", "select count(*) as n from ld_atomic")["rows"][0][0]
+    check("mysql: LOAD DATA LOCAL is atomic (error in a later batch)", "boom" in r.stderr and n == 0, (n, r.stdout + r.stderr))
+    r = shell("maria-rw", "load data local infile '/nope.csv' into table ld_atomic;\n")
+    check("mysql: LOAD DATA LOCAL of a missing file", "ERROR 2 (HY000): File '/nope.csv' not found (OS errno 2 - No such file or directory)" in r.stderr, r.stderr)
+    r = shell("maria-rw", f"load data local infile '{big_ld}' into table ld_atomic;\n", "--local-infile=0")
+    check("mariadb: --local-infile=0 refuses LOAD DATA LOCAL (4166)", "ERROR 4166 (HY000)" in r.stderr, r.stderr)
+    r = shell("mysql8", f"load data local infile '{big_ld}' into table users;\n", "--local-infile")
+    check("mysql 8: server local_infile=OFF refuses LOAD DATA LOCAL (3948)", "ERROR 3948 (42000): Loading local data is disabled" in r.stderr, r.stderr)
+    r = shell("maria", f"load data local infile '{big_ld}' into table users;\n")
+    check("mysql: LOAD DATA LOCAL refused on a read-only connection", "read-only connection" in r.stderr, r.stderr)
     r = shell("lite", ".mode csv\nwith recursive c(x) as (select 1 union all select x + 1 from c where x < 20000) select x from c;\n")
     lines = r.stdout.splitlines()
     check("sqlite3: csv to a pipe streams every row", r.returncode == 0 and len(lines) == 20001 and lines[-1] == "20000",

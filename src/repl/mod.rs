@@ -55,6 +55,7 @@ pub struct Options {
     pub skip_column_names: bool,
     pub column_type_info: bool,
     pub show_warnings: bool,
+    pub local_infile: Option<bool>,
 }
 
 impl Options {
@@ -70,6 +71,7 @@ impl Options {
             skip_column_names: self.skip_column_names,
             column_type_info: self.column_type_info,
             show_warnings: self.show_warnings,
+            local_infile: self.local_infile,
         }
     }
 
@@ -86,6 +88,7 @@ impl Options {
             (self.skip_column_names, "--skip-column-names"),
             (self.column_type_info, "--column-type-info"),
             (self.show_warnings, "--show-warnings"),
+            (self.local_infile.is_some(), "--local-infile"),
         ]
         .into_iter()
         .filter_map(|(on, name)| on.then_some(name))
