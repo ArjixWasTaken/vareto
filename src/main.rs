@@ -52,6 +52,18 @@ enum Cmd {
     Sql { connection: String, sql: String, #[arg(long)] limit: Option<usize> },
     /// Run a MongoDB operation given as JSON (fields of the mongo_query tool).
     Mongo { connection: String, query: String, #[arg(long)] limit: Option<usize> },
+    /// Export a query's full result (no row limit) as CSV or JSON lines. The query
+    /// is SQL, or a MongoDB query as JSON (as for `mongo`) when it starts with `{`.
+    Export {
+        connection: String,
+        query: String,
+        /// Output file; `-` (the default) is stdout.
+        #[arg(short, long, default_value = "-")]
+        output: String,
+        /// Default: jsonl for a `.jsonl`/`.ndjson` file, else csv.
+        #[arg(long, value_enum)]
+        format: Option<ExportFormatArg>,
+    },
     /// Run a Redis command.
     Redis { connection: String, #[arg(trailing_var_arg = true, required = true)] args: Vec<String> },
     /// Interactive shell in the style of the database's own client (mysql, psql,
@@ -87,6 +99,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ExportFormatArg {
+    Csv,
+    Jsonl,
 }
 
 /// Options of the mysql / mariadb client.
@@ -251,6 +269,23 @@ async fn run_cli(daemon: &Daemon, cmd: Cmd) -> Result<()> {
         Cmd::Mongo { connection, query, limit } => {
             let q: MongoQuery = serde_json::from_str(&query).context("parsing mongo query JSON")?;
             print(&daemon.call(Request::Query { connection, query: QuerySpec::Mongo(q), limit }).await?)
+        }
+        Cmd::Export { connection, query, output, format } => {
+            let query = if query.trim_start().starts_with('{') {
+                QuerySpec::Mongo(serde_json::from_str(&query).context("parsing mongo query JSON")?)
+            } else {
+                QuerySpec::Sql { sql: query }
+            };
+            let jsonl = matches!(format, Some(ExportFormatArg::Jsonl))
+                || (format.is_none() && (output.ends_with(".jsonl") || output.ends_with(".ndjson")));
+            let format = if jsonl { ipc::ExportFormat::Jsonl } else { ipc::ExportFormat::Csv };
+            let summary = daemon.export(connection, query, &output, format).await?;
+            // With the data on stdout, the summary goes to stderr.
+            if output == "-" {
+                eprintln!("{}", serde_json::to_string(&summary)?);
+            } else {
+                print(&summary);
+            }
         }
         Cmd::Redis { connection, args } => {
             print(&daemon.call(Request::Query { connection, query: QuerySpec::Redis { args }, limit: None }).await?)

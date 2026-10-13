@@ -50,6 +50,40 @@ impl Daemon {
     pub async fn call(&self, req: Request) -> Result<Value> {
         self.connect().await?.call(&req).await
     }
+
+    /// [`Self::call`] for a request that takes a file descriptor.
+    pub async fn call_with_fd(&self, req: Request, fd: std::os::fd::BorrowedFd<'_>) -> Result<Value> {
+        self.connect().await?.call_with_fd(&req, fd).await
+    }
+
+    /// Export a query's full result to `path` (`-`: stdout). This process creates
+    /// the file and passes it; a failed export leaves no partial file behind.
+    pub async fn export(&self, connection: String, query: crate::ipc::QuerySpec, path: &str, format: crate::ipc::ExportFormat) -> Result<Value> {
+        use std::os::fd::AsFd as _;
+        let req = Request::Export { connection, query, format };
+        if path == "-" {
+            let out = std::io::stdout();
+            return self.call_with_fd(req, out.as_fd()).await;
+        }
+        let p = std::path::Path::new(path);
+        if let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let file = std::fs::File::create(p).with_context(|| format!("creating {path}"))?;
+        let res = self.call_with_fd(req, file.as_fd()).await;
+        drop(file);
+        match res {
+            Ok(mut v) => {
+                v["path"] = serde_json::json!(path);
+                Ok(v)
+            }
+            Err(e) => {
+                // Don't leave a partial file that looks like a complete export.
+                std::fs::remove_file(p).ok();
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Connect to a running daemon without starting one.

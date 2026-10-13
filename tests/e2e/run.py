@@ -637,6 +637,17 @@ try:
     bad = work / "bad.csv"
     res = rpc(54, "tools/call", {"name": "export_query", "arguments": {"connection": "pg", "sql": "SELECT * FROM missing_table", "path": str(bad), "format": "csv"}})
     check("failed export leaves no partial file", res["result"].get("isError") is True and not bad.exists(), res)
+    r = v("export", "pg", "select id, email from users order by id")
+    lines = r.stdout.splitlines()
+    check("vareto export to stdout (csv, masked, all rows)", len(lines) == 301 and lines[0] == "id,email"
+          and "***@" in lines[1] and '"records":300' in r.stderr, (len(lines), r.stderr))
+    cj = work / "cli" / "customers.jsonl"
+    r = v("export", "mongo", '{"collection": "customers", "op": "find", "filter": {}}', "-o", str(cj))
+    rows = cj.read_text().splitlines() if cj.exists() else []
+    check("vareto export mongo to a .jsonl file", len(rows) == 2 and json.loads(r.stdout)["path"] == str(cj), (rows, r.stdout))
+    bad2 = work / "bad2.csv"
+    r = v("export", "pg", "select * from missing_table", "-o", str(bad2), ok=False)
+    check("vareto export failure leaves no file", r.returncode != 0 and not bad2.exists() and "missing_table" in r.stderr, r.stderr)
 
     res = rpc(6, "tools/call", {"name": "save_connection", "arguments": {"name": "saved-redis", "kind": "redis", "ssh": "e2e-bastion", "host": "redis", "password": "redispass"}})
     saved_ok = not res["result"].get("isError")

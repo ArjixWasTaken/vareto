@@ -282,9 +282,9 @@ database's own client:
 
 | Kind | Feels like | Highlights |
 |---|---|---|
-| MySQL/MariaDB | `mysql` / `mariadb` | `\G`, `use`, `status`, `source`, `delimiter`, `pager`, `tee`, `edit`, `warnings`, `prompt`, `connect`, `resetconnection`, `--batch`, `--safe-updates`, ... |
+| MySQL/MariaDB | `mysql` / `mariadb` | `\G`, `use`, `status`, `source`, `delimiter`, `pager`, `tee`, `edit`, `warnings`, `prompt`, `connect`, `resetconnection`, `LOAD DATA LOCAL INFILE`, `--batch`, `--safe-updates`, ... |
 | PostgreSQL | `psql` | The `\d` family with `S`/`+`, `\sf`/`\sv`, variables and `\if`, `\pset`, `\o`, `\watch`, `\gset`/`\gexec`/`\gdesc`, `\crosstabview`, `COPY … FROM STDIN` and `\copy`, `\password`, ... |
-| SQLite | `sqlite3` | `.tables`, `.schema`, `.indexes`, `.databases`, `.mode box\|table\|column\|line\|list\|csv\|json`, `.headers`, `.timer`, `.read` |
+| SQLite | `sqlite3` | `.tables`, `.schema`, `.indexes`, `.databases`, `.mode box\|table\|column\|line\|list\|csv\|json`, `.headers`, `.timer`, `.read`, `.import`, `.output`, `.once` |
 | Redis | `redis-cli` | redis-cli quoting and reply formatting, `SELECT n`, `MULTI`/`EXEC` |
 | MongoDB | `mongosh` | Real JavaScript: `db.coll.find(...).sort(...).limit(...)`, `it`, `use`, `show dbs\|collections`, variables and loops, `ObjectId`/`ISODate`/`Long`/`UUID`, mongosh-style output |
 
@@ -311,8 +311,25 @@ for Postgres and MySQL, so the session survives) and clears the input at the pro
 Ctrl-D exits. An open shell keeps its tunnel up, however long it sits idle.
 
 Everything else stays the same as for the MCP tools: read-only checks run in the daemon,
-masking applies, `query_timeout` applies to each statement, and each statement returns
-at most 5000 rows (`--limit`; the default is `row_limit`).
+masking applies, and `query_timeout` applies to each statement. On the terminal, each
+statement shows at most 5000 rows (`--limit`; the default is `row_limit`).
+
+**Bulk data streams.** Bulk data skips the daemon's socket: the CLI hands the daemon
+its open file, pipe or terminal (file descriptor passing), and the daemon streams
+between it and the database. That covers:
+- results sent to a file or pipe (`\o`, `\g file`, `.output`, `.once`, or stdout
+  redirected) in a layout that can be written a row at a time: psql `unaligned` and
+  `csv`, mysql `--batch`, sqlite3 `list`/`csv`/`line`/`json`
+- psql `COPY` and `\copy`, MySQL `LOAD DATA LOCAL INFILE` and sqlite3 `.import`
+
+There's no row or size limit there, as with the native clients, and memory stays
+flat. Masking and read-only rules still apply. A long transfer runs under
+`export_timeout` rather than `query_timeout`.
+
+```sh
+printf '\\pset format csv\n\\o orders.csv\nselect * from orders;\n' | vareto shell prod-pg  # every row
+vareto shell my -B -e 'select * from orders' | gzip > orders.tsv.gz
+```
 
 ### SQL shells
 
@@ -331,7 +348,17 @@ edit the query buffer in `$EDITOR` (`\e`, `edit`).
   - **Connections:** `connect` and MySQL's `resetconnection` give the session a fresh
     connection.
   - **Options:** `--safe-updates`, `--auto-vertical-output`, `-E`, `-B`/`-r`/`-t`/`-N`,
-    `--column-type-info`, `--show-warnings`, `-f`.
+    `--column-type-info`, `--show-warnings`, `-f`, `--local-infile[=0|1]`.
+  - **`LOAD DATA LOCAL INFILE`:** sqlx can't send a local file to the server, so the
+    daemon does the load itself. It reads your file and inserts the records in
+    batches, in one transaction (or a savepoint inside yours).
+    - **Statement options:** all of them, including terminators, enclosures, escapes,
+      `IGNORE n LINES`, column and `@variable` lists, `SET`, `REPLACE` and the
+      character set.
+    - **Results:** the `Records: … Deleted: … Skipped: … Warnings: …` counts and the
+      warnings come out as the server would give them.
+    - **Gates:** like the real clients, it needs `--local-infile` (the default for
+      MariaDB, not for MySQL) and the server's `local_infile`.
 - **psql:**
   - **Scripting:** variables (`\set`, `-v name=value`, `:var`, `:'var'`, `:"var"`)
     and the special ones (`ON_ERROR_STOP`, `ON_ERROR_ROLLBACK`, `AUTOCOMMIT`, `ECHO`,
@@ -353,6 +380,18 @@ edit the query buffer in `$EDITOR` (`\e`, `edit`).
   - **Server messages:** `NOTICE`/`WARNING`/`INFO` messages print before the result.
   - **`\password`:** builds the SCRAM-SHA-256 verifier locally, so the password never
     leaves the CLI.
+
+### SQLite shell
+
+- **Output:** a script starts in `list` mode without headers, and a terminal session
+  in `box`, as sqlite3 does.
+- **`.import`:** `[--csv|--ascii] [--skip N] [--schema S] [-v] FILE|'|cmd' TABLE`
+  follows sqlite3's rules:
+  - A new table takes its columns from the first row.
+  - Short and long rows get sqlite3's messages.
+  - A row the database refuses is reported and skipped.
+- **`.output` / `.once`:** `.output FILE|'|cmd'` sends output to a file or a pipe, and
+  `.once` does so for the next statement only.
 
 ### MongoDB shell
 
@@ -395,6 +434,8 @@ vareto open prod / close prod   # pin a tunnel open / close it
 vareto sql prod-pg "select now()"
 vareto mongo m '{"collection":"users","op":"find","filter":{"active":true}}'
 vareto redis cache GET some:key
+vareto export prod-pg "select * from orders" -o orders.csv   # every row; csv or jsonl
+vareto export m '{"collection":"users","op":"find"}' > users.csv
 vareto status / stop
 ```
 

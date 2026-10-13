@@ -1,7 +1,6 @@
 //! Shaping results for the model (limits, cell truncation, masking) and exporting them.
 
 use std::io::Write;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -279,17 +278,11 @@ pub struct ExportWriter<'m> {
 }
 
 impl<'m> ExportWriter<'m> {
-    /// `table`: source table for SQL `table.column` mask rules; `collection`: for Mongo.
-    pub fn create(path: &Path, format: ExportFormat, masker: &'m Masker, table: Option<String>, collection: Option<String>) -> Result<Self> {
-        let file = tokio_blocking(|| {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            std::fs::File::create(path)
-        })
-        .with_context(|| format!("creating {}", path.display()))?;
+    /// Write to `file` (the client opened it and passed it). `table`: source table
+    /// for SQL `table.column` mask rules; `collection`: for Mongo.
+    pub fn new(file: std::fs::File, format: ExportFormat, masker: &'m Masker, table: Option<String>, collection: Option<String>) -> Self {
         let file = BlockingFile(file);
-        Ok(Self {
+        Self {
             format,
             masker,
             table,
@@ -303,7 +296,7 @@ impl<'m> ExportWriter<'m> {
             records: 0,
             no_rows: false,
             done: false,
-        })
+        }
     }
 
     fn csv(&mut self) -> &mut csv::Writer<std::io::BufWriter<BlockingFile>> {
@@ -588,6 +581,7 @@ mod tests {
     #[test]
     fn streaming_export() {
         let dir = std::env::temp_dir().join(format!("vareto-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let masker = Masker::new(&[]).unwrap();
         let cols = || {
             vec![
@@ -596,7 +590,7 @@ mod tests {
             ]
         };
         let csv_path = dir.join("o.csv");
-        let mut w = ExportWriter::create(&csv_path, ExportFormat::Csv, &masker, None, None).unwrap();
+        let mut w = ExportWriter::new(std::fs::File::create(&csv_path).unwrap(), ExportFormat::Csv, &masker, None, None);
         w.columns(cols()).unwrap();
         w.row(vec![json!(1), json!("a,b")]).unwrap();
         w.row(vec![json!(2), Value::Null]).unwrap();
@@ -604,7 +598,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&csv_path).unwrap(), "id,name\n1,\"a,b\"\n2,\n");
 
         let jl = dir.join("o.jsonl");
-        let mut w = ExportWriter::create(&jl, ExportFormat::Jsonl, &masker, None, None).unwrap();
+        let mut w = ExportWriter::new(std::fs::File::create(&jl).unwrap(), ExportFormat::Jsonl, &masker, None, None);
         w.columns(cols()).unwrap();
         w.row(vec![json!(1), json!("x")]).unwrap();
         w.finish().unwrap();
@@ -612,7 +606,7 @@ mod tests {
 
         // Documents to CSV: header from the first documents, later new keys reported.
         let dc = dir.join("d.csv");
-        let mut w = ExportWriter::create(&dc, ExportFormat::Csv, &masker, None, None).unwrap();
+        let mut w = ExportWriter::new(std::fs::File::create(&dc).unwrap(), ExportFormat::Csv, &masker, None, None);
         for i in 0..CSV_DOC_SAMPLE {
             w.doc(json!({"a": i, "b": {"x": 1}})).unwrap();
         }
@@ -624,7 +618,7 @@ mod tests {
         assert!(text.starts_with("a,b\n0,\"{\"\"x\"\":1}\"\n"), "{}", &text[..40]);
 
         let empty = dir.join("e.csv");
-        let mut w = ExportWriter::create(&empty, ExportFormat::Csv, &masker, None, None).unwrap();
+        let mut w = ExportWriter::new(std::fs::File::create(&empty).unwrap(), ExportFormat::Csv, &masker, None, None);
         w.affected(3, None).unwrap();
         assert!(w.finish().is_err());
         std::fs::remove_dir_all(dir).ok();

@@ -195,13 +195,10 @@ impl Server {
         } else {
             std::env::current_dir().map_err(|e| McpError::internal_error(e.to_string(), None))?.join(path)
         };
-        self.forward(Request::Export {
-            connection: a.connection,
-            query,
-            path: path.to_string_lossy().into_owned(),
-            format: a.format,
+        Ok(match self.daemon.export(a.connection, query, &path.to_string_lossy(), a.format).await {
+            Ok(v) => ok_json(v),
+            Err(e) => err(e),
         })
-        .await
     }
 
     #[tool(description = "Save a new connection for future use. Saved connections are always read-only; the password (if any) goes to the OS keyring, never to a file. Use `ssh` to tunnel through an SSH host (then host/port are resolved on that server, default 127.0.0.1 and the kind's default port).")]

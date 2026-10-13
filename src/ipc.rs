@@ -40,7 +40,9 @@ pub enum Request {
     SaveConnection(SaveConnection),
     DeleteSavedConnection { name: String },
     Query { connection: String, query: QuerySpec, limit: Option<usize> },
-    Export { connection: String, query: QuerySpec, path: String, format: ExportFormat },
+    /// Stream a query's full result into the file sent with the request (the
+    /// client opens it, so the daemon never opens client paths).
+    Export { connection: String, query: QuerySpec, format: ExportFormat },
     ListDatabases { connection: String },
     ListTables { connection: String, database: Option<String>, pattern: Option<String> },
     DescribeTable { connection: String, database: Option<String>, table: String },
@@ -108,7 +110,7 @@ pub enum Request {
 impl Request {
     /// Requests sent with a file descriptor ([`send_with_fd`]).
     pub fn takes_fd(&self) -> bool {
-        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. } | Request::SessionLoadData { .. } | Request::SessionImport { .. })
+        matches!(self, Request::Export { .. } | Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. } | Request::SessionLoadData { .. } | Request::SessionImport { .. })
     }
 
     /// The request's `op` name, for messages.

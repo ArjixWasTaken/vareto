@@ -1,6 +1,5 @@
 //! Request dispatch.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -43,7 +42,10 @@ pub async fn handle(
             let out = run_query(state, &connection, &query, limit, force_readonly).await?;
             Ok(out.to_json(cfg.defaults.max_cell_chars))
         }
-        Request::Export { connection, query, path, format } => export(state, &connection, &query, &path, format, force_readonly).await,
+        Request::Export { connection, query, format } => {
+            let fd = fd.context("Export needs a file descriptor")?;
+            export(state, &connection, &query, fd, format, force_readonly).await
+        }
         Request::ListDatabases { connection } => {
             let (conn, live, t) = setup(state, &connection, force_readonly).await?;
             let out = match &live.backend {
@@ -185,11 +187,7 @@ pub(super) fn check(conn: &Connection, q: &QuerySpec, session: bool) -> Result<(
 }
 
 /// Stream a query's full result to a file. No row cap; bounded by `export_timeout`.
-async fn export(state: &State, name: &str, q: &QuerySpec, path: &str, format: ExportFormat, force_readonly: bool) -> Result<Value> {
-    let path = PathBuf::from(path);
-    if !path.is_absolute() {
-        bail!("export path must be absolute");
-    }
+async fn export(state: &State, name: &str, q: &QuerySpec, dst: std::os::fd::OwnedFd, format: ExportFormat, force_readonly: bool) -> Result<Value> {
     let cfg = state.config()?;
     let timeout = cfg.defaults.export_timeout;
     let mut conn = cfg.connection(name)?.clone();
@@ -203,7 +201,7 @@ async fn export(state: &State, name: &str, q: &QuerySpec, path: &str, format: Ex
         QuerySpec::Mongo(mq) => (None, Some(mq.collection.clone())),
         QuerySpec::Redis { .. } => (None, None),
     };
-    let mut w = ExportWriter::create(&path, format, &live.masker, table, collection)?;
+    let mut w = ExportWriter::new(std::fs::File::from(dst), format, &live.masker, table, collection);
     let res = match (&live.backend, q) {
         (Backend::Sql(p), QuerySpec::Sql { sql }) => p.stream(sql, &mut w, conn.readonly, timeout).await,
         (Backend::Mongo(m), QuerySpec::Mongo(mq)) => m.stream(mq, None, &mut w, timeout).await,
@@ -217,15 +215,11 @@ async fn export(state: &State, name: &str, q: &QuerySpec, path: &str, format: Ex
     let summary = res.and_then(|()| w.finish());
     match summary {
         Ok(mut v) => {
-            v["path"] = json!(path);
             v["elapsed_secs"] = json!((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
             Ok(v)
         }
-        Err(e) => {
-            // Don't leave a partial file that looks like a complete export.
-            std::fs::remove_file(&path).ok();
-            Err(e.context(format!("export to {} failed (export_timeout is {}s)", path.display(), timeout.as_secs())))
-        }
+        // The client removes its partial file.
+        Err(e) => Err(e.context(format!("export failed (export_timeout is {}s)", timeout.as_secs()))),
     }
 }
 
