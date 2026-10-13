@@ -35,6 +35,8 @@ pub struct Session {
     pub tx: Tx,
     /// Row cap per statement (`--limit`); the daemon's default when unset.
     pub limit: Option<usize>,
+    /// MySQL `warnings` / `\W`: fetch each statement's warnings, not just their count.
+    pub show_warnings: bool,
 }
 
 impl Session {
@@ -57,6 +59,7 @@ impl Session {
             backend_id: v["backend_id"].as_i64(),
             tx: Tx::Idle,
             limit,
+            show_warnings: false,
         })
     }
 
@@ -82,7 +85,7 @@ impl Session {
             QuerySpec::Sql { sql } => Some(sql.clone()),
             _ => None,
         };
-        let res = self.call(Request::SessionQuery { session: self.id, query, limit });
+        let res = self.call(Request::SessionQuery { session: self.id, query, limit, warnings: self.show_warnings });
         if let Some(sql) = sql {
             self.tx = next_tx(self.kind, self.tx, &sql, res.is_ok());
         }
@@ -105,6 +108,15 @@ impl Session {
         let v = self.call(Request::SessionUse { session: self.id, database: database.into() })?;
         self.database = v["database"].as_str().map(str::to_string);
         self.backend_id = v["backend_id"].as_i64().or(self.backend_id);
+        self.tx = Tx::Idle;
+        Ok(())
+    }
+
+    /// A fresh connection for the session (mysql `connect`, `resetconnection`).
+    pub fn reset(&mut self) -> Result<()> {
+        let v = self.call(Request::SessionReset { session: self.id })?;
+        self.database = v["database"].as_str().map(str::to_string);
+        self.backend_id = v["backend_id"].as_i64();
         self.tx = Tx::Idle;
         Ok(())
     }

@@ -114,6 +114,16 @@ password_cmd = "printf 'my pass@1'"
 database = "shop"
 readonly = false
 
+# Oracle MySQL, next to MariaDB, for the client features that differ.
+[connections.mysql8]
+kind = "mysql"
+tunnel = "dc"
+host = "mysql"
+user = "app"
+password = "my pass@1"
+database = "shop"
+readonly = false
+
 [connections.mongo]
 kind = "mongodb"
 tunnel = "dc"
@@ -306,6 +316,23 @@ try:
     check("mysql: each result set of a CALL, binary as hex, Empty set", r.returncode == 0
           and "| a |\n+---+\n| 1 |" in r.stdout and "| b | c |" in r.stdout and "Query OK, 0 rows affected" in r.stdout
           and "0xDEADBEEF" in r.stdout and "Empty set" in r.stdout, r.stdout + r.stderr)
+    for i in range(90):
+        if v("sql", "mysql8", "SELECT 1", ok=False).returncode == 0:
+            break
+        time.sleep(1)
+    r = shell("mysql8", "select id, data from users order by id;\nselect cast('12abc' as unsigned) as w;\n"
+                        "\\x\nconnect\nselect 1 as after_reset;\n", "--show-warnings")
+    check("mysql 8: binary as hex, --show-warnings, resetconnection/connect", r.returncode == 0
+          and "0xDEADBEEF" in r.stdout and "1 row in set, 1 warning" in r.stdout
+          and "Warning (Code 1292): Truncated incorrect INTEGER value: '12abc'" in r.stdout
+          and "Connection id:" in r.stdout and "| after_reset |" in r.stdout, r.stdout + r.stderr)
+    r = shell("mysql8", "delete from users;\n", "--safe-updates")
+    check("mysql: --safe-updates refuses an unkeyed DELETE", r.returncode == 1 and "ERROR 1175" in r.stderr, r.stderr)
+    r = shell("mysql8", "select id, email from users order by id;\n", "-B", "-N")
+    check("mysql: --batch --skip-column-names", r.returncode == 0 and r.stdout == "1\ta@example.com\n2\tb@example.com\n", repr(r.stdout))
+    r = shell("maria", "select 1 as a \\p \\G\nselect 'x' as b, 2 as c \\S\nwarnings\nselect cast('1x' as unsigned) as w;\n")
+    check("mariadb: \\p, \\G mid-line, \\S, warnings", r.returncode == 0 and "--------------\nselect 1 as a\n--------------" in r.stdout
+          and "a: 1" in r.stdout and "x\t2" in r.stdout and "Warning (Code 1292)" in r.stdout, r.stdout + r.stderr)
     r = shell("maria", "select 1;\nselect * from nope;\nselect 2;\n", "--force")
     check("mysql: --force goes on after an error, exit 1", r.returncode == 1 and "ERROR 1146" in r.stderr and "| 2 |" in r.stdout,
           (r.returncode, r.stdout + r.stderr))

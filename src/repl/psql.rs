@@ -636,7 +636,7 @@ impl Psql {
         let interrupts = super::interrupt::count();
         let mut runs = 0u64;
         loop {
-            let now = chrono::Utc::now().format("%a %d %b %Y %I:%M:%S %p UTC");
+            let now = chrono::Local::now().format("%a %d %b %Y %I:%M:%S %p");
             let mut opts = self.print.clone();
             opts.title = Some(match &self.print.title {
                 Some(t) => format!("{t}  {now} (every {every}s)"),

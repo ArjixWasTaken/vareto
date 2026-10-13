@@ -34,7 +34,11 @@ pub enum Request {
     /// Pin a dedicated connection for an interactive shell. Sessions belong to the
     /// socket that opened them and close with it.
     SessionOpen { connection: String, #[serde(default)] database: Option<String> },
-    SessionQuery { session: u64, query: QuerySpec, #[serde(default)] limit: Option<usize> },
+    /// `warnings`: MySQL, also return the statement's warnings (not only their count).
+    SessionQuery { session: u64, query: QuerySpec, #[serde(default)] limit: Option<usize>, #[serde(default)] warnings: bool },
+    /// Replace the session's connection with a fresh one (mysql `connect`,
+    /// `resetconnection`): session state is gone, the database stays.
+    SessionReset { session: u64 },
     /// Switch the session's database (Postgres reconnects, MySQL `USE`, Mongo's
     /// current db, Redis `SELECT`).
     SessionUse { session: u64, database: String },

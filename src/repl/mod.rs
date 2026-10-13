@@ -41,6 +41,52 @@ pub struct Options {
     pub force: bool,
     /// psql `-v name=value`.
     pub set: Vec<String>,
+    // mysql client options.
+    pub safe_updates: bool,
+    pub auto_vertical: bool,
+    pub vertical: bool,
+    pub batch: bool,
+    pub raw: bool,
+    pub table: bool,
+    pub skip_column_names: bool,
+    pub column_type_info: bool,
+    pub show_warnings: bool,
+}
+
+impl Options {
+    fn mysql(&self) -> mysql::MysqlOptions {
+        mysql::MysqlOptions {
+            force: self.force,
+            safe_updates: self.safe_updates,
+            auto_vertical: self.auto_vertical,
+            vertical: self.vertical,
+            batch: self.batch,
+            raw: self.raw,
+            table: self.table,
+            skip_column_names: self.skip_column_names,
+            column_type_info: self.column_type_info,
+            show_warnings: self.show_warnings,
+        }
+    }
+
+    /// The mysql-only options that were given.
+    fn mysql_flags(&self) -> Vec<&'static str> {
+        [
+            (self.force, "--force"),
+            (self.safe_updates, "--safe-updates"),
+            (self.auto_vertical, "--auto-vertical-output"),
+            (self.vertical, "--vertical"),
+            (self.batch, "--batch"),
+            (self.raw, "--raw"),
+            (self.table, "--table"),
+            (self.skip_column_names, "--skip-column-names"),
+            (self.column_type_info, "--column-type-info"),
+            (self.show_warnings, "--show-warnings"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
 }
 
 pub enum Flow {
@@ -215,16 +261,16 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<i32> {
     out::set_interactive(interactive);
     tokio::task::spawn_blocking(move || {
         let mut s = Session::open(rt, client, ro, &opts.connection, opts.database.clone(), opts.limit)?;
+        if s.kind != Kind::Mysql && !opts.mysql_flags().is_empty() {
+            anyhow::bail!("{} only apply to mysql connections", opts.mysql_flags().join(", "));
+        }
         let mut f: Box<dyn Flavor> = match s.kind {
-            Kind::Mysql => Box::new(mysql::Mysql::new(&s, &opts)),
+            Kind::Mysql => Box::new(mysql::Mysql::new(&mut s, opts.mysql())?),
             Kind::Postgres => Box::new(psql::Psql::new(&s, &opts, interactive)?),
             Kind::Redis => Box::new(redis::Redis::new()),
             Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
             Kind::Mongodb => Box::new(mongo::Mongo::new(interactive)?),
         };
-        if opts.force && s.kind != Kind::Mysql {
-            anyhow::bail!("--force is for mysql connections");
-        }
         if !opts.set.is_empty() && s.kind != Kind::Postgres {
             anyhow::bail!("-v/--set is for postgres connections");
         }
@@ -358,8 +404,9 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
                 }
                 if s.database != db {
                     f.refresh(s);
-                    *words.borrow_mut() = f.words();
                 }
+                // Cheap, and picks up `rehash`.
+                *words.borrow_mut() = f.words();
             }
             Err(ReadlineError::Interrupted) => {
                 f.reset();

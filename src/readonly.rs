@@ -203,8 +203,12 @@ pub fn check_sql(dialect: SqlDialect, sql: &str) -> Result<()> {
     }
 }
 
-/// A statement that only changes harmless session state (`USE db` on MySQL,
-/// `SET search_path` on Postgres). Interactive sessions on read-only connections
+/// MySQL session variables a read-only shell may set: the ones `--safe-updates`
+/// uses. (`SET NAMES` is allowed too.)
+const MYSQL_SESSION_VARS: &[&str] = &["sql_safe_updates", "sql_select_limit", "max_join_size"];
+
+/// A statement that only changes harmless session state (`USE db`, `SET NAMES`
+/// and the `--safe-updates` variables on MySQL, `SET search_path` on Postgres). Interactive sessions on read-only connections
 /// allow it, and run it outside the read-only transaction so it persists.
 pub fn session_statement(dialect: SqlDialect, sql: &str) -> bool {
     use sqlparser::ast::{Expr, Set, Statement};
@@ -212,6 +216,15 @@ pub fn session_statement(dialect: SqlDialect, sql: &str) -> bool {
     let [stmt] = stmts.as_slice() else { return false };
     match (dialect, stmt) {
         (SqlDialect::Mysql, Statement::Use(_)) => true,
+        (SqlDialect::Mysql, Statement::Set(Set::SetNames { .. } | Set::SetNamesDefault {})) => true,
+        (SqlDialect::Mysql, Statement::Set(Set::SingleAssignment { variable, values, hivevar: false, .. })) => {
+            let name = variable.to_string().to_ascii_lowercase();
+            MYSQL_SESSION_VARS.contains(&name.as_str()) && values.iter().all(|v| matches!(v, Expr::Value(_)))
+        }
+        (SqlDialect::Mysql, Statement::Set(Set::MultipleAssignments { assignments })) => assignments.iter().all(|a| {
+            let name = a.name.to_string().to_ascii_lowercase();
+            MYSQL_SESSION_VARS.contains(&name.as_str()) && matches!(a.value, Expr::Value(_))
+        }),
         (SqlDialect::Postgres, Statement::Set(Set::SingleAssignment { variable, values, hivevar: false, .. })) => {
             variable.to_string().eq_ignore_ascii_case("search_path")
                 && values.iter().all(|v| matches!(v, Expr::Identifier(_) | Expr::Value(_)))
@@ -515,6 +528,9 @@ mod tests {
         assert!(!session_statement(SqlDialect::Postgres, "SET default_transaction_read_only = off"));
         assert!(!session_statement(SqlDialect::Postgres, "SET search_path TO app; DROP TABLE t"));
         assert!(!session_statement(SqlDialect::Mysql, "SET SESSION TRANSACTION READ WRITE"));
+        assert!(session_statement(SqlDialect::Mysql, "SET NAMES utf8mb4"));
+        assert!(session_statement(SqlDialect::Mysql, "SET sql_safe_updates=1, sql_select_limit=1000, max_join_size=1000000"));
+        assert!(!session_statement(SqlDialect::Mysql, "SET sql_safe_updates=1, autocommit=0"));
         assert!(!session_statement(SqlDialect::Mysql, "SELECT 1"));
     }
 }

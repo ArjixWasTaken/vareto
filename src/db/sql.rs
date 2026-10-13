@@ -277,7 +277,7 @@ impl SqlPool {
         let fut = async {
             match self {
                 SqlPool::Postgres(pool) => pg_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout), describe).await,
-                SqlPool::Mysql(pool) => mysql_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout), describe).await,
+                SqlPool::Mysql(pool) => mysql_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout), describe, None).await,
                 SqlPool::Sqlite(pool) => sqlite_stream(&mut *pool.acquire().await?, sql, sink, describe).await,
             }
         };
@@ -465,7 +465,51 @@ async fn pg_stream(c: &mut sqlx::PgConnection, sql: &str, sink: &mut dyn Sink, r
     }
 }
 
-async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>, describe: bool) -> Result<()> {
+/// What a MySQL session wants to know about warnings after each statement.
+pub struct Warnings {
+    /// Also fetch the warnings themselves (`SHOW WARNINGS`), not only their count.
+    pub list: bool,
+    /// `{"count": n, "list": [{level, code, message}]}` once fetched.
+    pub found: Option<Value>,
+}
+
+/// The statement's warnings, read on the same connection (and transaction) right
+/// after it: anything else in between would reset them.
+async fn mysql_warnings(c: &mut sqlx::MySqlConnection, list: bool) -> Option<Value> {
+    use sqlx::Row as _;
+    // SHOW WARNINGS first: it leaves the warnings alone, while any other statement
+    // (even `SELECT @@warning_count`) clears them.
+    let listed = if list {
+        let rows = sqlx::raw_sql("SHOW WARNINGS").fetch_all(&mut *c).await.ok()?;
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let text = |i: usize| r.try_get_unchecked::<&str, _>(i).unwrap_or("").to_string();
+                serde_json::json!({ "level": text(0), "code": text(1).parse::<u64>().unwrap_or(0), "message": text(2) })
+            })
+            .collect();
+        Some(items)
+    } else {
+        None
+    };
+    let row = sqlx::raw_sql("SELECT @@warning_count").fetch_one(&mut *c).await.ok()?;
+    let count: u64 = row.try_get_unchecked::<&str, _>(0).ok()?.parse().ok()?;
+    let mut v = serde_json::json!({ "count": count });
+    if let Some(items) = listed.filter(|l| !l.is_empty()) {
+        v["list"] = Value::Array(items);
+    }
+    Some(v)
+}
+
+async fn mysql_stream(
+    c: &mut sqlx::MySqlConnection,
+    sql: &str,
+    sink: &mut dyn Sink,
+    readonly: bool,
+    timeout: Option<Duration>,
+    describe: bool,
+    mut warnings: Option<&mut Warnings>,
+) -> Result<()> {
     let affected = |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected();
     let set_timeout = timeout.map(|t| format!("SET SESSION max_execution_time = {}", t.as_millis()));
     if readonly {
@@ -474,6 +518,9 @@ async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn S
             sqlx::raw_sql(AssertSqlSafe(s)).execute(&mut *tx).await.ok();
         }
         let mut out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        if let (Ok(_), Some(w)) = (&out, warnings.as_deref_mut()) {
+            w.found = mysql_warnings(&mut tx, w.list).await;
+        }
         if describe && matches!(out, Ok(false)) {
             out = describe_empty!(&mut *tx, sql, sink).map(|()| false);
         }
@@ -483,7 +530,11 @@ async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn S
         if let Some(s) = set_timeout {
             sqlx::raw_sql(AssertSqlSafe(s)).execute(&mut *c).await.ok();
         }
-        if !drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await? && describe {
+        let rows = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await?;
+        if let Some(w) = warnings {
+            w.found = mysql_warnings(c, w.list).await;
+        }
+        if !rows && describe {
             describe_empty!(&mut *c, sql, sink)?;
         }
         Ok(())
@@ -532,8 +583,9 @@ impl SqlConn {
     }
 
     /// Run user SQL on this connection. `readonly` wraps it in a READ ONLY
-    /// transaction that is rolled back.
-    pub async fn stream(&mut self, sql: &str, sink: &mut dyn Sink, readonly: bool) -> Result<()> {
+    /// transaction that is rolled back. MySQL also reports the statement's warnings
+    /// into `warnings`.
+    pub async fn stream(&mut self, sql: &str, sink: &mut dyn Sink, readonly: bool, warnings: Option<&mut Warnings>) -> Result<()> {
         let dialect = match self {
             SqlConn::Postgres(_) => SqlDialect::Postgres,
             SqlConn::Mysql(_) => SqlDialect::Mysql,
@@ -542,7 +594,7 @@ impl SqlConn {
         let describe = crate::readonly::returns_rows(dialect, sql);
         let res = match self {
             SqlConn::Postgres(c) => pg_stream(c, sql, sink, readonly, None, describe).await,
-            SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None, describe).await,
+            SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None, describe, warnings).await,
             // Read-only connections open the file read-only.
             SqlConn::Sqlite(c) => sqlite_stream(c, sql, sink, describe).await,
         };
@@ -551,7 +603,7 @@ impl SqlConn {
 
     pub async fn run(&mut self, sql: &str, limit: usize, readonly: bool) -> Result<Output> {
         let mut c = Collector::new(limit, None);
-        self.stream(sql, &mut c, readonly).await?;
+        self.stream(sql, &mut c, readonly, None).await?;
         Ok(c.finish())
     }
 

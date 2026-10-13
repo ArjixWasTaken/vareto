@@ -65,10 +65,11 @@ pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bo
             }
         }
         Request::SessionOpen { connection, database } => session::open(state, client, &connection, database, force_readonly).await,
-        Request::SessionQuery { session, query, limit } => {
+        Request::SessionQuery { session, query, limit, warnings } => {
             let limit = limit.unwrap_or(state.config()?.defaults.row_limit).clamp(1, MAX_ROW_LIMIT);
-            session::query(state, client, session, query, limit).await
+            session::query(state, client, session, query, limit, warnings).await
         }
+        Request::SessionReset { session } => session::reset(state, client, session).await,
         Request::SessionUse { session, database } => session::use_db(state, client, session, &database).await,
         Request::SessionClose { session } => session::close(state, Some(client), session).await,
         Request::SessionCancel { session } => session::cancel(state, session).await,

@@ -18,6 +18,11 @@ services:
     environment: { MARIADB_ROOT_PASSWORD: rootpass, MARIADB_DATABASE: shop, MARIADB_USER: app, MARIADB_PASSWORD: "my pass@1" }
     volumes: ["./seed/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
     networks: [internal]
+  mysql:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: rootpass, MYSQL_DATABASE: shop, MYSQL_USER: app, MYSQL_PASSWORD: "my pass@1" }
+    volumes: ["./seed/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    networks: [internal]
   mongo:
     image: mongo:7
     environment: { MONGO_INITDB_ROOT_USERNAME: root, MONGO_INITDB_ROOT_PASSWORD: mongopass, MONGO_INITDB_DATABASE: shop }

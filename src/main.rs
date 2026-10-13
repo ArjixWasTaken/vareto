@@ -73,6 +73,8 @@ enum Cmd {
         /// psql: set a variable, as `\set name value` (repeatable).
         #[arg(short = 'v', long = "set", value_name = "NAME=VALUE")]
         set: Vec<String>,
+        #[command(flatten)]
+        mysql: MysqlArgs,
     },
     /// Config file helpers.
     Config {
@@ -84,6 +86,38 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+}
+
+/// Options of the mysql / mariadb client.
+#[derive(clap::Args)]
+struct MysqlArgs {
+    /// mysql: refuse UPDATE/DELETE without a key in the WHERE (also caps SELECT at 1000 rows).
+    #[arg(short = 'U', long, alias = "i-am-a-dummy")]
+    safe_updates: bool,
+    /// mysql: print results wider than the terminal vertically.
+    #[arg(long)]
+    auto_vertical_output: bool,
+    /// mysql: print every result vertically.
+    #[arg(short = 'E', long)]
+    vertical: bool,
+    /// mysql: tab-separated rows without borders or footers.
+    #[arg(short = 'B', long)]
+    batch: bool,
+    /// mysql: don't escape special characters in --batch output.
+    #[arg(short, long)]
+    raw: bool,
+    /// mysql: tables even with --batch.
+    #[arg(short, long)]
+    table: bool,
+    /// mysql: leave out column names.
+    #[arg(short = 'N', long)]
+    skip_column_names: bool,
+    /// mysql: print each result's column metadata.
+    #[arg(long)]
+    column_type_info: bool,
+    /// mysql: show warnings after every statement.
+    #[arg(long)]
+    show_warnings: bool,
 }
 
 #[derive(Subcommand)]
@@ -207,8 +241,25 @@ async fn run_cli(daemon: &Daemon, cmd: Cmd) -> Result<()> {
         Cmd::Redis { connection, args } => {
             print(&daemon.call(Request::Query { connection, query: QuerySpec::Redis { args }, limit: None }).await?)
         }
-        Cmd::Shell { connection, database, limit, execute, force, set } => {
-            let code = repl::run(daemon, repl::Options { connection, database, limit, execute, force, set }).await?;
+        Cmd::Shell { connection, database, limit, execute, force, set, mysql } => {
+            let opts = repl::Options {
+                connection,
+                database,
+                limit,
+                execute,
+                force,
+                set,
+                safe_updates: mysql.safe_updates,
+                auto_vertical: mysql.auto_vertical_output,
+                vertical: mysql.vertical,
+                batch: mysql.batch,
+                raw: mysql.raw,
+                table: mysql.table,
+                skip_column_names: mysql.skip_column_names,
+                column_type_info: mysql.column_type_info,
+                show_warnings: mysql.show_warnings,
+            };
+            let code = repl::run(daemon, opts).await?;
             if code != 0 {
                 std::process::exit(code);
             }

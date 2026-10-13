@@ -168,7 +168,7 @@ async fn refresh(s: &Session, inner: &mut Inner, conn: &Connection, live: Arc<Li
     Ok(true)
 }
 
-pub async fn query(state: &State, owner: u64, id: u64, q: QuerySpec, limit: usize) -> Result<Value> {
+pub async fn query(state: &State, owner: u64, id: u64, q: QuerySpec, limit: usize, warnings: bool) -> Result<Value> {
     let s = get(state, id, Some(owner)).await?;
     let (conn, live, timeout) = setup(state, &s.name, s.force_readonly).await?;
     check(&conn, &q, true)?;
@@ -177,7 +177,7 @@ pub async fn query(state: &State, owner: u64, id: u64, q: QuerySpec, limit: usiz
         tokio::spawn(async move {
             let mut inner = s.inner.lock().await;
             let reconnected = refresh(&s, &mut inner, &conn, live, timeout).await?;
-            let mut v = execute(&mut inner, &conn, &q, limit, timeout).await?;
+            let mut v = execute(&mut inner, &conn, &q, limit, timeout, warnings).await?;
             if reconnected {
                 v["reconnected"] = json!(true);
             }
@@ -202,7 +202,7 @@ pub async fn query(state: &State, owner: u64, id: u64, q: QuerySpec, limit: usiz
     }
 }
 
-async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usize, timeout: Duration) -> Result<Value> {
+async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usize, timeout: Duration, show_warnings: bool) -> Result<Value> {
     let started = Instant::now();
     let kind = conn.cfg.kind;
     let mut extra = serde_json::Map::new();
@@ -211,7 +211,9 @@ async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usi
             let d = dialect(kind);
             let wrap = conn.readonly && !readonly::session_statement(d, sql);
             let mut col = Collector::new(limit, None);
-            match tokio::time::timeout(timeout + Duration::from_secs(5), c.stream(sql, &mut col, wrap)).await {
+            let mut warnings = crate::db::sql::Warnings { list: show_warnings, found: None };
+            let want = (kind == Kind::Mysql).then_some(&mut warnings);
+            match tokio::time::timeout(timeout + Duration::from_secs(5), c.stream(sql, &mut col, wrap, want)).await {
                 Ok(r) => r?,
                 Err(_) => {
                     let old = std::mem::replace(&mut inner.pinned, Pinned::Broken);
@@ -225,6 +227,9 @@ async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usi
             }
             if kind == Kind::Mysql && sql.trim_start().get(..3).is_some_and(|w| w.eq_ignore_ascii_case("use")) {
                 inner.database = c.scalar("SELECT DATABASE()").await?.as_str().map(str::to_string);
+            }
+            if let Some(w) = warnings.found {
+                extra.insert("warnings".into(), w);
             }
             out
         }
@@ -282,6 +287,19 @@ pub async fn use_db(state: &State, owner: u64, id: u64, database: &str) -> Resul
             inner.database = Some(database.to_string());
         }
     }
+    let backend_id = s.cancel.lock().unwrap().backend.as_ref().map(|(_, id)| *id);
+    Ok(json!({ "database": inner.database, "backend_id": backend_id }))
+}
+
+/// mysql `connect` / `resetconnection`: a fresh connection for the session, in the
+/// same database.
+pub async fn reset(state: &State, owner: u64, id: u64) -> Result<Value> {
+    let s = get(state, id, Some(owner)).await?;
+    let (conn, live, timeout) = setup(state, &s.name, s.force_readonly).await?;
+    let mut inner = s.inner.lock().await;
+    let old = std::mem::replace(&mut inner.pinned, Pinned::Broken);
+    unpin(old).await;
+    refresh(&s, &mut inner, &conn, live, timeout).await?;
     let backend_id = s.cancel.lock().unwrap().backend.as_ref().map(|(_, id)| *id);
     Ok(json!({ "database": inner.database, "backend_id": backend_id }))
 }
