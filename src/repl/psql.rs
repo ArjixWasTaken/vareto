@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::out::{self, outln};
 use super::psql_catalog::{self as catalog, lit, Listing, Mods};
+use super::psql_copy::{self as copy, Direction, Endpoint};
 use super::psql_print::{crosstab, PrintOpts};
 use super::psql_vars::{bool_value, interpolate, split_args, split_meta, Vars};
 use super::session::{Session, Tx};
@@ -43,6 +44,10 @@ pub struct Psql {
     script_dirs: Vec<std::path::PathBuf>,
     tables: Vec<String>,
     columns: Vec<(String, String)>,
+    /// A `COPY … FROM STDIN` waiting for its data (the lines up to `\.`).
+    copy_in: Option<(String, String)>,
+    /// `\restrict KEY` (as pg_dump writes): meta-commands are refused until `\unrestrict KEY`.
+    restricted: Option<String>,
 }
 
 const HELP: &str = "\
@@ -50,6 +55,7 @@ General
   \\q                     quit psql
   \\crosstabview [COLUMNS] execute query and display result in crosstab
   \\g [(OPTIONS)] [FILE]  execute query (and send result to file or |pipe)
+  \\gdesc                 describe result of query, without executing it
   \\gexec                 execute query, then execute each value in its result
   \\gset [PREFIX]         execute query and store result in psql variables
   \\gx [(OPTIONS)] [FILE] as \\g, but forces expanded output mode
@@ -67,6 +73,7 @@ Query Buffer
   \\w FILE                write query buffer to file
 
 Input/Output
+  \\copy ...              perform SQL COPY with data stream to the client host
   \\echo [-n] [STRING]    write string to standard output (-n for no newline)
   \\i FILE                execute commands from file
   \\ir FILE               as \\i, but relative to location of current script
@@ -147,6 +154,7 @@ Formatting
 Connection
   \\c [DBNAME]            connect to another database
   \\conninfo              display information about current connection
+  \\password [USERNAME]   securely change the password for a user
 
 Operating System
   \\cd [DIR]              change the current working directory
@@ -311,6 +319,8 @@ impl Psql {
             script_dirs: Vec::new(),
             tables: Vec::new(),
             columns: Vec::new(),
+            copy_in: None,
+            restricted: None,
         };
         p.sync_conn_vars(s);
         Ok(p)
@@ -365,6 +375,11 @@ impl Psql {
 
     /// Send one statement, keeping psql's result variables up to date.
     fn query(&mut self, sql: &str, s: &mut Session) -> Result<Value> {
+        self.query_with(sql, s, &mut |s| s.sql(sql))
+    }
+
+    /// [`Self::query`], with `run` sending the statement (COPY has its own requests).
+    fn query_with(&mut self, sql: &str, s: &mut Session, run: &mut dyn FnMut(&mut Session) -> Result<Value>) -> Result<Value> {
         self.last = sql.to_string();
         self.stmt = sql.to_string();
         if self.var("ECHO") == "queries" || (self.var("ECHO") == "all" && self.interactive) {
@@ -388,7 +403,7 @@ impl Psql {
         if savepoint {
             s.sql("SAVEPOINT pg_psql_temporary_savepoint")?;
         }
-        let res = s.sql(sql);
+        let res = run(s);
         if savepoint {
             match &res {
                 Ok(_) => {
@@ -403,7 +418,16 @@ impl Psql {
         }
         match res {
             Ok(v) => {
-                let rows: u64 = QueryResult::from_json(&v)
+                for n in v["notices"].as_array().into_iter().flatten() {
+                    out::flush();
+                    eprintln!("{}:  {}", n["severity"].as_str().unwrap_or("NOTICE"), n["message"].as_str().unwrap_or(""));
+                }
+                let rows: u64 = if let Some(n) = v["rows"].as_u64() {
+                    n
+                } else if let Some(data) = v["data"].as_str() {
+                    copy::count_rows(sql, data) as u64
+                } else {
+                    QueryResult::from_json(&v)
                     .into_parts()
                     .iter()
                     .map(|p| match p {
@@ -411,7 +435,8 @@ impl Psql {
                         QueryResult::Affected { rows } => *rows,
                         _ => 0,
                     })
-                    .sum();
+                    .sum()
+                };
                 self.vars.insert("ROW_COUNT".into(), rows.to_string());
                 self.vars.insert("ERROR".into(), "false".into());
                 self.vars.insert("SQLSTATE".into(), "00000".into());
@@ -442,6 +467,20 @@ impl Psql {
     }
 
     fn execute_with(&mut self, sql: &str, vertical: bool, opts: &PrintOpts, s: &mut Session) -> Result<()> {
+        match copy::direction(sql) {
+            Some(Direction::In) => {
+                self.start_copy_in(sql);
+                return Ok(());
+            }
+            Some(Direction::Out) => {
+                let v = self.query_with(sql, s, &mut |s| s.copy_out(sql))?;
+                let data = v["data"].as_str().unwrap_or("");
+                out::text(data);
+                self.note(&format!("COPY {}", copy::count_rows(sql, data)));
+                return Ok(());
+            }
+            None => {}
+        }
         let v = self.query(sql, s)?;
         for part in QueryResult::from_json(&v).into_parts() {
             match part {
@@ -460,6 +499,113 @@ impl Psql {
         if self.timing {
             outln!("Time: {:.3} ms", elapsed(&v) * 1000.0);
         }
+        Ok(())
+    }
+
+    /// Collect the data lines of a `COPY … FROM STDIN` (up to `\.` or the end of input).
+    fn start_copy_in(&mut self, sql: &str) {
+        if self.interactive && !self.flag("QUIET") {
+            eprintln!("Enter data to be copied followed by a newline.\nEnd with a backslash and a period on a line by itself, or an EOF signal.");
+        }
+        self.copy_in = Some((sql.to_string(), String::new()));
+    }
+
+    /// Send a COPY's data.
+    fn copy_data(&mut self, sql: &str, data: String, s: &mut Session) -> Result<()> {
+        let mut data = Some(data);
+        let v = self.query_with(sql, s, &mut |s| s.copy_in(sql, data.take().unwrap_or_default()))?;
+        self.note(&format!("COPY {}", v["rows"].as_u64().unwrap_or(0)));
+        Ok(())
+    }
+
+    /// `\copy`: COPY with the file on this side.
+    fn meta_copy(&mut self, arg: &str, s: &mut Session) -> Result<()> {
+        let m = copy::parse_meta(arg)?;
+        match m.direction {
+            Direction::In => {
+                let data = match &m.endpoint {
+                    Endpoint::Std | Endpoint::PStd => {
+                        self.start_copy_in(&m.sql);
+                        return Ok(());
+                    }
+                    Endpoint::File(f) => std::fs::read_to_string(f).with_context(|| f.clone())?,
+                    Endpoint::Program(cmd) => {
+                        let o = std::process::Command::new("sh").arg("-c").arg(cmd).stderr(std::process::Stdio::inherit()).output()?;
+                        if !o.status.success() {
+                            bail!("program \"{cmd}\" failed: {}", o.status);
+                        }
+                        String::from_utf8(o.stdout).context("program output is not UTF-8")?
+                    }
+                };
+                self.copy_data(&m.sql, data, s)
+            }
+            Direction::Out => {
+                let v = self.query_with(&m.sql, s, &mut |s| s.copy_out(&m.sql))?;
+                let data = v["data"].as_str().unwrap_or("");
+                match &m.endpoint {
+                    Endpoint::Std => out::text(data),
+                    Endpoint::PStd => {
+                        out::flush();
+                        print!("{data}");
+                        std::io::stdout().flush().ok();
+                    }
+                    Endpoint::File(f) => std::fs::write(f, data).with_context(|| f.clone())?,
+                    Endpoint::Program(cmd) => {
+                        let mut child = std::process::Command::new("sh").arg("-c").arg(cmd).stdin(std::process::Stdio::piped()).spawn()?;
+                        child.stdin.take().expect("piped").write_all(data.as_bytes()).ok();
+                        child.wait()?;
+                    }
+                }
+                self.note(&format!("COPY {}", copy::count_rows(&m.sql, data)));
+                Ok(())
+            }
+        }
+    }
+
+    /// `\gdesc`: the result columns of the query buffer, without running it.
+    fn gdesc(&mut self, sql: &str, s: &mut Session) -> Result<()> {
+        self.stmt = sql.to_string();
+        let v = s.describe(sql)?;
+        let cols = v["columns"].as_array().cloned().unwrap_or_default();
+        if cols.is_empty() {
+            outln!("The command has no result, or the result has no columns.");
+            return Ok(());
+        }
+        let values: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let oid = c["oid"].as_u64().map(|o| format!("{o}::pg_catalog.oid")).unwrap_or_else(|| "NULL::pg_catalog.oid".into());
+                format!("({}, {oid}, {i})", lit(c["name"].as_str().unwrap_or("")))
+            })
+            .collect();
+        let q = format!(
+            "SELECT n AS \"Column\", pg_catalog.format_type(o, NULL) AS \"Type\" FROM (VALUES {}) v(n, o, i) ORDER BY i",
+            values.join(", ")
+        );
+        if let Some((columns, rows)) = self.catalog(s, &q)? {
+            let opts = self.print.clone();
+            self.print_rows(&opts, &columns, &rows, false);
+        }
+        Ok(())
+    }
+
+    /// `\password [user]`: a SCRAM verifier computed here, so the password never
+    /// leaves this process.
+    fn password(&mut self, user: Option<&str>, s: &mut Session) -> Result<()> {
+        let user = match user {
+            Some(u) => u.to_string(),
+            None => s.sql("SELECT current_user")?["rows"][0][0].as_str().unwrap_or_default().to_string(),
+        };
+        let pw = rpassword::prompt_password(format!("Enter new password for user \"{user}\": "))?;
+        let again = rpassword::prompt_password("Enter it again: ")?;
+        if pw != again {
+            bail!("Passwords didn't match.");
+        }
+        let mut salt = [0u8; 16];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut salt)?;
+        let verifier = copy::scram_verifier(&pw, &salt, 4096);
+        s.sql(&format!("ALTER USER {} PASSWORD {}", super::psql_vars::quote_ident(&user), lit(&verifier)))?;
         Ok(())
     }
 
@@ -1076,6 +1222,20 @@ impl Psql {
     }
 
     fn meta(&mut self, cmd: &str, arg: &str, s: &mut Session) -> Result<Flow> {
+        if let Some(key) = &self.restricted {
+            if cmd == "unrestrict" && arg.trim() == key {
+                self.restricted = None;
+                return Ok(Flow::Continue);
+            }
+            bail!("backslash commands are restricted; only \\unrestrict is allowed");
+        }
+        if cmd == "restrict" {
+            if arg.trim().is_empty() {
+                bail!("\\restrict: missing required argument");
+            }
+            self.restricted = Some(arg.trim().to_string());
+            return Ok(Flow::Continue);
+        }
         if matches!(cmd, "if" | "elif" | "else" | "endif") {
             self.conditional(cmd, arg)?;
             return Ok(Flow::Continue);
@@ -1105,6 +1265,13 @@ impl Psql {
                     None => self.execute_with(&sql, vertical, &print, s)?,
                 }
             }
+            "copy" => self.meta_copy(arg, s)?,
+            "gdesc" => {
+                let sql = self.take_query()?;
+                self.last = sql.clone();
+                self.gdesc(&sql, s)?;
+            }
+            "password" => self.password(first, s)?,
             "gset" => {
                 let sql = self.take_query()?;
                 let (columns, rows) = self.result_table(&sql, s)?;
@@ -1476,11 +1643,24 @@ impl Flavor for Psql {
     }
 
     fn prompt(&self, s: &Session) -> String {
+        if self.copy_in.is_some() {
+            return ">> ".into();
+        }
         let which = if self.buf.is_empty() { "PROMPT1" } else { "PROMPT2" };
         self.expand_prompt(self.var(which), s)
     }
 
     fn line(&mut self, line: &str, s: &mut Session) -> Result<Flow> {
+        if let Some((_, data)) = &mut self.copy_in {
+            if line != "\\." {
+                data.push_str(line);
+                data.push('\n');
+                return Ok(Flow::Continue);
+            }
+            let (sql, data) = self.copy_in.take().expect("checked");
+            self.copy_data(&sql, data, s)?;
+            return Ok(Flow::Continue);
+        }
         if self.var("ECHO") == "all" && !self.interactive {
             outln!("{line}");
         }
@@ -1508,6 +1688,10 @@ impl Flavor for Psql {
             self.cond.clear();
             eprintln!("reached EOF without finding closing \\endif(s)");
         }
+        // End of input ends a COPY's data.
+        if let Some((sql, data)) = self.copy_in.take() {
+            self.copy_data(&sql, data, s)?;
+        }
         let rest = self.buf.take();
         if !rest.is_empty() {
             self.execute(&rest, End::Normal, s)?;
@@ -1516,7 +1700,7 @@ impl Flavor for Psql {
     }
 
     fn pending(&self) -> bool {
-        !self.buf.is_empty()
+        !self.buf.is_empty() || self.copy_in.is_some()
     }
 
     fn stop_on_error(&self) -> bool {
@@ -1532,6 +1716,7 @@ impl Flavor for Psql {
     }
 
     fn reset(&mut self) {
+        self.copy_in = None;
         self.buf.clear();
     }
 
@@ -1575,7 +1760,7 @@ impl Flavor for Psql {
             "\\x", "\\timing", "\\g", "\\gx", "\\gset", "\\gexec", "\\watch", "\\crosstabview", "\\i", "\\ir", "\\echo",
             "\\qecho", "\\warn", "\\p", "\\r", "\\e", "\\w", "\\s", "\\o", "\\set", "\\unset", "\\pset", "\\a", "\\t", "\\f",
             "\\C", "\\H", "\\T", "\\if", "\\elif", "\\else", "\\endif", "\\prompt", "\\getenv", "\\setenv", "\\cd", "\\!",
-            "\\errverbose", "\\sf", "\\sv", "\\ef", "\\ev", "\\z", "\\dp", "\\dx", "\\dT", "\\dD", "\\dE", "\\dy", "\\dL",
+            "\\copy", "\\gdesc", "\\password", "\\errverbose", "\\sf", "\\sv", "\\ef", "\\ev", "\\z", "\\dp", "\\dx", "\\dT", "\\dD", "\\dE", "\\dy", "\\dL",
             "\\dO", "\\dP", "\\dX", "\\db", "\\dconfig", "\\drds", "\\drg", "\\dRp", "\\dRs", "\\da", "\\dA", "\\dc",
             "\\dC", "\\dd", "\\ddp", "\\do", "\\dF", "\\des", "\\det", "\\deu", "\\dew", "\\dg", "\\dt+", "\\d+",
         ];

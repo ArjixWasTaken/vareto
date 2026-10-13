@@ -351,6 +351,24 @@ try:
           and " postgres\n(1 row)" in r.stdout, r.stdout + r.stderr)
     r = shell("pg-sock", "select count(*) as n from users;\n")
     check("postgres over a unix socket (no tunnel)", r.returncode == 0 and "300" in r.stdout, r.stdout + r.stderr)
+    r = shell("pg-sock", "copy (select id from users where id <= 3 order by id) to stdout;\ncopy users to '/tmp/x';\n"
+                         "\\copy users from '/dev/null'\n")
+    check("psql: read-only COPY TO STDOUT only", r.returncode == 0 and "1\n2\n3\nCOPY 3" in r.stdout
+          and "`COPY users ...` is not a read statement" in r.stderr and "COPY FROM writes to a table" in r.stderr, r.stdout + r.stderr)
+    r = shell("pg", "copy users to stdout;\n")
+    check("psql: COPY TO STDOUT refused under mask rules", "mask rules" in r.stderr and "@example.com" not in r.stdout, r.stdout + r.stderr)
+    cfile = work / "copy.csv"
+    r = shell("pg-rw", "create temp table ct (id int, name text);\nCOPY ct (id, name) FROM stdin;\n1\tone\n2\ttwo\n\\.\n"
+                       "copy ct to stdout;\n"
+                       f"\\copy ct to '{cfile}' with (format csv, header)\n\\copy ct from '{cfile}' with (format csv, header)\n"
+                       "select count(*) as n from ct;\nselect 1 as a, 'x'::text as b \\gdesc\n"
+                       "do $$ begin raise notice 'hello %', 42; end $$;\n"
+                       "\\restrict k1\n\\echo blocked\n\\unrestrict k1\n\\echo free\n")
+    check("psql: COPY FROM STDIN data, COPY TO STDOUT, \\copy to/from a file, \\gdesc, NOTICE, \\restrict",
+          r.returncode == 0 and "COPY 2\n1\tone\n2\ttwo\nCOPY 2\n" in r.stdout
+          and (cfile.read_text() if cfile.exists() else "") == "id,name\n1,one\n2,two\n" and " n\n---\n 4\n(1 row)" in r.stdout
+          and " a      | integer" in r.stdout and " b      | text" in r.stdout and "NOTICE:  hello 42" in r.stderr
+          and "restricted" in r.stderr and "blocked" not in r.stdout and "free" in r.stdout, r.stdout + r.stderr)
 
     r = shell("maria", "use information_schema\nselect database();\nselect id, email from shop.users order by id\\G\n")
     check("mysql: USE persists, \\G vertical output", r.returncode == 0 and "Database changed" in r.stdout

@@ -1,6 +1,7 @@
 //! The long-lived daemon: owns tunnels and DB pools, serves the unix socket.
 
 mod handlers;
+pub mod notices;
 mod session;
 
 use std::collections::HashMap;

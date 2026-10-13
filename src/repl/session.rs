@@ -104,6 +104,25 @@ impl Session {
         self.query(QuerySpec::Sql { sql: sql.into() })
     }
 
+    /// Postgres `COPY … FROM STDIN` with `data`. Returns `{"rows": n}`.
+    pub fn copy_in(&mut self, sql: &str, data: String) -> Result<Value> {
+        let res = self.call(Request::SessionCopyIn { session: self.id, sql: sql.into(), data });
+        self.tx = next_tx(self.kind, self.tx, sql, res.is_ok());
+        res
+    }
+
+    /// Postgres `COPY … TO STDOUT`. Returns `{"data": text}`.
+    pub fn copy_out(&mut self, sql: &str) -> Result<Value> {
+        let res = self.call(Request::SessionCopyOut { session: self.id, sql: sql.into() });
+        self.tx = next_tx(self.kind, self.tx, sql, res.is_ok());
+        res
+    }
+
+    /// A statement's result columns without running it: `{"columns": [{name, type, oid}]}`.
+    pub fn describe(&mut self, sql: &str) -> Result<Value> {
+        self.call(Request::SessionDescribe { session: self.id, sql: sql.into() })
+    }
+
     pub fn use_db(&mut self, database: &str) -> Result<()> {
         let v = self.call(Request::SessionUse { session: self.id, database: database.into() })?;
         self.database = v["database"].as_str().map(str::to_string);

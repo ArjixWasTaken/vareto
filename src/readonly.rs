@@ -203,6 +203,22 @@ pub fn check_sql(dialect: SqlDialect, sql: &str) -> Result<()> {
     }
 }
 
+/// Postgres `COPY … TO STDOUT` on a read-only connection: the copy must go to the
+/// client (not a server file or program) and its query must be a read.
+pub fn check_copy_out(sql: &str) -> Result<()> {
+    use sqlparser::ast::{CopySource, CopyTarget, Statement};
+    let stmts = parse(SqlDialect::Postgres, sql).map_err(|e| anyhow::anyhow!("read-only connection: could not parse COPY ({e})"))?;
+    let [Statement::Copy { source, to: true, target: CopyTarget::Stdout, .. }] = stmts.as_slice() else {
+        bail!("read-only connection: only COPY … TO STDOUT is allowed");
+    };
+    if let CopySource::Query(q) = source {
+        if let std::ops::ControlFlow::Break(e) = sqlparser::ast::Visit::visit(q.as_ref(), &mut SqlGuard) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// MySQL session variables a read-only shell may set: the ones `--safe-updates`
 /// uses. (`SET NAMES` is allowed too.)
 const MYSQL_SESSION_VARS: &[&str] = &["sql_safe_updates", "sql_select_limit", "max_join_size"];
@@ -400,6 +416,17 @@ mod tests {
             (SqlDialect::Mysql, "SHOW DATABASES"),
         ] {
             check_sql(d, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[test]
+    fn copy_out() {
+        for ok in ["COPY users TO STDOUT", "COPY users (id, email) TO STDOUT WITH (FORMAT csv, HEADER)", "COPY (SELECT * FROM users) TO STDOUT"] {
+            check_copy_out(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in ["COPY users TO '/tmp/x'", "COPY users TO PROGRAM 'id'", "COPY users FROM STDIN", "SELECT 1",
+                    "COPY (DELETE FROM users RETURNING *) TO STDOUT", "COPY users TO STDOUT; DROP TABLE users"] {
+            assert!(check_copy_out(bad).is_err(), "should reject: {bad}");
         }
     }
 

@@ -9,6 +9,7 @@ mod mysql;
 mod out;
 mod psql;
 mod psql_catalog;
+mod psql_copy;
 mod psql_print;
 mod psql_vars;
 mod redis;

@@ -42,6 +42,12 @@ pub enum Request {
     /// Switch the session's database (Postgres reconnects, MySQL `USE`, Mongo's
     /// current db, Redis `SELECT`).
     SessionUse { session: u64, database: String },
+    /// Postgres `COPY … FROM STDIN`, with the data (text or CSV format).
+    SessionCopyIn { session: u64, sql: String, data: String },
+    /// Postgres `COPY … TO STDOUT`; the data comes back as text.
+    SessionCopyOut { session: u64, sql: String },
+    /// The result columns of a statement without running it (psql `\gdesc`).
+    SessionDescribe { session: u64, sql: String },
     SessionClose { session: u64 },
     /// Cancel the query a session is running. Sent on a second socket, since the
     /// session's own socket is waiting for that query.

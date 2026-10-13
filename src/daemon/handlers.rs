@@ -67,8 +67,11 @@ pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bo
         Request::SessionOpen { connection, database } => session::open(state, client, &connection, database, force_readonly).await,
         Request::SessionQuery { session, query, limit, warnings } => {
             let limit = limit.unwrap_or(state.config()?.defaults.row_limit).clamp(1, MAX_ROW_LIMIT);
-            session::query(state, client, session, query, limit, warnings).await
+            session::query(state, client, session, session::Op::Query { query, limit, warnings }).await
         }
+        Request::SessionCopyIn { session, sql, data } => session::query(state, client, session, session::Op::CopyIn { sql, data }).await,
+        Request::SessionCopyOut { session, sql } => session::query(state, client, session, session::Op::CopyOut { sql }).await,
+        Request::SessionDescribe { session, sql } => session::query(state, client, session, session::Op::Describe { sql }).await,
         Request::SessionReset { session } => session::reset(state, client, session).await,
         Request::SessionUse { session, database } => session::use_db(state, client, session, &database).await,
         Request::SessionClose { session } => session::close(state, Some(client), session).await,

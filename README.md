@@ -149,7 +149,7 @@ protected in layers:
 
 | Engine | Protections |
 |---|---|
-| PostgreSQL | <ul><li>Statement check with sqlparser: one statement only, and it must be SELECT, EXPLAIN or SHOW. No writes inside CTEs, no `FOR UPDATE`, no `SELECT INTO`, and no functions with side effects such as `pg_terminate_backend` or `set_config`.</li><li>Runs inside `BEGIN READ ONLY … ROLLBACK`.</li><li>`default_transaction_read_only=on` on every pooled connection.</li></ul> |
+| PostgreSQL | <ul><li>Statement check with sqlparser: one statement only, and it must be SELECT, EXPLAIN or SHOW. No writes inside CTEs, no `FOR UPDATE`, no `SELECT INTO`, and no functions with side effects such as `pg_terminate_backend` or `set_config`.</li><li>The shell also allows `COPY … TO STDOUT` of a table or of a query passing the same check, but not `COPY … FROM` or COPY to a server file or program. On connections with mask rules it refuses `COPY … TO STDOUT`, since COPY output can't be masked.</li><li>Runs inside `BEGIN READ ONLY … ROLLBACK`.</li><li>`default_transaction_read_only=on` on every pooled connection.</li></ul> |
 | MySQL/MariaDB | <ul><li>The same statement check, plus no `INTO OUTFILE` and no `GET_LOCK`.</li><li>Runs inside `START TRANSACTION READ ONLY … ROLLBACK`.</li><li>`SET SESSION TRANSACTION READ ONLY` on every pooled connection.</li></ul> |
 | SQLite | <ul><li>The same statement check (SQLite dialect), plus a list of read-only `PRAGMA`s in their query form. `ATTACH` is refused.</li><li>The file is opened read-only (`SQLITE_OPEN_READONLY`).</li></ul> |
 | MongoDB | <ul><li>The daemon only takes structured operations, never JavaScript. The [shell](#shell)'s JavaScript runs in the CLI and is lowered to those same operations.</li><li>Only find, aggregate, count and distinct are allowed, plus `run_command` for informational commands (listIndexes, collStats, dbStats, listCollections, buildInfo, serverStatus, usersInfo, explain of a read, and similar).</li><li>Pipelines are rejected if they contain `$out` or `$merge` anywhere, including nested stages.</li></ul> |
@@ -282,8 +282,8 @@ database's own client:
 
 | Kind | Feels like | Highlights |
 |---|---|---|
-| MySQL/MariaDB | `mysql` | `\G`, `use db` / `\u`, `\s`, `source file`, `delimiter`, `\c` |
-| PostgreSQL | `psql` | `\d[tvimsn] [pattern]`, `\d table`, `\l`, `\c db`, `\x [auto]`, `\timing`, `\g` / `\gx`, `\i file`; `=*>` / `=!>` in a transaction |
+| MySQL/MariaDB | `mysql` / `mariadb` | `\G`, `use`, `status`, `source`, `delimiter`, `pager`, `tee`, `edit`, `warnings`, `prompt`, `connect`, `resetconnection`, `--batch`, `--safe-updates`, ... |
+| PostgreSQL | `psql` | The `\d` family with `S`/`+`, `\sf`/`\sv`, variables and `\if`, `\pset`, `\o`, `\watch`, `\gset`/`\gexec`/`\gdesc`, `\crosstabview`, `COPY … FROM STDIN` and `\copy`, `\password`, ... |
 | SQLite | `sqlite3` | `.tables`, `.schema`, `.indexes`, `.databases`, `.mode box\|table\|column\|line\|list\|csv\|json`, `.headers`, `.timer`, `.read` |
 | Redis | `redis-cli` | redis-cli quoting and reply formatting, `SELECT n`, `MULTI`/`EXEC` |
 | MongoDB | `mongosh` | Real JavaScript: `db.coll.find(...).sort(...).limit(...)`, `it`, `use`, `show dbs\|collections`, variables and loops, `ObjectId`/`ISODate`/`Long`/`UUID`, mongosh-style output |
@@ -292,8 +292,17 @@ database's own client:
 vareto shell prod-pg                     # interactive, with history and tab completion
 vareto shell prod-pg -d other_db         # start in another database
 vareto shell cache -e 'INFO keyspace'    # run commands and exit
-vareto shell m < report.js               # piped input runs as a script, stopping at the first error
+vareto shell m < report.js               # piped input runs as a script
+vareto shell pg-rw < dump.sql            # including pg_dump output (COPY … FROM stdin)
+vareto shell pg -v day=2024-01-01 < report.sql   # psql variables
 ```
+
+Scripts handle errors the way the native client does. mysql stops at the first error
+(exit 1) unless `-f/--force`. psql reports the error and goes on, unless
+`ON_ERROR_STOP` is set (exit 3). The other shells stop at the first error. Tab
+completion knows where it is in a statement: it offers tables after `FROM`/`JOIN`/
+`UPDATE`/..., columns after `SELECT`/`WHERE`/`ON`/..., `table.` followed by that
+table's columns, and client commands after `\`.
 
 The shell pins one connection in the daemon for as long as it runs, so session state
 behaves as it does in the native client: `USE`, `SET`, `\c`, transactions and Redis
@@ -304,6 +313,45 @@ Ctrl-D exits. An open shell keeps its tunnel up, however long it sits idle.
 Everything else stays the same as for the MCP tools: read-only checks run in the daemon,
 masking applies, `query_timeout` applies to each statement, and each statement returns
 at most 5000 rows (`--limit`; the default is `row_limit`).
+
+### SQL shells
+
+Both SQL shells print results in their client's own layout: several result sets from
+one `CALL` or batch, MySQL binary columns as `0x…`, and psql errors with
+`LINE`/caret/`DETAIL`/`HINT`. Both use `$PAGER` when the output is taller than the
+terminal (psql) or after `pager` (mysql), write to files and pipes (`\o`, `tee`), and
+edit the query buffer in `$EDITOR` (`\e`, `edit`).
+
+- **mysql / mariadb:**
+  - **Client commands:** all of them, with long and short forms. That includes
+    `pager`/`nopager`, `tee`/`notee`, `edit`, `system`, `rehash`, `charset`, `prompt`
+    (also `MYSQL_PS1`), and MariaDB's `\S` (silent).
+  - **Status and warnings:** `status` gives the full status block. `warnings` lists
+    each statement's warnings, and the footer counts them (`1 row in set, 1 warning`).
+  - **Connections:** `connect` and MySQL's `resetconnection` give the session a fresh
+    connection.
+  - **Options:** `--safe-updates`, `--auto-vertical-output`, `-E`, `-B`/`-r`/`-t`/`-N`,
+    `--column-type-info`, `--show-warnings`, `-f`.
+- **psql:**
+  - **Scripting:** variables (`\set`, `-v name=value`, `:var`, `:'var'`, `:"var"`)
+    and the special ones (`ON_ERROR_STOP`, `ON_ERROR_ROLLBACK`, `AUTOCOMMIT`, `ECHO`,
+    `ECHO_HIDDEN`, `QUIET`, `VERBOSITY`, `PROMPT1`/`PROMPT2`, `ROW_COUNT`, `SQLSTATE`, ...).
+    Also `\if`/`\elif`/`\else`/`\endif`, `\gset`, `\gexec`, `\watch` and
+    `\crosstabview`.
+  - **Output:** `\pset` with every format (aligned, wrapped, unaligned, csv, html,
+    asciidoc), borders 0–2 and unicode lines.
+  - **Catalog:** the `\d` family, including `\dx`, `\dT`, `\dp`, `\dRp`, `\dconfig`
+    and the full `\d table` layout. Also `\sf`/`\sv`/`\ef`/`\ev`, `\errverbose`
+    and `\gdesc`.
+  - **COPY:** `COPY … FROM STDIN` reads the lines that follow it, up to `\.`, so
+    `pg_dump` output loads, `\restrict` included. `COPY … TO STDOUT` prints. `\copy`
+    reads or writes a file, a program or stdin/stdout on your machine. A COPY moves
+    at most 200 MB at a time.
+  - **Server messages:** `NOTICE`/`WARNING`/`INFO` messages print before the result.
+  - **`\password`:** builds the SCRAM-SHA-256 verifier locally, so the password never
+    leaves the CLI.
+
+### MongoDB shell
 
 The mongosh flavor runs JavaScript in the CLI with [boa](https://boajs.dev). Each `db.*`
 call becomes a structured operation or a database command, so the daemon never executes

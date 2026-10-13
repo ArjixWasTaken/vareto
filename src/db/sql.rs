@@ -607,6 +607,75 @@ impl SqlConn {
         Ok(c.finish())
     }
 
+    /// Postgres `COPY … FROM STDIN`, fed with `data`. Returns the rows copied.
+    pub async fn copy_in(&mut self, sql: &str, data: &[u8]) -> Result<u64> {
+        let SqlConn::Postgres(c) = self else { anyhow::bail!("COPY FROM STDIN is Postgres-only") };
+        let res = async {
+            let mut w = c.copy_in_raw(sql).await?;
+            w.send(data).await?;
+            w.finish().await
+        }
+        .await;
+        res.map_err(|e| server_message(e.into()))
+    }
+
+    /// Postgres `COPY … TO STDOUT`. `readonly` runs it in a READ ONLY transaction.
+    /// More than `max` bytes is an error (the rest is still read, so the connection
+    /// stays usable).
+    pub async fn copy_out(&mut self, sql: &str, readonly: bool, max: usize) -> Result<Vec<u8>> {
+        let SqlConn::Postgres(c) = self else { anyhow::bail!("COPY TO STDOUT is Postgres-only") };
+        async fn read(c: &mut sqlx::PgConnection, sql: &str, max: usize) -> Result<Vec<u8>> {
+            let mut stream = c.copy_out_raw(sql).await?;
+            let (mut buf, mut total) = (Vec::new(), 0usize);
+            while let Some(chunk) = stream.try_next().await? {
+                total += chunk.len();
+                if total <= max {
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+            if total > max {
+                anyhow::bail!("COPY output is {total} bytes, more than the {max} a shell can receive");
+            }
+            Ok(buf)
+        }
+        let res = if readonly {
+            let mut tx = c.begin_with("BEGIN READ ONLY").await?;
+            let r = read(&mut tx, sql, max).await;
+            tx.rollback().await.ok();
+            r
+        } else {
+            read(c, sql, max).await
+        };
+        res.map_err(server_message)
+    }
+
+    /// The result columns of `sql` without running it: `[{name, type, oid}]`
+    /// (`oid` on Postgres only).
+    pub async fn describe(&mut self, sql: &str) -> Result<Vec<Value>> {
+        use sqlx::{Column as _, SqlSafeStr as _, Statement as _, TypeInfo as _};
+        let stmt = AssertSqlSafe(sql.to_string()).into_sql_str();
+        let cols = match self {
+            SqlConn::Postgres(c) => c
+                .prepare(stmt)
+                .await
+                .map(|s| {
+                    s.columns()
+                        .iter()
+                        .map(|c| serde_json::json!({ "name": c.name(), "type": c.type_info().name(), "oid": c.type_info().oid().map(|o| o.0) }))
+                        .collect()
+                }),
+            SqlConn::Mysql(c) => c
+                .prepare(stmt)
+                .await
+                .map(|s| s.columns().iter().map(|c| serde_json::json!({ "name": c.name(), "type": c.type_info().name() })).collect()),
+            SqlConn::Sqlite(c) => c
+                .prepare(stmt)
+                .await
+                .map(|s| s.columns().iter().map(|c| serde_json::json!({ "name": c.name(), "type": c.type_info().name() })).collect()),
+        };
+        cols.map_err(|e| server_message(e.into()))
+    }
+
     /// A single scalar from an internal query.
     pub async fn scalar(&mut self, sql: &str) -> Result<Value> {
         match self.run(sql, 1, false).await? {

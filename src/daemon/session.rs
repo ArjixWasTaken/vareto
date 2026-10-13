@@ -168,27 +168,63 @@ async fn refresh(s: &Session, inner: &mut Inner, conn: &Connection, live: Arc<Li
     Ok(true)
 }
 
-pub async fn query(state: &State, owner: u64, id: u64, q: QuerySpec, limit: usize, warnings: bool) -> Result<Value> {
+/// What a session runs.
+pub enum Op {
+    Query { query: QuerySpec, limit: usize, warnings: bool },
+    /// Postgres `COPY … FROM STDIN` with its data.
+    CopyIn { sql: String, data: String },
+    /// Postgres `COPY … TO STDOUT`.
+    CopyOut { sql: String },
+    /// The result columns of a statement, without running it.
+    Describe { sql: String },
+}
+
+/// Most COPY output sent back to a shell (the IPC frame limit is 256 MiB).
+const COPY_OUT_MAX: usize = 200 * 1024 * 1024;
+
+fn check_op(conn: &Connection, op: &Op) -> Result<()> {
+    let kind = conn.cfg.kind;
+    match op {
+        Op::Query { query, .. } => check(conn, query, true),
+        Op::CopyIn { .. } | Op::CopyOut { .. } if kind != Kind::Postgres => bail!("COPY with the client is Postgres-only"),
+        Op::CopyIn { .. } if conn.readonly => bail!("read-only connection: COPY FROM writes to a table"),
+        Op::CopyIn { .. } => Ok(()),
+        Op::CopyOut { sql } if conn.readonly => readonly::check_copy_out(sql),
+        Op::CopyOut { .. } => Ok(()),
+        Op::Describe { .. } if !matches!(kind, Kind::Mysql | Kind::Postgres | Kind::Sqlite) => bail!("only SQL statements can be described"),
+        Op::Describe { .. } => Ok(()),
+    }
+}
+
+pub async fn query(state: &State, owner: u64, id: u64, op: Op) -> Result<Value> {
     let s = get(state, id, Some(owner)).await?;
     let (conn, live, timeout) = setup(state, &s.name, s.force_readonly).await?;
-    check(&conn, &q, true)?;
+    check_op(&conn, &op)?;
     let task = {
         let s = s.clone();
-        tokio::spawn(async move {
+        tokio::spawn(super::notices::collect(async move {
             let mut inner = s.inner.lock().await;
             let reconnected = refresh(&s, &mut inner, &conn, live, timeout).await?;
-            let mut v = execute(&mut inner, &conn, &q, limit, timeout, warnings).await?;
+            let mut v = match op {
+                Op::Query { query, limit, warnings } => execute(&mut inner, &conn, &query, limit, timeout, warnings).await?,
+                op => special(&mut inner, &conn, op, timeout).await?,
+            };
             if reconnected {
                 v["reconnected"] = json!(true);
             }
             Ok(v)
-        })
+        }))
     };
     s.cancel.lock().unwrap().abort = Some(task.abort_handle());
     let res = task.await;
     s.cancel.lock().unwrap().abort = None;
     match res {
-        Ok(r) => r,
+        Ok((r, notices)) => r.map(|mut v| {
+            if !notices.is_empty() {
+                v["notices"] = Value::Array(notices);
+            }
+            v
+        }),
         Err(e) if e.is_cancelled() => {
             let mut inner = s.inner.lock().await;
             if matches!(inner.pinned, Pinned::Sql(_)) {
@@ -258,6 +294,39 @@ async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usi
         v[k] = x;
     }
     Ok(v)
+}
+
+/// COPY and describe, on a pinned SQL connection.
+async fn special(inner: &mut Inner, conn: &Connection, op: Op, timeout: Duration) -> Result<Value> {
+    let Pinned::Sql(c) = &mut inner.pinned else { bail!("this session's connection cannot run that") };
+    let limit = timeout + Duration::from_secs(5);
+    let res = match op {
+        Op::CopyIn { sql, data } => tokio::time::timeout(limit, c.copy_in(&sql, data.as_bytes())).await.map(|r| r.map(|n| json!({ "rows": n }))),
+        Op::CopyOut { sql } => {
+            if !inner.live.masker.is_noop() {
+                bail!("COPY TO STDOUT would bypass this connection's mask rules; use a query instead");
+            }
+            tokio::time::timeout(limit, c.copy_out(&sql, conn.readonly, COPY_OUT_MAX)).await.map(|r| {
+                r.and_then(|data| {
+                    let data = String::from_utf8(data).map_err(|_| anyhow::anyhow!("COPY output is not text (binary format is not supported)"))?;
+                    Ok(json!({ "data": data }))
+                })
+            })
+        }
+        Op::Describe { sql } => tokio::time::timeout(limit, c.describe(&sql)).await.map(|r| r.map(|cols| json!({ "columns": cols }))),
+        Op::Query { .. } => unreachable!(),
+    };
+    match res {
+        Ok(r) => r.map(|mut v| {
+            v["database"] = json!(inner.database);
+            v
+        }),
+        Err(_) => {
+            let old = std::mem::replace(&mut inner.pinned, Pinned::Broken);
+            unpin(old).await;
+            bail!("timed out after {}s; the session was reset", timeout.as_secs())
+        }
+    }
 }
 
 pub async fn use_db(state: &State, owner: u64, id: u64, database: &str) -> Result<Value> {

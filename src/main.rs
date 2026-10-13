@@ -141,9 +141,18 @@ enum SecretCmd {
 const EXAMPLE_CONFIG: &str = include_str!("../config.example.toml");
 
 fn init_tracing(default: &str) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::Layer as _;
     let filter = tracing_subscriber::EnvFilter::try_from_env("VARETO_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_ansi(false).init();
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default))
+        // Notices carry query text; they go to the shell that ran the query instead.
+        .add_directive(format!("{}=off", daemon::notices::TARGET).parse().unwrap());
+    let notices = tracing_subscriber::filter::Targets::new().with_target(daemon::notices::TARGET, tracing::Level::TRACE);
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false).with_filter(filter))
+        .with(daemon::notices::Layer.with_filter(notices))
+        .init();
 }
 
 fn print(v: &Value) {
