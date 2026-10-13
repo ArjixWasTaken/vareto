@@ -417,7 +417,7 @@ mod tests {
         );
         assert_eq!(q.projection.unwrap(), json!({"name": 1}));
         assert_eq!(q.sort.unwrap(), json!({"a": -1}));
-        assert_eq!((q.skip, q.limit), (Some(5), Some(2)));
+        assert_eq!((q.skip, q.cursor_limit), (Some(5), Some(2)));
 
         eval_str(&mut ctx, "db.getSiblingDB('other').logs.aggregate([{$match: {}}]).toArray()").unwrap();
         let req = SEEN.with(|s| s.borrow_mut().pop()).unwrap();

@@ -1,6 +1,6 @@
 ---
 name: vareto
-description: Query and explore databases through the vareto MCP server — MySQL/MariaDB, PostgreSQL, MongoDB and Redis, including ones only reachable through SSH tunnels. Use whenever the user asks about data in a database, wants to inspect a schema, run SQL / a Mongo query / a Redis command, debug data in staging or production, export query results to a file, or add a database connection through vareto. Also use it to install or set up vareto, or when the vareto tools (list_connections, sql_query, mongo_query, redis_command, ...) are expected but missing.
+description: Query and explore databases through the vareto MCP server — MySQL/MariaDB, PostgreSQL, SQLite, MongoDB and Redis, including ones only reachable through SSH tunnels. Use whenever the user asks about data in a database, wants to inspect a schema, run SQL / a Mongo query / a Redis command, debug data in staging or production, export query results to a file, or add a database connection through vareto. Also use it to install or set up vareto, or when the vareto tools (list_connections, sql_query, mongo_query, redis_command, ...) are expected but missing.
 ---
 
 # Working with databases through vareto
@@ -65,7 +65,7 @@ the version changes.
 ## Workflow
 
 1. **Find the connection.** Call `list_connections` first unless you already know the
-   exact name. It shows each connection's `kind` (mysql / postgres / mongodb / redis),
+   exact name. It shows each connection's `kind` (mysql / postgres / sqlite / mongodb / redis),
    `readonly`, route (direct or tunnel + ssh host), default `database`, `description`,
    and `masked`. Pick by name/description; if several could match (e.g. `prod-pg` vs
    `staging-pg`), ask the user which one — never guess between production and
@@ -104,7 +104,9 @@ ONLY transaction:
 - SQL: one `SELECT` / `WITH ... SELECT` / `EXPLAIN` / `SHOW` / `DESCRIBE` statement. No
   writes, DDL, `SET`, `FOR UPDATE`, `SELECT ... INTO`, multiple statements, or
   side-effect functions (`pg_terminate_backend`, `set_config`, `GET_LOCK`, ...).
-- MongoDB: `find`, `aggregate` (without `$out`/`$merge`), `count`, `distinct`.
+- SQLite: the same, plus read-only `PRAGMA`s such as `PRAGMA table_info(t)`.
+- MongoDB: `find`, `aggregate` (without `$out`/`$merge`), `count`, `distinct`, and
+  informational `run_command`s (`listIndexes`, `collStats`, `dbStats`, `explain`, ...).
 - Redis: read commands only (GET, HGETALL, SCAN, TTL, TYPE, ZRANGE, XRANGE, INFO, ...).
 
 If a write is needed on a read-only connection, **stop and tell the user**: read-only can
@@ -154,6 +156,8 @@ Details and examples: [reference.md](reference.md). Short version:
   intended — it executes the statement).
 - **MySQL/MariaDB**: `database` in introspection tools is the MySQL database; queries can
   use `db.table`.
+- **SQLite**: one local file. `database` in introspection tools is an attached database
+  name (default `main`). Use `PRAGMA table_info(t)` or `sqlite_schema` for schema details.
 - **MongoDB**: structured operations, not shell syntax. Filters/pipelines are MongoDB
   Extended JSON: `{"_id": {"$oid": "..."}}`, `{"createdAt": {"$gte": {"$date": "2024-01-01T00:00:00Z"}}}`.
 - **Redis**: `args` is the command split into an array: `["HGETALL", "user:42"]`. Use

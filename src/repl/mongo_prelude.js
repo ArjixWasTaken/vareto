@@ -330,7 +330,7 @@
       if (limit) n = Math.min(n, limit - from);
       if (this._op === 'find') {
         q = { op: 'find', collection: this._coll._name, filter: this._spec.filter || {}, projection: this._spec.projection,
-              sort: this._spec.sort, skip: (this._spec.skip || 0) + from, limit: limit ? limit - from : undefined };
+              sort: this._spec.sort, skip: (this._spec.skip || 0) + from, cursor_limit: limit ? limit - from : undefined };
       } else {
         const pipeline = (this._spec.pipeline || []).slice();
         if (from) pipeline.push({ $skip: from });

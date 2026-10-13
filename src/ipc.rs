@@ -143,9 +143,11 @@ pub struct MongoQuery {
     /// Documents to skip (find).
     #[serde(default)]
     pub skip: Option<u64>,
-    /// Cursor limit (find); the response is also capped by the request's `limit`.
+    /// Server-side cursor limit for find (the shell's `.limit(n)`). Responses are
+    /// capped by the request's own `limit` either way, so tools don't expose it.
     #[serde(default)]
-    pub limit: Option<u64>,
+    #[schemars(skip)]
+    pub cursor_limit: Option<u64>,
     /// Aggregation pipeline (aggregate).
     #[serde(default)]
     pub pipeline: Option<Vec<Value>>,

@@ -407,7 +407,7 @@ mod tests {
             field: None,
             documents: None,
             update: None,
-            limit: None,
+            cursor_limit: None,
             upsert: None,
             command: None,
         }

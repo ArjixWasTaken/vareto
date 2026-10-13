@@ -145,7 +145,7 @@ impl Mongo {
             MongoOp::Find => {
                 let mut find = coll.find(filter).max_time(timeout);
                 // One extra so the collector can tell the result was truncated.
-                let server_limit = match (limit.map(|l| l as u64 + 1), q.limit.filter(|&l| l > 0)) {
+                let server_limit = match (limit.map(|l| l as u64 + 1), q.cursor_limit.filter(|&l| l > 0)) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };

@@ -10,10 +10,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 BIN = ROOT / "target" / "debug" / "vareto"
 work = pathlib.Path(tempfile.mkdtemp(prefix="vareto-e2e-"))
-keys, ssh_dir, cfg_dir = work / "keys", work / "ssh", work / "config"
-for d in (keys, ssh_dir, cfg_dir):
+keys, ssh_dir, cfg_dir, sock_dir = work / "keys", work / "ssh", work / "config", work / "sock"
+for d in (keys, ssh_dir, cfg_dir, sock_dir):
     d.mkdir()
 os.chmod(ssh_dir, 0o700)
+os.chmod(sock_dir, 0o777)  # postgres (another uid) creates its socket here
 
 env = dict(os.environ)
 env.pop("SSH_AUTH_SOCK", None)  # only use the test key
@@ -23,6 +24,7 @@ env.update(
     VARETO_STATE_DIR=str(work / "state"),
     VARETO_SSH_DIR=str(ssh_dir),
     KEYS_DIR=str(keys),
+    SOCK_DIR=str(sock_dir),
 )
 
 def sh(*args, check=True, **kw):
@@ -45,6 +47,10 @@ def v(*args, ok=True):
 
 def vj(*args):
     return json.loads(v(*args).stdout)
+
+def shell(conn, script, *args):
+    """Pipe a script into `vareto shell` (script mode stops at the first error)."""
+    return subprocess.run([str(BIN), "shell", conn, *args], input=script, env=env, text=True, capture_output=True)
 
 sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(keys / "id_ed25519"))
 shutil.copy(keys / "id_ed25519", ssh_dir / "id_ed25519")
@@ -122,7 +128,47 @@ password = "redispass"
 kind = "redis"
 tunnel = "redis-fixed"
 password = "redispass"
-""")
+
+[connections.redis-rw]
+kind = "redis"
+tunnel = "dc"
+host = "redis"
+password = "redispass"
+readonly = false
+
+[connections.mongo-rw]
+kind = "mongodb"
+tunnel = "dc"
+host = "mongo"
+user = "root"
+password = "mongopass"
+database = "shop"
+params = { authSource = "admin" }
+readonly = false
+
+# Postgres's socket directory is bind-mounted from the host (no tunnel).
+[connections.pg-sock]
+kind = "postgres"
+socket = "%(sock)s"
+user = "postgres"
+database = "shop"
+
+[connections.lite]
+kind = "sqlite"
+path = "%(lite)s"
+
+[connections.lite-rw]
+kind = "sqlite"
+path = "%(lite)s"
+readonly = false
+""" % {"sock": sock_dir, "lite": work / "lite.db"})
+import sqlite3
+with sqlite3.connect(work / "lite.db") as db:
+    db.executescript("""
+        CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, score REAL);
+        CREATE INDEX notes_score ON notes (score);
+        INSERT INTO notes (body, score) VALUES ('first', 1.5), ('second', NULL);
+    """)
 env["E2E_PG_PW"] = "pgpass"
 
 print("building..."); subprocess.run(["cargo", "build", "-q"], cwd=ROOT, check=True)
@@ -209,6 +255,64 @@ try:
 
     out = vj("redis", "redis-jump", "PING")
     check("ProxyJump (bastion -> inner sshd)", out["result"] == "PONG", out)
+
+    # ---- vareto shell: one pinned session per run, native-style output
+    r = shell("pg", "select count(*) from users;\n\\dt\n\\d orders\nset search_path to public;\nshow search_path;\n")
+    check("psql: query, \\dt, \\d, SET persists", r.returncode == 0 and "   300\n(1 row)" in r.stdout
+          and "public | orders | table" in r.stdout and '"orders_pkey" PRIMARY KEY, btree (id)' in r.stdout
+          and " search_path\n-------------\n public" in r.stdout, r.stdout + r.stderr)
+    r = shell("pg", "select 1;\ninsert into orders (user_id) values (1);\nselect 2;\n")
+    check("psql: read-only refused, script stops", r.returncode != 0 and "ERROR:  read-only connection" in r.stderr
+          and "?column?" in r.stdout and " 2\n" not in r.stdout, r.stdout + r.stderr)
+    r = shell("pg-rw", "begin;\ninsert into orders (user_id, total) values (1, 1);\nselect count(*) as n from orders;\nrollback;\nselect count(*) as n from orders;\n")
+    counts = [l.strip() for l in r.stdout.splitlines() if l.strip().isdigit()]
+    check("psql: transaction spans statements and rolls back", r.returncode == 0 and len(counts) == 2
+          and int(counts[0]) == int(counts[1]) + 1 and "ROLLBACK" in r.stdout, r.stdout + r.stderr)
+    r = shell("pg-rw", "\\c postgres\nselect current_database();\n")
+    check("psql: \\c switches database", r.returncode == 0 and 'connected to database "postgres"' in r.stdout
+          and " postgres\n(1 row)" in r.stdout, r.stdout + r.stderr)
+    r = shell("pg-sock", "select count(*) as n from users;\n")
+    check("postgres over a unix socket (no tunnel)", r.returncode == 0 and "300" in r.stdout, r.stdout + r.stderr)
+
+    r = shell("maria", "use information_schema\nselect database();\nselect id, email from shop.users order by id\\G\n")
+    check("mysql: USE persists, \\G vertical output", r.returncode == 0 and "Database changed" in r.stdout
+          and "| information_schema |" in r.stdout and "*************************** 1. row" in r.stdout
+          and "email: a@example.com" in r.stdout, r.stdout + r.stderr)
+    r = shell("maria", "select * from nope;\n")
+    check("mysql: server error wording", r.returncode != 0 and "ERROR 1146 (42S02)" in r.stderr, r.stderr)
+
+    r = shell("redis-rw", 'select 2\nset shellkey "a b"\nselect 0\nget shellkey\nselect 2\nget shellkey\nmulti\nincr n\nexec\nlrange nope 0 -1\n')
+    check("redis-cli: SELECT persists, MULTI/EXEC, reply formatting", r.returncode == 0
+          and r.stdout.split("\n")[3] == "(nil)" and '"a b"' in r.stdout and "QUEUED" in r.stdout
+          and "1) (integer) 1" in r.stdout and "(empty array)" in r.stdout, r.stdout + r.stderr)
+    r = shell("redis", "select 3\nset k v\n")
+    check("redis-cli: read-only session allows SELECT, refuses SET", r.returncode != 0 and r.stdout.startswith("OK")
+          and "(error) read-only connection" in r.stderr, r.stdout + r.stderr)
+
+    r = shell("mongo", "show collections\ndb.customers.find({}, {_id: 0, name: 1}).sort({name: -1})\n"
+                       "const n = db.customers.countDocuments()\nprint('n =', n)\ndb.customers.deleteMany({})\n")
+    check("mongosh: JS, cursor printing, read-only refused", r.returncode != 0 and "customers" in r.stdout
+          and "[ { name: 'Ben' }, { name: 'Ann' } ]" in r.stdout and "n = 2" in r.stdout
+          and "read-only connection" in r.stderr, r.stdout + r.stderr)
+    r = shell("mongo-rw", "use scratch\ndb.items.drop()\ndb.items.insertMany(Array.from({length: 25}, (_, i) => ({i})))\n"
+                          "db.items.find({}, {_id: 0}).sort({i: 1})\nit\n"
+                          "db.items.updateOne({i: 99}, {$set: {i: 99}}, {upsert: true}).upsertedCount\n"
+                          "db.items.findOne({i: 24}, {_id: 0})\n")
+    check("mongosh: writes, `it` paging, upsert", r.returncode == 0 and "switched to db scratch" in r.stdout
+          and 'Type "it" for more' in r.stdout and "{ i: 19 }\n]" in r.stdout and "[ { i: 20 }, { i: 21 }" in r.stdout
+          and "\n1\n" in r.stdout and "{ i: 24 }" in r.stdout, r.stdout + r.stderr)
+
+    r = shell("lite", ".tables\n.mode column\nselect id, body, score from notes order by id;\ninsert into notes (body) values ('x');\n")
+    check("sqlite3: dot commands, column mode, read-only file", r.returncode != 0 and r.stdout.startswith("notes")
+          and "id  body    score\n--  ------  -----\n 1  first     1.5" in r.stdout and "read-only" in r.stderr,
+          r.stdout + r.stderr)
+    r = shell("lite-rw", "begin;\ninsert into notes (body) values ('third');\nrollback;\n.mode list\n.headers off\nselect count(*) from notes;\n")
+    check("sqlite3: transactions on a writable file", r.returncode == 0 and r.stdout.strip() == "2", r.stdout + r.stderr)
+    out = vj("sql", "lite", "PRAGMA table_info(notes)")
+    check("sqlite via sql_query (read-only pragma)", [row[1] for row in out["rows"]] == ["id", "body", "score"], out)
+
+    st = vj("status")
+    check("shell sessions close with their shell", st.get("shell_sessions") == 0, st)
 
     compose("restart", "sshd")
     time.sleep(2)

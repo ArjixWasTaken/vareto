@@ -8,12 +8,12 @@
 | `list_databases` | `connection` | Redis: keyspaces from `INFO keyspace`. |
 | `list_tables` | `connection`, `database?`, `pattern?` | SQL: `LIKE` pattern (`*` → `%`). Mongo: glob. Redis: SCAN MATCH, max 1000 keys, with types. Postgres: `database` = schema. |
 | `describe_table` | `connection`, `table`, `database?` | Postgres accepts `schema.table`. Redis: `table` = key. |
-| `sql_query` | `connection`, `sql`, `limit?` | MySQL/MariaDB/Postgres. |
+| `sql_query` | `connection`, `sql`, `limit?` | MySQL/MariaDB/Postgres/SQLite. |
 | `mongo_query` | `connection`, `collection`, `op`, `database?`, op-specific fields, `limit?` | See below. |
 | `redis_command` | `connection`, `args` | `args[0]` is the command. |
 | `export_query` | `connection`, exactly one of `sql` / `mongo` / `redis`, `path`, `format` (`csv`\|`jsonl`) | Streams the whole result to the file; no row cap, bounded by `export_timeout` (default 10 min). Relative paths resolve against the MCP server's working directory. Returns `{path, records, elapsed_secs}`, plus `dropped_fields` when a MongoDB CSV export saw fields after the first 1000 documents (use `jsonl` to keep them). A failed export deletes its partial file. Masking applies. |
 | `tunnel_list` / `tunnel_open` / `tunnel_close` | `name` | Rarely needed: tunnels open on demand and close when idle. `tunnel_open` pins a tunnel open. |
-| `save_connection` | `name`, `kind`, `ssh?`/`tunnel?`, `host?`, `port?`, `user?`, `password?`, `database?`, `params?`, `description?` | Always read-only. |
+| `save_connection` | `name`, `kind`, `ssh?`/`tunnel?`, `host?`, `port?`, `socket?`, `path?`, `user?`, `password?`, `database?`, `params?`, `description?` | Always read-only. `socket`: a local server's unix socket. `path`: the file, for `kind = "sqlite"`. |
 | `delete_saved_connection` | `name` | Only for saved connections. |
 
 ## SQL examples
@@ -42,8 +42,10 @@ pulling rows to count/sum them yourself.
 | `count` | `filter` | yes |
 | `distinct` | `field`, `filter` | yes |
 | `insert_one` / `insert_many` | `documents` | no |
-| `update_one` / `update_many` | `filter`, `update` (document or pipeline array) | no |
+| `update_one` / `update_many` | `filter`, `update` (document or pipeline array), `upsert?` | no |
+| `replace_one` | `filter`, `documents` (the replacement first), `upsert?` | no |
 | `delete_one` / `delete_many` | `filter` | no |
+| `run_command` | `command` (e.g. `{"listIndexes": "orders"}`); no `collection` | only informational commands: listIndexes, listCollections, listDatabases, collStats, dbStats, dataSize, buildInfo, hello, ping, serverStatus, usersInfo, rolesInfo, connectionStatus, hostInfo, count, distinct, and `explain` of find/aggregate/count/distinct |
 
 `database` defaults to the connection's database. All JSON is MongoDB Extended JSON:
 

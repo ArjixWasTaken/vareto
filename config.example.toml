@@ -32,7 +32,7 @@ host = "prod-bastion"
 # local = "127.0.0.1:15432"
 
 [connections.prod-pg]
-kind = "postgres"          # mysql | mariadb | postgres | mongodb | redis
+kind = "postgres"          # mysql | mariadb | postgres | sqlite | mongodb | redis
 tunnel = "prod"
 host = "10.0.0.5"          # as seen from prod-bastion
 port = 5432
@@ -64,3 +64,14 @@ readonly = false           # writes allowed (only a human can set this)
 [connections.local-redis]
 kind = "redis"
 host = "127.0.0.1"
+
+# A server on this machine through its unix socket (no tunnel).
+# [connections.dev-pg]
+# kind = "postgres"
+# socket = "/run/postgresql"
+# database = "app"
+
+# A local SQLite file.
+# [connections.notes]
+# kind = "sqlite"
+# path = "~/notes.db"

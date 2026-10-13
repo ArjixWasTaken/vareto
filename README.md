@@ -1,15 +1,16 @@
 # vareto
 
 *βαρετό: Greek for "boring".* An MCP server that gives an assistant access to
-MySQL/MariaDB, PostgreSQL, MongoDB and Redis. When a database sits behind SSH, vareto
-opens the tunnel itself, the way GUI database clients do. It was inspired by
-[boring](https://github.com/alebeck/boring).
+MySQL/MariaDB, PostgreSQL, SQLite, MongoDB and Redis. When a database sits behind SSH,
+vareto opens the tunnel itself, the way GUI database clients do. It also has an
+interactive [shell](#shell) that behaves like each database's own client. It was inspired
+by [boring](https://github.com/alebeck/boring).
 
 ## How it works
 
 ```
 MCP client ──stdio──> vareto mcp ──unix socket──> vareto daemon ──ssh──> bastion ──> database
-vareto list/open/close/sql ─────────────────────────┘
+vareto shell/list/open/close/sql ───────────────────┘
 ```
 
 - **`vareto mcp`** is a thin stdio server. On first use it starts a detached daemon
@@ -18,7 +19,7 @@ vareto list/open/close/sql ─────────────────�
   one set of tunnels for all MCP clients and for the CLI.
   - Tunnels open on demand, reconnect if they drop, and close after `idle_timeout`.
     Tunnels opened with `vareto open` stay open until you close them.
-  - The daemon exits after `daemon_idle_timeout` with no tunnels open.
+  - The daemon exits after `daemon_idle_timeout` with no tunnels or shells open.
 - **SSH** is pure Rust (russh).
   - Host settings come from `~/.ssh/config`: HostName, User, Port, IdentityFile and
     ProxyJump.
@@ -107,6 +108,32 @@ tunnel = "dc"
 host = "10.0.0.12"           # same SSH session as `orders`
 ```
 
+### Local databases
+
+Without `tunnel` or `ssh`, a connection goes straight to `host:port` (`host` defaults to
+`127.0.0.1`). A server on this machine can also be reached through its unix socket, and
+SQLite needs only the file:
+
+```toml
+[connections.dev-pg]
+kind = "postgres"
+socket = "/run/postgresql"   # the socket directory or file; `port` picks .s.PGSQL.<port>
+user = "me"
+database = "app"
+
+[connections.dev-redis]
+kind = "redis"               # plain TCP on 127.0.0.1:6379
+readonly = false
+
+[connections.notes]
+kind = "sqlite"
+path = "~/notes.db"          # absolute or ~/; the file must exist
+```
+
+`socket` works for every server kind and excludes `host`, `tunnel` and `ssh`. SQLite
+connections have only `path`, `readonly`, `description` and masking: no users,
+passwords or tunnels.
+
 Passwords can be set in any of these ways:
 
 | Setting | Behaviour |
@@ -124,8 +151,9 @@ protected in layers:
 |---|---|
 | PostgreSQL | <ul><li>Statement check with sqlparser: one statement only, and it must be SELECT, EXPLAIN or SHOW. No writes inside CTEs, no `FOR UPDATE`, no `SELECT INTO`, and no functions with side effects such as `pg_terminate_backend` or `set_config`.</li><li>Runs inside `BEGIN READ ONLY … ROLLBACK`.</li><li>`default_transaction_read_only=on` on every pooled connection.</li></ul> |
 | MySQL/MariaDB | <ul><li>The same statement check, plus no `INTO OUTFILE` and no `GET_LOCK`.</li><li>Runs inside `START TRANSACTION READ ONLY … ROLLBACK`.</li><li>`SET SESSION TRANSACTION READ ONLY` on every pooled connection.</li></ul> |
-| MongoDB | <ul><li>Queries are structured operations, never shell JavaScript.</li><li>Only find, aggregate, count and distinct are allowed.</li><li>Pipelines are rejected if they contain `$out` or `$merge` anywhere, including nested stages.</li></ul> |
-| Redis | <ul><li>Allowlist of read-only commands.</li><li>Commands that block or change connection state (SUBSCRIBE, MONITOR, SELECT, MULTI, BLPOP and similar) are always refused.</li></ul> |
+| SQLite | <ul><li>The same statement check (SQLite dialect), plus a list of read-only `PRAGMA`s in their query form. `ATTACH` is refused.</li><li>The file is opened read-only (`SQLITE_OPEN_READONLY`).</li></ul> |
+| MongoDB | <ul><li>The daemon only takes structured operations, never JavaScript. The [shell](#shell)'s JavaScript runs in the CLI and is lowered to those same operations.</li><li>Only find, aggregate, count and distinct are allowed, plus `run_command` for informational commands (listIndexes, collStats, dbStats, listCollections, buildInfo, serverStatus, usersInfo, explain of a read, and similar).</li><li>Pipelines are rejected if they contain `$out` or `$merge` anywhere, including nested stages.</li></ul> |
+| Redis | <ul><li>Allowlist of read-only commands.</li><li>Commands that block or change connection state (SUBSCRIBE, MONITOR, SELECT, MULTI, BLPOP and similar) are always refused. In the shell, which has its own connection, `SELECT` is allowed, and so are transactions on writable connections.</li></ul> |
 
 Read-only can never be relaxed through the MCP:
 
@@ -247,9 +275,45 @@ to keep every field.
 
 The daemon log never contains query text: statement logging is disabled.
 
+## Shell
+
+`vareto shell <connection>` (alias `repl`) is an interactive shell in the style of the
+database's own client:
+
+| Kind | Feels like | Highlights |
+|---|---|---|
+| MySQL/MariaDB | `mysql` | `\G`, `use db` / `\u`, `\s`, `source file`, `delimiter`, `\c` |
+| PostgreSQL | `psql` | `\d[tvimsn] [pattern]`, `\d table`, `\l`, `\c db`, `\x [auto]`, `\timing`, `\g` / `\gx`, `\i file`; `=*>` / `=!>` in a transaction |
+| SQLite | `sqlite3` | `.tables`, `.schema`, `.indexes`, `.databases`, `.mode box\|table\|column\|line\|list\|csv\|json`, `.headers`, `.timer`, `.read` |
+| Redis | `redis-cli` | redis-cli quoting and reply formatting, `SELECT n`, `MULTI`/`EXEC` |
+| MongoDB | `mongosh` | Real JavaScript: `db.coll.find(...).sort(...).limit(...)`, `it`, `use`, `show dbs\|collections`, variables and loops, `ObjectId`/`ISODate`/`Long`/`UUID`, mongosh-style output |
+
+```sh
+vareto shell prod-pg                     # interactive, with history and tab completion
+vareto shell prod-pg -d other_db         # start in another database
+vareto shell cache -e 'INFO keyspace'    # run commands and exit
+vareto shell m < report.js               # piped input runs as a script, stopping at the first error
+```
+
+The shell pins one connection in the daemon for as long as it runs, so session state
+behaves as it does in the native client: `USE`, `SET`, `\c`, transactions and Redis
+`SELECT` carry over between statements. Ctrl-C cancels the running query (server-side
+for Postgres and MySQL, so the session survives) and clears the input at the prompt;
+Ctrl-D exits. An open shell keeps its tunnel up, however long it sits idle.
+
+Everything else stays the same as for the MCP tools: read-only checks run in the daemon,
+masking applies, `query_timeout` applies to each statement, and each statement returns
+at most 5000 rows (`--limit`; the default is `row_limit`).
+
+The mongosh flavor runs JavaScript in the CLI with [boa](https://boajs.dev). Each `db.*`
+call becomes a structured operation, so the daemon never executes JavaScript. Methods
+the operations can't express, such as `bulkWrite`, sessions or change streams, aren't
+available. History is kept in `~/.local/state/vareto/history/<connection>`.
+
 ## CLI
 
 ```sh
+vareto shell prod-pg            # interactive shell (see above)
 vareto list                     # connections + tunnels
 vareto open prod / close prod   # pin a tunnel open / close it
 vareto sql prod-pg "select now()"
@@ -269,8 +333,9 @@ python3 tests/e2e/run.py        # Docker: sshd + postgres/mariadb/mongo/redis on
 ```
 
 The e2e suite reaches the databases only through the SSH container. It covers TOFU,
-ProxyJump, reconnecting after an sshd restart, every read-only layer, masking, export
-and the MCP protocol over stdio.
+ProxyJump, reconnecting after an sshd restart, every read-only layer, masking, export,
+the MCP protocol over stdio, and each shell flavor (piped scripts), including session
+state, transactions, SQLite files and a Postgres unix socket.
 
 It uses its own config, SSH and runtime directories, but `save_connection` stores and
 then deletes one entry in your real OS keyring (service `vareto`).
