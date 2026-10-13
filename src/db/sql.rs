@@ -10,7 +10,7 @@ use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
-use sqlx::{AssertSqlSafe, Column as _, Either, Executor, Row, TypeInfo, ValueRef};
+use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Either, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{Connection, Kind};
 use crate::render::{Column, Output};
@@ -41,7 +41,7 @@ pub async fn connect(conn: &Connection, ep: &Endpoint<'_>) -> Result<SqlPool> {
             if let Some(db) = &cfg.database {
                 o = o.database(db);
             }
-            o = o.application_name("vareto");
+            o = o.application_name("vareto").disable_statement_logging();
             let mut server_opts: Vec<(String, String)> = Vec::new();
             for (k, v) in &cfg.params {
                 match k.as_str() {
@@ -67,7 +67,7 @@ pub async fn connect(conn: &Connection, ep: &Endpoint<'_>) -> Result<SqlPool> {
             Ok(SqlPool::Postgres(pool))
         }
         Kind::Mysql => {
-            let mut o = MySqlConnectOptions::new().host(ep.host).port(ep.port);
+            let mut o = MySqlConnectOptions::new().host(ep.host).port(ep.port).disable_statement_logging();
             if let Some(u) = &cfg.user {
                 o = o.username(u);
             }
