@@ -26,6 +26,17 @@ pub enum Open {
     Dollar,
 }
 
+/// Where scanning stands at the end of the buffered text, so the next line can be
+/// read in the right context (inside a quote, a comment, a dollar-quote).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    Code,
+    Quote(char),
+    BlockComment,
+    /// Inside `$tag$ … $tag$`; the tag includes the dollars.
+    Dollar(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Code,
@@ -44,6 +55,11 @@ pub struct SqlBuf {
 impl SqlBuf {
     pub fn new(dialect: Dialect) -> Self {
         Self { dialect, delimiter: ";".into(), buf: String::new() }
+    }
+
+    /// Lines buffered so far.
+    pub fn lines(&self) -> usize {
+        if self.buf.is_empty() { 0 } else { self.buf.lines().count() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -84,6 +100,21 @@ impl SqlBuf {
         out
     }
 
+    /// The scanning context the next line starts in.
+    pub fn mode(&self) -> Mode {
+        if self.buf.is_empty() {
+            return Mode::Code;
+        }
+        // The newline a next line brings ends any `--` comment.
+        let text = format!("{}\n", self.buf);
+        match scan(self.dialect, None, &text) {
+            Scan::Open(State::Quote(q), _) => Mode::Quote(q),
+            Scan::Open(State::BlockComment, _) => Mode::BlockComment,
+            Scan::Open(State::Dollar, tag) => Mode::Dollar(tag),
+            _ => Mode::Code,
+        }
+    }
+
     /// What the buffered text is waiting for, if anything.
     pub fn open(&self) -> Option<Open> {
         if self.is_empty() {
@@ -102,13 +133,13 @@ impl SqlBuf {
 fn split_one<'a>(dialect: Dialect, delim: &str, s: &'a str) -> (Option<(&'a str, End)>, &'a str) {
     match scan(dialect, Some(delim), s) {
         Scan::Statement { at, len, end } => (Some((&s[..at], end)), &s[at + len..]),
-        Scan::Open(_) => (None, s),
+        Scan::Open(..) => (None, s),
     }
 }
 
 fn scan_state(dialect: Dialect, s: &str) -> State {
     match scan(dialect, None, s) {
-        Scan::Open(state) => state,
+        Scan::Open(state, _) => state,
         Scan::Statement { .. } => State::Code,
     }
 }
@@ -116,8 +147,8 @@ fn scan_state(dialect: Dialect, s: &str) -> State {
 enum Scan {
     /// A terminator of `len` bytes at `at`.
     Statement { at: usize, len: usize, end: End },
-    /// No terminator; the state at the end of the text.
-    Open(State),
+    /// No terminator; the state at the end of the text (and the open dollar tag).
+    Open(State, String),
 }
 
 /// Walk `s` tracking quotes, comments and dollar-quotes. With `delim`, stop at the
@@ -195,7 +226,7 @@ fn scan(dialect: Dialect, delim: Option<&str>, s: &str) -> Scan {
         }
         i += 1;
     }
-    Scan::Open(state)
+    Scan::Open(state, dollar_tag)
 }
 
 /// `$$` or `$tag$` at the start of `s`.
@@ -259,6 +290,18 @@ mod tests {
         // `$1` is a parameter, not a dollar quote.
         let (out, _) = feed(Dialect::Postgres, &["select $1;"]);
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn modes() {
+        let (_, b) = feed(Dialect::Postgres, &["select 'a"]);
+        assert_eq!(b.mode(), Mode::Quote('\''));
+        let (_, b) = feed(Dialect::Postgres, &["do $fn$ begin"]);
+        assert_eq!(b.mode(), Mode::Dollar("$fn$".into()));
+        let (_, b) = feed(Dialect::Postgres, &["select 1 -- comment"]);
+        assert_eq!(b.mode(), Mode::Code);
+        let (_, b) = feed(Dialect::Postgres, &["select /* x"]);
+        assert_eq!(b.mode(), Mode::BlockComment);
     }
 
     #[test]

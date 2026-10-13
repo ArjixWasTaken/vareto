@@ -286,6 +286,22 @@ try:
           and " two\n-----\n   2" in r.stdout and " id\n----\n(0 rows)" in r.stdout
           and 'ERROR:  column "emial" does not exist\nLINE 1: select emial from users\n               ^\nHINT:  Perhaps you meant' in r.stderr,
           r.stdout + r.stderr)
+    ofile = work / "psql-o.txt"
+    r = shell("pg", "\\set tbl orders\nselect count(*) as n, count(*) > 0 as any from :tbl \\gset row_\n\\echo n=:row_n\n"
+                    "\\if :row_any\n\\echo nonzero\n\\else\n\\echo zero\n\\endif\n"
+                    "\\pset format csv\nselect id, user_id from orders order by id limit 1;\n\\pset format aligned\n"
+                    "select 1 as a \\g (format=unaligned tuples_only)\n"
+                    f"\\o {ofile}\nselect 'to file' as f;\n\\o\n"
+                    "select 'select ' || g || ' as g' from generate_series(5, 6) g \\gexec\n"
+                    "select 'x' as r, 1 as c, 9 as v \\crosstabview\n"
+                    "select 3 as w \\watch c=2 i=0.1\n"
+                    "\\set QUIET on\n\\x on\n\\echo :QUIET\n")
+    check("psql: variables, \\gset, \\if, \\pset, \\g (opts), \\o, \\gexec, \\crosstabview, \\watch, QUIET",
+          r.returncode == 0 and "n=2\nnonzero\n" in r.stdout and "id,user_id\n1,1\n" in r.stdout
+          and "\n1\n" in r.stdout and "to file" not in r.stdout and "to file" in (ofile.read_text() if ofile.exists() else "")
+          and " g\n---\n 5\n" in r.stdout and " g\n---\n 6\n" in r.stdout and " r | 1\n---+---\n x | 9" in r.stdout
+          and r.stdout.count("(every 0.1s)") == 2 and "Expanded display is on." not in r.stdout and r.stdout.rstrip().endswith("on"),
+          r.stdout + r.stderr)
     r = shell("maria-rw", "call two_results();\nselect id, data from users order by id;\nselect * from users where id < 0;\n")
     check("mysql: each result set of a CALL, binary as hex, Empty set", r.returncode == 0
           and "| a |\n+---+\n| 1 |" in r.stdout and "| b | c |" in r.stdout and "Query OK, 0 rows affected" in r.stdout

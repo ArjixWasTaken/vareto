@@ -138,6 +138,7 @@ pub async fn open(state: &State, owner: u64, connection: &str, database: Option<
         "readonly": conn.readonly,
         "database": database,
         "server_version": version,
+        "backend_id": backend_id,
         "user": conn.cfg.user,
         "host": conn.route().describe(),
     }))
@@ -281,7 +282,8 @@ pub async fn use_db(state: &State, owner: u64, id: u64, database: &str) -> Resul
             inner.database = Some(database.to_string());
         }
     }
-    Ok(json!({ "database": inner.database }))
+    let backend_id = s.cancel.lock().unwrap().backend.as_ref().map(|(_, id)| *id);
+    Ok(json!({ "database": inner.database, "backend_id": backend_id }))
 }
 
 /// Cancel the running query. Postgres and MySQL cancel it server-side and keep the

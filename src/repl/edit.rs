@@ -1,14 +1,12 @@
 //! `\e` / `edit`: change text in the user's editor.
 
-use std::process::Command;
-
 use anyhow::{bail, Context, Result};
 
 /// The editor command: `$VISUAL`, then `$EDITOR`, else `vi`.
 fn editor() -> String {
     ["VISUAL", "EDITOR"]
         .iter()
-        .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
+        .find_map(|v| super::get_env(v).filter(|e| !e.trim().is_empty()))
         .unwrap_or_else(|| "vi".into())
 }
 
@@ -26,9 +24,7 @@ pub fn edit_file(path: &str, line: Option<usize>) -> Result<()> {
     let ed = editor();
     let at = line.map(|n| format!(" +{n}")).unwrap_or_default();
     // Through the shell, so EDITOR="code --wait" works.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{ed}{at} \"$1\""))
+    let status = super::shell_command(&format!("{ed}{at} \"$1\""))
         .arg("vareto-edit")
         .arg(path)
         .status()

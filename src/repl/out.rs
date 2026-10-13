@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context, Result};
@@ -113,16 +113,32 @@ pub fn redirect(to: Option<&str>) -> Result<()> {
     flush();
     let target = match to.map(str::trim) {
         None | Some("") => Target::Stdout,
-        Some(t) => match t.strip_prefix('|') {
-            Some(cmd) => Target::Pipe(
-                Command::new("sh").arg("-c").arg(cmd.trim()).stdin(Stdio::piped()).spawn().with_context(|| format!("could not run {cmd}"))?,
-            ),
-            None => Target::File(File::create(super::expand_home(t)).with_context(|| format!("{t}"))?),
-        },
+        Some(t) => open_target(t)?,
     };
     let old = std::mem::replace(&mut state().target, target);
     close(old);
     Ok(())
+}
+
+/// Run `f` with output going to `to` (a file or `|cmd`), then back to the current
+/// target (psql `\g file`).
+pub fn with_target<T>(to: &str, f: impl FnOnce() -> T) -> Result<T> {
+    flush();
+    let target = open_target(to)?;
+    let old = std::mem::replace(&mut state().target, target);
+    let out = f();
+    flush();
+    let temp = std::mem::replace(&mut state().target, old);
+    close(temp);
+    Ok(out)
+}
+
+fn open_target(to: &str) -> Result<Target> {
+    let t = to.trim();
+    Ok(match t.strip_prefix('|') {
+        Some(cmd) => Target::Pipe(super::shell_command(cmd.trim()).stdin(Stdio::piped()).spawn().with_context(|| format!("could not run {cmd}"))?),
+        None => Target::File(File::create(super::expand_home(t)).with_context(|| t.to_string())?),
+    })
 }
 
 /// mysql `tee [file]` / `notee`: append a copy of all output to a file.
@@ -167,7 +183,7 @@ pub fn flush() {
         _ => false,
     };
     if paged {
-        let cmd = s.pager_cmd.clone().or_else(|| std::env::var("PAGER").ok()).unwrap_or_else(|| "less -S".into());
+        let cmd = s.pager_cmd.clone().or_else(|| super::get_env("PAGER")).unwrap_or_else(|| "less -S".into());
         drop(s);
         if page(&cmd, &text).is_ok() {
             return;
@@ -192,7 +208,7 @@ pub fn flush() {
 }
 
 fn page(cmd: &str, text: &str) -> Result<()> {
-    let mut child = Command::new("sh").arg("-c").arg(cmd).stdin(Stdio::piped()).spawn()?;
+    let mut child = super::shell_command(cmd).stdin(Stdio::piped()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         // The pager may quit before reading everything; that's fine.
         stdin.write_all(text.as_bytes()).ok();

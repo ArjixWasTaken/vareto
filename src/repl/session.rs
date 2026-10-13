@@ -30,6 +30,8 @@ pub struct Session {
     pub user: Option<String>,
     pub host: String,
     pub database: Option<String>,
+    /// The server's id for this connection (Postgres backend pid, MySQL connection id).
+    pub backend_id: Option<i64>,
     pub tx: Tx,
     /// Row cap per statement (`--limit`); the daemon's default when unset.
     pub limit: Option<usize>,
@@ -52,6 +54,7 @@ impl Session {
             user: v["user"].as_str().map(str::to_string),
             host: v["host"].as_str().unwrap_or("").into(),
             database: v["database"].as_str().map(str::to_string),
+            backend_id: v["backend_id"].as_i64(),
             tx: Tx::Idle,
             limit,
         })
@@ -101,6 +104,7 @@ impl Session {
     pub fn use_db(&mut self, database: &str) -> Result<()> {
         let v = self.call(Request::SessionUse { session: self.id, database: database.into() })?;
         self.database = v["database"].as_str().map(str::to_string);
+        self.backend_id = v["backend_id"].as_i64().or(self.backend_id);
         self.tx = Tx::Idle;
         Ok(())
     }

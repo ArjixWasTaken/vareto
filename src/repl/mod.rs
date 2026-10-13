@@ -7,6 +7,8 @@ mod mongo;
 mod mysql;
 mod out;
 mod psql;
+mod psql_print;
+mod psql_vars;
 mod redis;
 mod session;
 mod sqlite;
@@ -44,6 +46,39 @@ pub struct Options {
 pub enum Flow {
     Continue,
     Quit,
+    /// psql `\s [file]`: the driver prints (or writes) the line history.
+    History(Option<String>),
+}
+
+/// psql `\setenv`: variables for the commands the shell starts (`\!`, the editor,
+/// the pager). The process environment itself is left alone; changing it while
+/// other threads run is unsound.
+static ENV_OVERLAY: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, Option<String>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub fn set_env(name: &str, value: Option<&str>) {
+    ENV_OVERLAY.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), value.map(str::to_string));
+}
+
+/// An environment variable as the shell's child processes see it.
+pub fn get_env(name: &str) -> Option<String> {
+    match ENV_OVERLAY.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+        Some(v) => v.clone(),
+        None => std::env::var(name).ok(),
+    }
+}
+
+/// `sh -c <cmd>` with the `\setenv` overlay applied.
+pub fn shell_command(cmd: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("sh");
+    c.arg("-c").arg(cmd);
+    for (k, v) in ENV_OVERLAY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    c
 }
 
 /// One database's shell dialect.
@@ -146,7 +181,8 @@ fn run_lines(f: &mut dyn Flavor, s: &mut Session, lines: impl Iterator<Item = st
     let handle = |f: &mut dyn Flavor, r: Result<Flow>| -> Result<Option<Flow>> {
         match r {
             Ok(Flow::Quit) => Ok(Some(Flow::Quit)),
-            Ok(Flow::Continue) => Ok(None),
+            // No line history in a script.
+            Ok(Flow::Continue | Flow::History(_)) => Ok(None),
             Err(e) if f.stop_on_error() => Err(e),
             Err(e) => {
                 out::flush();
@@ -181,7 +217,7 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<i32> {
         let mut s = Session::open(rt, client, ro, &opts.connection, opts.database.clone(), opts.limit)?;
         let mut f: Box<dyn Flavor> = match s.kind {
             Kind::Mysql => Box::new(mysql::Mysql::new(&s, &opts)),
-            Kind::Postgres => Box::new(psql::Psql::new(&opts)?),
+            Kind::Postgres => Box::new(psql::Psql::new(&s, &opts, interactive)?),
             Kind::Redis => Box::new(redis::Redis::new()),
             Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
             Kind::Mongodb => Box::new(mongo::Mongo::new(interactive)?),
@@ -308,6 +344,16 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
                 match flow {
                     Ok(Flow::Quit) => break,
                     Ok(Flow::Continue) => {}
+                    Ok(Flow::History(to)) => {
+                        let lines: Vec<String> = ed.history().iter().map(|h| h.to_string()).collect();
+                        match to {
+                            Some(path) => match std::fs::write(expand_home(&path), lines.join("\n") + "\n") {
+                                Ok(()) => println!("Wrote history to file \"{path}\"."),
+                                Err(e) => eprintln!("{path}: {e}"),
+                            },
+                            None => println!("{}", lines.join("\n")),
+                        }
+                    }
                     Err(e) => eprintln!("{}", f.error(&e)),
                 }
                 if s.database != db {

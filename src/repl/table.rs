@@ -201,22 +201,6 @@ pub fn vertical_mysql(columns: &[String], rows: &[Vec<Value>]) -> String {
     out.trim_end().to_string()
 }
 
-/// psql `\x`.
-pub fn expanded_psql(columns: &[String], rows: &[Vec<Value>]) -> String {
-    let w = columns.iter().map(|c| c.chars().count()).max().unwrap_or(0);
-    let vw = rows.iter().flatten().map(|v| psql_cell(v).chars().count()).max().unwrap_or(0);
-    let mut out = String::new();
-    for (n, r) in rows.iter().enumerate() {
-        let head = format!("-[ RECORD {} ]", n + 1);
-        let total = w + 3 + vw;
-        out.push_str(&format!("{head}{}\n", "-".repeat(total.saturating_sub(head.len()).max(1))));
-        for (c, v) in columns.iter().zip(r) {
-            out.push_str(&format!("{c:<w$} | {}\n", psql_cell(v)));
-        }
-    }
-    out.trim_end().to_string()
-}
-
 /// sqlite3 `.mode line`.
 pub fn line_sqlite(columns: &[String], rows: &[Vec<Value>]) -> String {
     let w = columns.iter().map(|c| c.chars().count()).max().unwrap_or(0);
@@ -278,7 +262,6 @@ mod tests {
         let (c, r) = data();
         let s = table(&c, &r, Style::Psql, true, &psql_cell);
         assert_eq!(s, " id | name\n----+------\n  1 | ann\n 10 |");
-        assert_eq!(expanded_psql(&c, &r[..1]), "-[ RECORD 1 ]-\nid   | 1\nname | ann");
     }
 
     #[test]
