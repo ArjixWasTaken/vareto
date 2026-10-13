@@ -20,7 +20,7 @@ use crate::ipc::{MongoQuery, QuerySpec, Request};
 
 /// vareto (βαρετό, "boring"): SSH-tunnelling database MCP server.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = ipc::VERSION, about)]
 struct Cli {
     /// Force every connection to read-only for this client.
     #[arg(long, global = true, env = "VARETO_READONLY")]

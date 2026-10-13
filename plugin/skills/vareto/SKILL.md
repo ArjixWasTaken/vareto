@@ -1,6 +1,6 @@
 ---
 name: vareto
-description: Query and explore databases through the vareto MCP server — MySQL/MariaDB, PostgreSQL, MongoDB and Redis, including ones only reachable through SSH tunnels. Use whenever the user asks about data in a database, wants to inspect a schema, run SQL / a Mongo query / a Redis command, debug data in staging or production, export query results to a file, or add a database connection, and the vareto tools (list_connections, sql_query, mongo_query, redis_command, ...) are available.
+description: Query and explore databases through the vareto MCP server — MySQL/MariaDB, PostgreSQL, MongoDB and Redis, including ones only reachable through SSH tunnels. Use whenever the user asks about data in a database, wants to inspect a schema, run SQL / a Mongo query / a Redis command, debug data in staging or production, export query results to a file, or add a database connection through vareto. Also use it to install or set up vareto, or when the vareto tools (list_connections, sql_query, mongo_query, redis_command, ...) are expected but missing.
 ---
 
 # Working with databases through vareto
@@ -9,6 +9,58 @@ vareto is an MCP server that connects to databases, opening SSH tunnels on its o
 connection needs one. Tunnels and pools live in a background daemon: you never open
 tunnels manually before querying. Tool names below are the bare names; in your tool list
 they carry an MCP prefix (e.g. `mcp__vareto__sql_query` or `mcp__plugin_vareto_vareto__sql_query`).
+
+## If the tools are missing: install vareto
+
+The plugin starts the MCP server by running `vareto mcp`, so the `vareto` binary must
+be on `PATH`. If no vareto tools are available, check with `command -v vareto`. If it
+isn't installed, tell the user and offer to install it. Installing software changes
+their system, so get a yes first. Then:
+
+1. **Rust toolchain available** (`command -v cargo` succeeds): build from source.
+   ```sh
+   cargo install --locked --git https://github.com/ArjixWasTaken/vareto
+   ```
+   This puts the binary in `~/.cargo/bin`, which is normally already on `PATH`.
+2. **No Rust:** download a prebuilt binary from the latest GitHub release. Each push to
+   `master` publishes one, tagged `v<version>.<build>`.
+   - Linux builds are static (musl), so they run on any distro.
+   - Windows is not supported; vareto relies on unix sockets.
+
+   | `uname -sm` | Asset |
+   |---|---|
+   | `Linux x86_64` | `vareto-x86_64-unknown-linux-musl.tar.gz` |
+   | `Linux aarch64` / `arm64` | `vareto-aarch64-unknown-linux-musl.tar.gz` |
+   | `Darwin arm64` | `vareto-aarch64-apple-darwin.tar.gz` |
+   | `Darwin x86_64` | `vareto-x86_64-apple-darwin.tar.gz` |
+
+   ```sh
+   asset=vareto-x86_64-unknown-linux-musl            # from the table above
+   url=https://github.com/ArjixWasTaken/vareto/releases/latest/download/$asset.tar.gz
+   tmp=$(mktemp -d) && cd "$tmp"
+   curl -fsSLO "$url" && curl -fsSLO "$url.sha256"
+   shasum -a 256 -c "$asset.tar.gz.sha256"           # or: sha256sum -c
+   tar -xzf "$asset.tar.gz"
+   mkdir -p ~/.local/bin && install -m 755 "$asset/vareto" ~/.local/bin/vareto
+   ```
+   If `~/.local/bin` is not on `PATH`, tell the user to add it to their shell profile.
+   Claude Code launches the MCP server with that `PATH`.
+3. Check the install with `vareto --version`.
+4. **Ask the user to reconnect.** The MCP server only starts once the binary exists, so
+   the user must run `/mcp` and reconnect `vareto`, or restart Claude Code. You can't
+   do this yourself.
+5. **Configure.** If `~/.config/vareto/config.toml` doesn't exist, `vareto config init`
+   writes an annotated example. Then:
+   - Ask the user for their connections. Never invent hosts or credentials.
+   - Help them fill in the file. Keep passwords out of it where possible: prefer
+     `password = "${env:VAR}"`, `password_cmd`, or `keyring = true` with
+     `vareto secret set <conn>`, which the user runs because it prompts for the
+     password.
+   - Validate with `vareto config check`.
+
+To update an existing install, rerun the same `cargo install` command (add `--force`)
+or download the binary again. The running daemon restarts itself on the next call when
+the version changes.
 
 ## Workflow
 
@@ -132,5 +184,5 @@ way; connections from `config.toml` are the user's to edit.
 | `query timed out` | Add filters/indexes-friendly predicates, use `EXPLAIN`, or export a narrower set. |
 
 For deeper diagnosis the user can run `vareto status` or read the daemon log
-(`~/.local/state/vareto/daemon.log`). If the tools are missing entirely, the `vareto`
-binary is probably not on PATH (`cargo install --path .` in the vareto repo).
+(`~/.local/state/vareto/daemon.log`). If the tools are missing entirely, see
+*If the tools are missing* above.

@@ -41,3 +41,7 @@ toml = "1.1.8"
 toml_edit = "0.25.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = "thin"

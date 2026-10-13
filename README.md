@@ -29,8 +29,19 @@ vareto list/open/close/sql ─────────────────�
 
 ## Setup
 
+Install the binary in one of these ways:
+
+- **From source** (needs Rust): `cargo install --locked --git https://github.com/ArjixWasTaken/vareto`
+- **Prebuilt:** download a binary from the
+  [latest release](https://github.com/ArjixWasTaken/vareto/releases/latest).
+  - Every push to `master` publishes one, tagged `v<version>.<run id>`.
+  - Assets are named `vareto-<target>.tar.gz`, for x86_64/aarch64 Linux (static musl)
+    and macOS.
+  - `releases/latest/download/vareto-<target>.tar.gz` always points at the newest build.
+
+Then:
+
 ```sh
-cargo install --path .
 vareto config init          # writes ~/.config/vareto/config.toml from config.example.toml
 $EDITOR ~/.config/vareto/config.toml
 vareto config check
