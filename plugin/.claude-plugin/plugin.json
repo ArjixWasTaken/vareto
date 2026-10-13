@@ -3,7 +3,8 @@
   "description": "Query MySQL/MariaDB, PostgreSQL, MongoDB and Redis (directly or through SSH tunnels) via the vareto MCP server, with read-only enforcement and data masking.",
   "version": "0.1.0",
   "author": {
-    "name": "ArjixWasTaken"
+    "name": "ArjixWasTaken",
+    "email": "me@arjix.dev"
   },
   "keywords": [
     "database",

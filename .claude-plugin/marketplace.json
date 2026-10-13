@@ -1,7 +1,8 @@
 {
   "name": "vareto",
   "owner": {
-    "name": "ArjixWasTaken"
+    "name": "ArjixWasTaken",
+    "email": "me@arjix.dev"
   },
   "metadata": {
     "description": "vareto: SSH-tunnelling database MCP server and its usage skill"
