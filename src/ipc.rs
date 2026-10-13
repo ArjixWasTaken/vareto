@@ -48,8 +48,25 @@ pub enum Request {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     Ok { result: Value },
-    Err { error: String },
+    /// `info`: the database's structured error fields, when the error came from it.
+    Err { error: String, #[serde(default, skip_serializing_if = "Option::is_none")] info: Option<Value> },
 }
+
+/// An error answered by the daemon. `info` carries the database's structured
+/// error fields (see `db::DbError`).
+#[derive(Debug)]
+pub struct ServerError {
+    pub message: String,
+    pub info: Option<Value>,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SaveConnection {
@@ -215,7 +232,7 @@ impl Client {
         send(&mut self.conn, req).await?;
         match recv::<Response>(&mut self.conn).await? {
             Some(Response::Ok { result }) => Ok(result),
-            Some(Response::Err { error }) => bail!(error),
+            Some(Response::Err { error, info }) => Err(ServerError { message: error, info }.into()),
             None => bail!("daemon closed the connection"),
         }
     }

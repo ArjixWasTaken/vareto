@@ -219,10 +219,8 @@ async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usi
                 }
             }
             let mut out = col.finish();
-            if let Output::Table { columns, .. } = &mut out {
-                if let Some(t) = readonly::single_table(d, sql) {
-                    columns.iter_mut().for_each(|c| c.table = Some(t.clone()));
-                }
+            if let Some(t) = readonly::single_table(d, sql) {
+                out.set_table(&t);
             }
             if kind == Kind::Mysql && sql.trim_start().get(..3).is_some_and(|w| w.eq_ignore_ascii_case("use")) {
                 inner.database = c.scalar("SELECT DATABASE()").await?.as_str().map(str::to_string);

@@ -1,9 +1,11 @@
 //! `vareto shell`: an interactive shell that behaves like each database's own
 //! client (mysql, psql, sqlite3, redis-cli, mongosh), on a pinned daemon session.
 
+mod edit;
 mod interrupt;
 mod mongo;
 mod mysql;
+mod out;
 mod psql;
 mod redis;
 mod session;
@@ -33,6 +35,10 @@ pub struct Options {
     pub limit: Option<usize>,
     /// Run these commands and exit instead of reading input.
     pub execute: Option<String>,
+    /// mysql `--force`: keep going after errors in a script.
+    pub force: bool,
+    /// psql `-v name=value`.
+    pub set: Vec<String>,
 }
 
 pub enum Flow {
@@ -60,7 +66,23 @@ pub trait Flavor {
     fn refresh(&mut self, _s: &mut Session) {}
     /// Words for tab completion.
     fn words(&self) -> Vec<String>;
+    /// Whether a script stops at its first error (mysql), or reports it and goes on
+    /// (psql unless `ON_ERROR_STOP`).
+    fn stop_on_error(&self) -> bool {
+        true
+    }
+    /// Exit status when a script stopped at an error (psql: 3).
+    fn stop_status(&self) -> i32 {
+        1
+    }
+    /// Exit status for a script that ran to the end with `errors` errors.
+    fn finish_status(&self, errors: usize) -> i32 {
+        i32::from(errors > 0)
+    }
 }
+
+/// Errors a script reported and went past (see [`Flavor::stop_on_error`]).
+static SCRIPT_ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Completion words shared by the SQL shells.
 pub const SQL_KEYWORDS: &[&str] = &[
@@ -73,6 +95,11 @@ pub const SQL_KEYWORDS: &[&str] = &[
 ];
 
 /// The error text without driver boilerplate.
+/// The database's structured error fields, when the daemon sent them.
+pub fn error_info(e: &anyhow::Error) -> Option<&serde_json::Value> {
+    e.chain().find_map(|c| c.downcast_ref::<crate::ipc::ServerError>()).and_then(|s| s.info.as_ref())
+}
+
 pub fn error_text(e: &anyhow::Error) -> String {
     let s = format!("{e:#}");
     s.strip_prefix("error returned from database: ").unwrap_or(&s).to_string()
@@ -96,67 +123,104 @@ pub fn names(v: &serde_json::Value) -> Vec<String> {
 
 /// Read a file for `source` / `\i` / `.read`.
 pub fn read_script(path: &str) -> Result<String> {
-    let p = shellexpand_home(path.trim().trim_matches(|c| c == '\'' || c == '"'));
+    let p = expand_home(path.trim().trim_matches(|c| c == '\'' || c == '"'));
     std::fs::read_to_string(&p).map_err(|e| anyhow::anyhow!("{p}: {e}"))
 }
 
-fn shellexpand_home(p: &str) -> String {
+pub fn expand_home(p: &str) -> String {
     match (p.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => format!("{home}/{rest}"),
         _ => p.to_string(),
     }
 }
 
-/// Feed a whole script through a flavor, line by line. Stops at the first error.
+/// Feed a whole script through a flavor, line by line. An error ends it, or is
+/// reported and skipped, as the flavor's client does.
 pub fn run_script(f: &mut dyn Flavor, s: &mut Session, text: &str) -> Result<Flow> {
-    for line in text.lines() {
-        if let Flow::Quit = f.line(line, s)? {
-            return Ok(Flow::Quit);
+    run_lines(f, s, text.lines().map(|l| Ok(l.to_string())))
+}
+
+/// [`run_script`] over lines as they arrive (piped stdin runs statement by
+/// statement, like `mysql < file`, instead of waiting for the end of input).
+fn run_lines(f: &mut dyn Flavor, s: &mut Session, lines: impl Iterator<Item = std::io::Result<String>>) -> Result<Flow> {
+    let handle = |f: &mut dyn Flavor, r: Result<Flow>| -> Result<Option<Flow>> {
+        match r {
+            Ok(Flow::Quit) => Ok(Some(Flow::Quit)),
+            Ok(Flow::Continue) => Ok(None),
+            Err(e) if f.stop_on_error() => Err(e),
+            Err(e) => {
+                out::flush();
+                eprintln!("{}", f.error(&e));
+                SCRIPT_ERRORS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+    };
+    for line in lines {
+        let r = f.line(&line?, s);
+        out::flush();
+        if let Some(flow) = handle(f, r)? {
+            return Ok(flow);
         }
     }
-    f.finish(s)?;
+    let r = f.finish(s).map(|()| Flow::Continue);
+    out::flush();
+    handle(f, r)?;
     Ok(Flow::Continue)
 }
 
-pub async fn run(daemon: &Daemon, opts: Options) -> Result<bool> {
+/// Runs the shell; returns the exit status.
+pub async fn run(daemon: &Daemon, opts: Options) -> Result<i32> {
     let client = daemon.connect().await?;
     let rt = tokio::runtime::Handle::current();
     let ro = daemon.force_readonly;
     let interactive = opts.execute.is_none() && std::io::stdin().is_terminal();
     interrupt::install(&rt, interactive);
+    out::set_interactive(interactive);
     tokio::task::spawn_blocking(move || {
         let mut s = Session::open(rt, client, ro, &opts.connection, opts.database.clone(), opts.limit)?;
         let mut f: Box<dyn Flavor> = match s.kind {
-            Kind::Mysql => Box::new(mysql::Mysql::new(&s)),
-            Kind::Postgres => Box::new(psql::Psql::new()),
+            Kind::Mysql => Box::new(mysql::Mysql::new(&s, &opts)),
+            Kind::Postgres => Box::new(psql::Psql::new(&opts)?),
             Kind::Redis => Box::new(redis::Redis::new()),
             Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
             Kind::Mongodb => Box::new(mongo::Mongo::new(interactive)?),
         };
-        let ok = if let Some(cmds) = &opts.execute {
+        if opts.force && s.kind != Kind::Mysql {
+            anyhow::bail!("--force is for mysql connections");
+        }
+        if !opts.set.is_empty() && s.kind != Kind::Postgres {
+            anyhow::bail!("-v/--set is for postgres connections");
+        }
+        let code = if let Some(cmds) = &opts.execute {
             script(f.as_mut(), &mut s, cmds)
         } else if interactive {
             run_interactive(f.as_mut(), &mut s, &opts.connection)
         } else {
-            let mut text = String::new();
-            for l in std::io::stdin().lock().lines() {
-                text.push_str(&l?);
-                text.push('\n');
-            }
-            script(f.as_mut(), &mut s, &text)
+            let stdin = std::io::stdin();
+            let r = run_lines(f.as_mut(), &mut s, stdin.lock().lines());
+            finish_script(f.as_mut(), r)
         };
+        out::finish();
         s.close();
-        Ok(ok)
+        Ok(code)
     })
     .await?
 }
 
-fn script(f: &mut dyn Flavor, s: &mut Session, text: &str) -> bool {
-    match run_script(f, s, text) {
-        Ok(_) => true,
+fn script(f: &mut dyn Flavor, s: &mut Session, text: &str) -> i32 {
+    let r = run_script(f, s, text);
+    finish_script(f, r)
+}
+
+/// The exit status of a script run, printing the error that stopped it.
+fn finish_script(f: &mut dyn Flavor, r: Result<Flow>) -> i32 {
+    match r {
+        Ok(_) => f.finish_status(SCRIPT_ERRORS.load(std::sync::atomic::Ordering::SeqCst)),
         Err(e) => {
+            out::flush();
             eprintln!("{}", f.error(&e));
-            false
+            f.stop_status()
         }
     }
 }
@@ -203,13 +267,13 @@ impl Highlighter for Helper {}
 impl Validator for Helper {}
 impl rustyline::Helper for Helper {}
 
-fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> bool {
+fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32 {
     let config = rustyline::Config::builder().auto_add_history(false).max_history_size(5000).map(|b| b.build());
     let mut ed: rustyline::Editor<Helper, DefaultHistory> = match config.and_then(rustyline::Editor::with_config) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("cannot start the line editor: {e}");
-            return false;
+            return 1;
         }
     };
     let words = Rc::new(RefCell::new(Vec::new()));
@@ -226,10 +290,14 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> boo
     let mut entry: Vec<String> = Vec::new();
     loop {
         let db = s.database.clone();
+        if let Some((w, h)) = ed.dimensions() {
+            out::set_size(w as usize, h as usize);
+        }
         match ed.readline(&f.prompt(s)) {
             Ok(line) => {
                 entry.push(line.clone());
                 let flow = f.line(&line, s);
+                out::flush();
                 if !f.pending() {
                     let text = entry.join("\n");
                     if !text.trim().is_empty() {
@@ -265,5 +333,5 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> boo
         }
     }
     ed.save_history(&history).ok();
-    true
+    0
 }

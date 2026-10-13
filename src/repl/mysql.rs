@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
+use super::out::outln;
 use super::session::Session;
 use super::sqlbuf::{Dialect, End, Open, SqlBuf};
 use super::table::{self, QueryResult, Style};
@@ -10,6 +11,8 @@ use super::{elapsed, error_text, names, read_script, run_script, Flavor, Flow, S
 
 pub struct Mysql {
     buf: SqlBuf,
+    /// `--force`: keep going after errors in a script.
+    force: bool,
     mariadb: bool,
     tables: Vec<String>,
 }
@@ -34,8 +37,8 @@ fn plural(n: usize, one: &str) -> String {
 }
 
 impl Mysql {
-    pub fn new(s: &Session) -> Self {
-        Self { buf: SqlBuf::new(Dialect::Mysql), mariadb: s.server_version.to_lowercase().contains("mariadb"), tables: Vec::new() }
+    pub fn new(s: &Session, opts: &super::Options) -> Self {
+        Self { buf: SqlBuf::new(Dialect::Mysql), force: opts.force, mariadb: s.server_version.to_lowercase().contains("mariadb"), tables: Vec::new() }
     }
 
     /// A client command at the start of a line, if it is one.
@@ -45,13 +48,13 @@ impl Mysql {
         let out = match cmd.to_lowercase().as_str() {
             "quit" | "exit" | "\\q" => Ok(Flow::Quit),
             "help" | "\\h" | "?" | "\\?" => {
-                println!("{HELP}\n");
+                outln!("{HELP}\n");
                 Ok(Flow::Continue)
             }
             "\\u" | "use" if !arg.is_empty() => {
                 let db = arg.trim_matches('`');
                 s.use_db(db).map(|()| {
-                    println!("Database changed");
+                    outln!("Database changed");
                     Flow::Continue
                 })
             }
@@ -71,39 +74,72 @@ impl Mysql {
 
     fn status(&self, s: &Session) {
         let line = "--------------";
-        println!("{line}");
-        println!("Connection:\t\t{} (vareto connection {:?})", s.host, s.connection);
-        println!("Current database:\t{}", s.database.as_deref().unwrap_or(""));
-        println!("Current user:\t\t{}", s.user.as_deref().unwrap_or(""));
-        println!("Server version:\t\t{}", s.server_version);
-        println!("Read-only:\t\t{}", if s.readonly { "yes" } else { "no" });
-        println!("Statement delimiter:\t{}", self.buf.delimiter);
-        println!("{line}\n");
+        outln!("{line}");
+        outln!("Connection:\t\t{} (vareto connection {:?})", s.host, s.connection);
+        outln!("Current database:\t{}", s.database.as_deref().unwrap_or(""));
+        outln!("Current user:\t\t{}", s.user.as_deref().unwrap_or(""));
+        outln!("Server version:\t\t{}", s.server_version);
+        outln!("Read-only:\t\t{}", if s.readonly { "yes" } else { "no" });
+        outln!("Statement delimiter:\t{}", self.buf.delimiter);
+        outln!("{line}\n");
     }
 
     fn execute(&mut self, sql: &str, end: End, s: &mut Session) -> Result<()> {
         let v = s.sql(sql)?;
         let secs = elapsed(&v);
-        match QueryResult::from_json(&v) {
-            QueryResult::Table { columns, rows, truncated } => {
+        // A CALL (or several statements at once) prints one result per statement.
+        for part in QueryResult::from_json(&v).into_parts() {
+            self.print_result(part, end, secs)?;
+        }
+        Ok(())
+    }
+
+    /// Binary values as `0x…` hex. MariaDB's client prints the raw bytes; text that
+    /// is valid UTF-8 stays text there, and anything else is shown as hex too.
+    fn binary_cells(&self, types: &[Option<String>], rows: &mut [Vec<Value>]) {
+        for (i, t) in types.iter().enumerate() {
+            if !t.as_deref().is_some_and(table::is_binary_type) {
+                continue;
+            }
+            for row in rows.iter_mut() {
+                let Some(cell) = row.get_mut(i) else { continue };
+                if self.mariadb && cell.as_str().is_some_and(|s| !s.starts_with("base64:")) {
+                    continue;
+                }
+                if let Some(bytes) = table::value_bytes(cell) {
+                    *cell = Value::String(table::hex_bytes(&bytes));
+                }
+            }
+        }
+    }
+
+    fn print_result(&self, r: QueryResult, end: End, secs: f64) -> Result<()> {
+        match r {
+            QueryResult::Table { columns, types, mut rows, truncated } => {
                 if rows.is_empty() {
-                    println!("Empty set ({secs:.2} sec)\n");
+                    outln!("Empty set ({secs:.2} sec)\n");
                     return Ok(());
                 }
+                self.binary_cells(&types, &mut rows);
                 let out = match end {
                     End::Vertical => table::vertical_mysql(&columns, &rows),
                     End::Normal => table::table(&columns, &rows, Style::Mysql, true, &|v| table::cell(v, "NULL")),
                 };
-                println!("{out}");
-                println!("{} in set ({secs:.2} sec)", plural(rows.len(), "row"));
+                outln!("{out}");
+                outln!("{} in set ({secs:.2} sec)", plural(rows.len(), "row"));
                 if truncated {
-                    println!("(more rows exist; only the first {} are shown, see --limit)", rows.len());
+                    outln!("(more rows exist; only the first {} are shown, see --limit)", rows.len());
                 }
-                println!();
+                outln!();
             }
-            QueryResult::Affected { rows, .. } => println!("Query OK, {} affected ({secs:.2} sec)\n", plural(rows as usize, "row")),
-            QueryResult::Docs { docs, .. } => println!("{}\n", serde_json::to_string_pretty(&Value::Array(docs))?),
-            QueryResult::Value(v) => println!("{}\n", serde_json::to_string_pretty(&v)?),
+            QueryResult::Affected { rows, .. } => outln!("Query OK, {} affected ({secs:.2} sec)\n", plural(rows as usize, "row")),
+            QueryResult::Docs { docs, .. } => outln!("{}\n", serde_json::to_string_pretty(&Value::Array(docs))?),
+            QueryResult::Value(v) => outln!("{}\n", serde_json::to_string_pretty(&v)?),
+            QueryResult::Multi(parts) => {
+                for p in parts {
+                    self.print_result(p, end, secs)?;
+                }
+            }
         }
         Ok(())
     }
@@ -152,6 +188,10 @@ impl Flavor for Mysql {
             self.execute(&rest, End::Normal, s)?;
         }
         Ok(())
+    }
+
+    fn stop_on_error(&self) -> bool {
+        !self.force
     }
 
     fn pending(&self) -> bool {

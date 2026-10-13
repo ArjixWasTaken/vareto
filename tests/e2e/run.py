@@ -105,6 +105,15 @@ user = "app"
 password_cmd = "printf 'my pass@1'"
 database = "shop"
 
+[connections.maria-rw]
+kind = "mariadb"
+ssh = "e2e-bastion"
+host = "mariadb"
+user = "app"
+password_cmd = "printf 'my pass@1'"
+database = "shop"
+readonly = false
+
 [connections.mongo]
 kind = "mongodb"
 tunnel = "dc"
@@ -268,9 +277,22 @@ try:
     check("psql: query, \\dt, \\d, SET persists", r.returncode == 0 and "   300\n(1 row)" in r.stdout
           and "public | orders | table" in r.stdout and '"orders_pkey" PRIMARY KEY, btree (id)' in r.stdout
           and " search_path\n-------------\n public" in r.stdout, r.stdout + r.stderr)
-    r = shell("pg", "select 1;\ninsert into orders (user_id) values (1);\nselect 2;\n")
-    check("psql: read-only refused, script stops", r.returncode != 0 and "ERROR:  read-only connection" in r.stderr
-          and "?column?" in r.stdout and " 2\n" not in r.stdout, r.stdout + r.stderr)
+    r = shell("pg", "\\set ON_ERROR_STOP on\nselect 1;\ninsert into orders (user_id) values (1);\nselect 2;\n")
+    check("psql: read-only refused; ON_ERROR_STOP stops with status 3", r.returncode == 3
+          and "ERROR:  read-only connection" in r.stderr and "?column?" in r.stdout and " 2\n" not in r.stdout,
+          (r.returncode, r.stdout + r.stderr))
+    r = shell("pg", "select 1 as one;\nselect emial from users;\nselect 2 as two;\nselect id from users where false;\n")
+    check("psql: continues past errors, LINE/HINT, empty results keep their header", r.returncode == 0
+          and " two\n-----\n   2" in r.stdout and " id\n----\n(0 rows)" in r.stdout
+          and 'ERROR:  column "emial" does not exist\nLINE 1: select emial from users\n               ^\nHINT:  Perhaps you meant' in r.stderr,
+          r.stdout + r.stderr)
+    r = shell("maria-rw", "call two_results();\nselect id, data from users order by id;\nselect * from users where id < 0;\n")
+    check("mysql: each result set of a CALL, binary as hex, Empty set", r.returncode == 0
+          and "| a |\n+---+\n| 1 |" in r.stdout and "| b | c |" in r.stdout and "Query OK, 0 rows affected" in r.stdout
+          and "0xDEADBEEF" in r.stdout and "Empty set" in r.stdout, r.stdout + r.stderr)
+    r = shell("maria", "select 1;\nselect * from nope;\nselect 2;\n", "--force")
+    check("mysql: --force goes on after an error, exit 1", r.returncode == 1 and "ERROR 1146" in r.stderr and "| 2 |" in r.stdout,
+          (r.returncode, r.stdout + r.stderr))
     r = shell("pg-rw", "begin;\ninsert into orders (user_id, total) values (1, 1);\nselect count(*) as n from orders;\nrollback;\nselect count(*) as n from orders;\n")
     counts = [l.strip() for l in r.stdout.splitlines() if l.strip().isdigit()]
     check("psql: transaction spans statements and rolls back", r.returncode == 0 and len(counts) == 2
@@ -329,8 +351,11 @@ try:
     # Ctrl-C: during a query it cancels the query; in a script outside a query it ends the shell.
     p = subprocess.Popen([str(BIN), "shell", "pg-rw"], env=env, text=True, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    p.stdin.write("select pg_sleep(1.8);\n"); p.stdin.flush()
-    time.sleep(0.8); p.send_signal(signal.SIGINT)
+    # Signal only once the session is up (the first result printed) and the sleep is running.
+    p.stdin.write("select 1 as ready;\nselect pg_sleep(1.8);\n"); p.stdin.flush()
+    while "(1 row)" not in p.stdout.readline():
+        pass
+    time.sleep(0.5); p.send_signal(signal.SIGINT)
     out, err = p.communicate(timeout=10)
     check("Ctrl-C cancels the running query", "canceling statement due to user request" in err, err)
     p = subprocess.Popen([str(BIN), "shell", "mongo"], env=env, text=True, stdin=subprocess.PIPE,

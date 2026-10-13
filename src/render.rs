@@ -18,12 +18,25 @@ pub trait Sink: Send {
     fn doc(&mut self, doc: Value) -> Result<bool>;
     fn affected(&mut self, rows: u64, detail: Option<Value>) -> Result<()>;
     fn value(&mut self, v: Value) -> Result<()>;
+    /// SQL: one statement finished. `affected` counts its rows for statements
+    /// without a result set.
+    fn end_statement(&mut self, affected: u64) -> Result<()>;
+    /// SQL: the (single) statement was a query that returned no rows; these are
+    /// its columns.
+    fn empty_result(&mut self, _columns: Vec<Column>) -> Result<()> {
+        Ok(())
+    }
 }
 
-/// Collects up to `limit` rows/documents in memory for a query response.
+/// Collects up to `limit` rows/documents in memory for a query response. SQL
+/// statements that return several result sets (a `CALL`, or several statements at
+/// once) keep one part per statement.
 pub struct Collector {
     limit: usize,
     collection: Option<String>,
+    parts: Vec<Output>,
+    /// Rows kept so far, over all parts.
+    total: usize,
     columns: Option<Vec<Column>>,
     rows: Vec<Vec<Value>>,
     docs: Option<Vec<Value>>,
@@ -34,10 +47,29 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(limit: usize, collection: Option<String>) -> Self {
-        Self { limit, collection, columns: None, rows: Vec::new(), docs: None, affected: None, value: None, truncated: false }
+        Self {
+            limit,
+            collection,
+            parts: Vec::new(),
+            total: 0,
+            columns: None,
+            rows: Vec::new(),
+            docs: None,
+            affected: None,
+            value: None,
+            truncated: false,
+        }
     }
 
-    pub fn finish(self) -> Output {
+    pub fn finish(mut self) -> Output {
+        if !self.parts.is_empty() || self.columns.is_some() {
+            // A statement cut short by the row limit never got its end.
+            if let Some(columns) = self.columns.take() {
+                let rows = std::mem::take(&mut self.rows);
+                self.parts.push(Output::Table { columns, rows, truncated: self.truncated });
+            }
+            return if self.parts.len() == 1 { self.parts.pop().unwrap() } else { Output::Multi(self.parts) };
+        }
         if let Some(columns) = self.columns {
             Output::Table { columns, rows: self.rows, truncated: self.truncated }
         } else if let Some(docs) = self.docs {
@@ -57,11 +89,12 @@ impl Sink for Collector {
         Ok(())
     }
     fn row(&mut self, row: Vec<Value>) -> Result<bool> {
-        if self.rows.len() >= self.limit {
+        if self.total >= self.limit {
             self.truncated = true;
             return Ok(false);
         }
         self.rows.push(row);
+        self.total += 1;
         Ok(true)
     }
     fn doc(&mut self, doc: Value) -> Result<bool> {
@@ -80,6 +113,20 @@ impl Sink for Collector {
     }
     fn value(&mut self, v: Value) -> Result<()> {
         self.value = Some(v);
+        Ok(())
+    }
+    fn end_statement(&mut self, affected: u64) -> Result<()> {
+        let part = match self.columns.take() {
+            Some(columns) => Output::Table { columns, rows: std::mem::take(&mut self.rows), truncated: self.truncated },
+            None => Output::Affected { rows: affected, detail: None },
+        };
+        self.parts.push(part);
+        Ok(())
+    }
+    fn empty_result(&mut self, columns: Vec<Column>) -> Result<()> {
+        if let [part @ Output::Affected { .. }] = self.parts.as_mut_slice() {
+            *part = Output::Table { columns, rows: Vec::new(), truncated: false };
+        }
         Ok(())
     }
 }
@@ -128,6 +175,8 @@ pub struct ExportWriter<'m> {
     dropped_keys: std::collections::BTreeSet<String>,
     records: usize,
     no_rows: bool,
+    /// The first result set is complete; an export holds only that one.
+    done: bool,
 }
 
 impl<'m> ExportWriter<'m> {
@@ -154,6 +203,7 @@ impl<'m> ExportWriter<'m> {
             dropped_keys: Default::default(),
             records: 0,
             no_rows: false,
+            done: false,
         })
     }
 
@@ -227,6 +277,9 @@ impl<'m> ExportWriter<'m> {
 
 impl Sink for ExportWriter<'_> {
     fn columns(&mut self, mut columns: Vec<Column>) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
         for c in &mut columns {
             c.table = self.table.clone();
         }
@@ -239,6 +292,9 @@ impl Sink for ExportWriter<'_> {
     }
 
     fn row(&mut self, mut row: Vec<Value>) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
         for (col, cell) in self.columns.iter().zip(row.iter_mut()) {
             self.masker.mask_cell(col.table.as_deref(), &col.name, cell);
         }
@@ -286,6 +342,15 @@ impl Sink for ExportWriter<'_> {
         Ok(())
     }
 
+    fn end_statement(&mut self, _affected: u64) -> Result<()> {
+        if self.columns.is_empty() && self.records == 0 {
+            self.no_rows = true;
+        } else {
+            self.done = true;
+        }
+        Ok(())
+    }
+
     fn value(&mut self, mut v: Value) -> Result<()> {
         self.masker.mask_document(None, &mut v);
         let w = self.out.as_mut().context("cannot export a single value as CSV")?;
@@ -315,14 +380,26 @@ pub enum Output {
     /// Statement executed without a result set.
     Affected { rows: u64, detail: Option<Value> },
     Value(Value),
+    /// One part per statement, for SQL that returned several result sets.
+    Multi(Vec<Output>),
 }
 
 impl Output {
+    /// Attribute the columns of every result set to `table` (for mask rules).
+    pub fn set_table(&mut self, table: &str) {
+        match self {
+            Output::Table { columns, .. } => columns.iter_mut().for_each(|c| c.table = Some(table.to_string())),
+            Output::Multi(parts) => parts.iter_mut().for_each(|p| p.set_table(table)),
+            _ => {}
+        }
+    }
+
     pub fn mask(&mut self, m: &Masker) {
         if m.is_noop() {
             return;
         }
         match self {
+            Output::Multi(parts) => parts.iter_mut().for_each(|p| p.mask(m)),
             Output::Table { columns, rows, .. } => {
                 for row in rows {
                     for (col, cell) in columns.iter().zip(row.iter_mut()) {
@@ -372,6 +449,7 @@ impl Output {
                 out
             }
             Output::Value(v) => json!({ "result": truncate_value(v, max_cell_chars) }),
+            Output::Multi(parts) => json!({ "results": parts.iter().map(|p| p.to_json(max_cell_chars)).collect::<Vec<_>>() }),
         }
     }
 }

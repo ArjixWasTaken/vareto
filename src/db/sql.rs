@@ -14,6 +14,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Connection as _, Either, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{Connection, Kind};
+use crate::readonly::SqlDialect;
 use crate::render::{Collector, Column, Output, Sink};
 
 pub enum SqlPool {
@@ -187,12 +188,13 @@ where
     Ok(Value::String(format!("base64:{}", base64::engine::general_purpose::STANDARD.encode(bytes))))
 }
 
-/// Feed a `fetch_many` stream into a sink, stopping early when it has enough.
+/// Feed a `fetch_many` stream into a sink, one statement at a time, stopping early
+/// when it has enough. Returns whether any row arrived.
 async fn drain<'e, DB, R>(
     mut stream: futures::stream::BoxStream<'e, Result<Either<DB::QueryResult, R>, sqlx::Error>>,
     sink: &mut dyn Sink,
     affected_of: fn(&DB::QueryResult) -> u64,
-) -> Result<()>
+) -> Result<bool>
 where
     DB: sqlx::Database,
     R: Row<Database = DB>,
@@ -200,12 +202,17 @@ where
     for<'r> &'r str: sqlx::Decode<'r, R::Database>,
     for<'r> Vec<u8>: sqlx::Decode<'r, R::Database>,
 {
+    // Column types of the current statement's result set.
     let mut types: Option<Vec<String>> = None;
-    let mut affected = 0u64;
+    let mut any_rows = false;
     while let Some(item) = stream.try_next().await? {
         match item {
-            Either::Left(res) => affected += affected_of(&res),
+            Either::Left(res) => {
+                sink.end_statement(affected_of(&res))?;
+                types = None;
+            }
             Either::Right(row) => {
+                any_rows = true;
                 if types.is_none() {
                     let cols: Vec<Column> = row
                         .columns()
@@ -225,15 +232,33 @@ where
                     out.push(cell(&row, i, t)?);
                 }
                 if !sink.row(out)? {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
     }
-    if types.is_none() {
-        sink.affected(affected, None)?;
-    }
-    Ok(())
+    Ok(any_rows)
+}
+
+/// Column metadata as the sink wants it.
+fn sink_columns<C: sqlx::Column>(cols: &[C]) -> Vec<Column> {
+    use sqlx::TypeInfo as _;
+    cols.iter()
+        .map(|c| Column { name: c.name().to_string(), type_name: Some(c.type_info().name().to_string()), table: None })
+        .collect()
+}
+
+/// The columns of `sql` without running it, for a query that returned no rows
+/// (rows are where the column names come from otherwise). A macro rather than a
+/// generic function: `Executor` on concrete connections keeps the futures `Send`.
+macro_rules! describe_empty {
+    ($conn:expr, $sql:expr, $sink:expr) => {{
+        use sqlx::{SqlSafeStr as _, Statement as _};
+        match $conn.prepare(AssertSqlSafe($sql.to_string()).into_sql_str()).await {
+            Ok(stmt) => $sink.empty_result(sink_columns(stmt.columns())),
+            Err(_) => Ok(()),
+        }
+    }};
 }
 
 impl SqlPool {
@@ -248,11 +273,12 @@ impl SqlPool {
     /// the server (statement_timeout / max_execution_time) and locally. In read-only
     /// mode it runs inside a READ ONLY transaction that is always rolled back.
     pub async fn stream(&self, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Duration) -> Result<()> {
+        let describe = crate::readonly::returns_rows(self.dialect(), sql);
         let fut = async {
             match self {
-                SqlPool::Postgres(pool) => pg_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout)).await,
-                SqlPool::Mysql(pool) => mysql_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout)).await,
-                SqlPool::Sqlite(pool) => sqlite_stream(&mut *pool.acquire().await?, sql, sink).await,
+                SqlPool::Postgres(pool) => pg_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout), describe).await,
+                SqlPool::Mysql(pool) => mysql_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout), describe).await,
+                SqlPool::Sqlite(pool) => sqlite_stream(&mut *pool.acquire().await?, sql, sink, describe).await,
             }
         };
         tokio::time::timeout(timeout + Duration::from_secs(5), fut)
@@ -285,6 +311,14 @@ impl SqlPool {
         };
         c.set_timeout(timeout).await?;
         Ok(c)
+    }
+
+    pub fn dialect(&self) -> SqlDialect {
+        match self {
+            SqlPool::Postgres(_) => SqlDialect::Postgres,
+            SqlPool::Mysql(_) => SqlDialect::Mysql,
+            SqlPool::Sqlite(_) => SqlDialect::Sqlite,
+        }
     }
 
     pub async fn close(&self) {
@@ -407,25 +441,31 @@ impl SqlPool {
     }
 }
 
-async fn pg_stream(c: &mut sqlx::PgConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>) -> Result<()> {
+async fn pg_stream(c: &mut sqlx::PgConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>, describe: bool) -> Result<()> {
     let affected = |r: &sqlx::postgres::PgQueryResult| r.rows_affected();
     if readonly {
         let mut tx = c.begin_with("BEGIN READ ONLY").await?;
         if let Some(t) = timeout {
             sqlx::raw_sql(AssertSqlSafe(format!("SET LOCAL statement_timeout = {}", t.as_millis()))).execute(&mut *tx).await?;
         }
-        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        let mut out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        if describe && matches!(out, Ok(false)) {
+            out = describe_empty!(&mut *tx, sql, sink).map(|()| false);
+        }
         tx.rollback().await.ok();
-        out
+        out.map(drop)
     } else {
         if let Some(t) = timeout {
             sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {}", t.as_millis()))).execute(&mut *c).await?;
         }
-        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
+        if !drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await? && describe {
+            describe_empty!(&mut *c, sql, sink)?;
+        }
+        Ok(())
     }
 }
 
-async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>) -> Result<()> {
+async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Option<Duration>, describe: bool) -> Result<()> {
     let affected = |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected();
     let set_timeout = timeout.map(|t| format!("SET SESSION max_execution_time = {}", t.as_millis()));
     if readonly {
@@ -433,30 +473,37 @@ async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn S
         if let Some(s) = set_timeout {
             sqlx::raw_sql(AssertSqlSafe(s)).execute(&mut *tx).await.ok();
         }
-        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        let mut out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
+        if describe && matches!(out, Ok(false)) {
+            out = describe_empty!(&mut *tx, sql, sink).map(|()| false);
+        }
         tx.rollback().await.ok();
-        out
+        out.map(drop)
     } else {
         if let Some(s) = set_timeout {
             sqlx::raw_sql(AssertSqlSafe(s)).execute(&mut *c).await.ok();
         }
-        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
+        if !drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await? && describe {
+            describe_empty!(&mut *c, sql, sink)?;
+        }
+        Ok(())
     }
 }
 
 /// A database error as the server words it, without sqlx's wrapper (and without
-/// Postgres's `at line N`, which is a line in the server's own C source).
-/// MySQL keeps its code: `1146 (42S02): Table 'x' doesn't exist`.
+/// Postgres's `at line N`, which is a line in the server's own C source), with
+/// its structured fields. MySQL keeps its code: `1146 (42S02): Table 'x' doesn't exist`.
 fn server_message(e: anyhow::Error) -> anyhow::Error {
     let Some(sqlx::Error::Database(d)) = e.downcast_ref::<sqlx::Error>() else { return e };
-    match d.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
-        Some(pg) => anyhow::anyhow!("{}", pg.message()),
-        None => anyhow::anyhow!("{d}"),
-    }
+    crate::db::DbError::from_sqlx(d.as_ref()).into()
 }
 
-async fn sqlite_stream(c: &mut sqlx::SqliteConnection, sql: &str, sink: &mut dyn Sink) -> Result<()> {
-    drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, |r: &sqlx::sqlite::SqliteQueryResult| r.rows_affected()).await
+async fn sqlite_stream(c: &mut sqlx::SqliteConnection, sql: &str, sink: &mut dyn Sink, describe: bool) -> Result<()> {
+    let affected = |r: &sqlx::sqlite::SqliteQueryResult| r.rows_affected();
+    if !drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await? && describe {
+        describe_empty!(&mut *c, sql, sink)?;
+    }
+    Ok(())
 }
 
 /// A single connection pinned to an interactive session, so session state (USE,
@@ -487,11 +534,17 @@ impl SqlConn {
     /// Run user SQL on this connection. `readonly` wraps it in a READ ONLY
     /// transaction that is rolled back.
     pub async fn stream(&mut self, sql: &str, sink: &mut dyn Sink, readonly: bool) -> Result<()> {
+        let dialect = match self {
+            SqlConn::Postgres(_) => SqlDialect::Postgres,
+            SqlConn::Mysql(_) => SqlDialect::Mysql,
+            SqlConn::Sqlite(_) => SqlDialect::Sqlite,
+        };
+        let describe = crate::readonly::returns_rows(dialect, sql);
         let res = match self {
-            SqlConn::Postgres(c) => pg_stream(c, sql, sink, readonly, None).await,
-            SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None).await,
+            SqlConn::Postgres(c) => pg_stream(c, sql, sink, readonly, None, describe).await,
+            SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None, describe).await,
             // Read-only connections open the file read-only.
-            SqlConn::Sqlite(c) => sqlite_stream(c, sql, sink).await,
+            SqlConn::Sqlite(c) => sqlite_stream(c, sql, sink, describe).await,
         };
         res.map_err(server_message)
     }

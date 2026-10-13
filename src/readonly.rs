@@ -220,6 +220,35 @@ pub fn session_statement(dialect: SqlDialect, sql: &str) -> bool {
     }
 }
 
+/// A single statement that returns rows (a query, SHOW, EXPLAIN, a read PRAGMA).
+pub fn returns_rows(dialect: SqlDialect, sql: &str) -> bool {
+    use sqlparser::ast::Statement as S;
+    if dialect == SqlDialect::Sqlite && read_pragma(sql) {
+        return true;
+    }
+    let Ok(stmts) = parse(dialect, sql) else { return false };
+    matches!(
+        stmts.as_slice(),
+        [S::Query(_)
+            | S::Explain { .. }
+            | S::ExplainTable { .. }
+            | S::ShowTables { .. }
+            | S::ShowColumns { .. }
+            | S::ShowVariable { .. }
+            | S::ShowVariables { .. }
+            | S::ShowStatus { .. }
+            | S::ShowCreate { .. }
+            | S::ShowDatabases { .. }
+            | S::ShowSchemas { .. }
+            | S::ShowViews { .. }
+            | S::ShowFunctions { .. }
+            | S::ShowCollation { .. }
+            | S::ShowCharset(_)
+            | S::ShowObjects(_)
+            | S::Pragma { .. }]
+    )
+}
+
 fn parse(dialect: SqlDialect, sql: &str) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
     use sqlparser::parser::Parser;

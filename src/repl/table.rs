@@ -5,22 +5,28 @@ use serde_json::Value;
 
 /// A query response from the daemon (the shape of `Output::to_json`).
 pub enum QueryResult {
-    Table { columns: Vec<String>, rows: Vec<Vec<Value>>, truncated: bool },
+    /// `types`: the database's type name per column, when known.
+    Table { columns: Vec<String>, types: Vec<Option<String>>, rows: Vec<Vec<Value>>, truncated: bool },
     Docs { docs: Vec<Value> },
     Affected { rows: u64 },
     Value(Value),
+    /// One result per statement, for SQL that returned several.
+    Multi(Vec<QueryResult>),
 }
 
 impl QueryResult {
     pub fn from_json(v: &Value) -> Self {
         let truncated = v["truncated"].as_bool() == Some(true);
-        if let Some(cols) = v["columns"].as_array() {
+        if let Some(parts) = v["results"].as_array() {
+            QueryResult::Multi(parts.iter().map(QueryResult::from_json).collect())
+        } else if let Some(cols) = v["columns"].as_array() {
             let columns = cols.iter().map(|c| c["name"].as_str().unwrap_or("").to_string()).collect();
+            let types = cols.iter().map(|c| c["type"].as_str().map(str::to_string)).collect();
             let rows = v["rows"]
                 .as_array()
                 .map(|r| r.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect())
                 .unwrap_or_default();
-            QueryResult::Table { columns, rows, truncated }
+            QueryResult::Table { columns, types, rows, truncated }
         } else if let Some(docs) = v["documents"].as_array() {
             QueryResult::Docs { docs: docs.clone() }
         } else if let Some(n) = v["affected_rows"].as_u64() {
@@ -61,6 +67,43 @@ const BOX: TableStyle = TableStyle::new()
     .header_separator(LineStyle::new('├', '─', '┼', '┤'))
     .content_lines(ContentLineStyle::new('│', '│', '│'))
     .bottom_border(LineStyle::new('└', '─', '┴', '┘'));
+
+impl QueryResult {
+    /// The results in order: the parts of a `Multi`, or just this one.
+    pub fn into_parts(self) -> Vec<QueryResult> {
+        match self {
+            QueryResult::Multi(parts) => parts.into_iter().flat_map(QueryResult::into_parts).collect(),
+            other => vec![other],
+        }
+    }
+}
+
+/// MySQL's binary column types.
+pub fn is_binary_type(t: &str) -> bool {
+    let t = t.to_ascii_uppercase();
+    matches!(t.as_str(), "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT" | "GEOMETRY")
+}
+
+/// The bytes of a binary value as it arrives: `base64:…` when it isn't UTF-8, else
+/// the text itself.
+pub fn value_bytes(v: &Value) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let s = v.as_str()?;
+    match s.strip_prefix("base64:") {
+        Some(b) => base64::engine::general_purpose::STANDARD.decode(b).ok(),
+        None => Some(s.as_bytes().to_vec()),
+    }
+}
+
+/// `0x…` hex, as the mysql client shows binary values.
+pub fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("0x");
+    for b in bytes {
+        out.push_str(&format!("{b:02X}"));
+    }
+    out
+}
 
 /// Cell text. `null` is how NULL prints (`NULL` in mysql, empty in psql).
 pub fn cell(v: &Value, null: &str) -> String {

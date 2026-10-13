@@ -3,6 +3,7 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 
+use super::out::outln;
 use super::session::Session;
 use super::sqlbuf::{Dialect, SqlBuf};
 use super::table::{self, QueryResult, Style};
@@ -85,27 +86,29 @@ impl Sqlite {
             Mode::Json => table::json(columns, rows),
         };
         if !out.is_empty() {
-            println!("{out}");
+            outln!("{out}");
         }
     }
 
     fn execute(&mut self, sql: &str, s: &mut Session) -> Result<()> {
         let v = s.sql(sql)?;
-        match QueryResult::from_json(&v) {
-            QueryResult::Table { columns, rows, truncated } => {
-                if !rows.is_empty() {
-                    self.print(&columns, &rows);
+        for part in QueryResult::from_json(&v).into_parts() {
+            match part {
+                QueryResult::Table { columns, rows, truncated, .. } => {
+                    if !rows.is_empty() {
+                        self.print(&columns, &rows);
+                    }
+                    if truncated {
+                        eprintln!("(more rows exist; only the first {} are shown, see --limit)", rows.len());
+                    }
                 }
-                if truncated {
-                    eprintln!("(more rows exist; only the first {} are shown, see --limit)", rows.len());
-                }
+                QueryResult::Affected { .. } | QueryResult::Multi(_) => {}
+                QueryResult::Docs { docs, .. } => outln!("{}", serde_json::to_string_pretty(&Value::Array(docs))?),
+                QueryResult::Value(v) => outln!("{}", serde_json::to_string_pretty(&v)?),
             }
-            QueryResult::Affected { .. } => {}
-            QueryResult::Docs { docs, .. } => println!("{}", serde_json::to_string_pretty(&Value::Array(docs))?),
-            QueryResult::Value(v) => println!("{}", serde_json::to_string_pretty(&v)?),
         }
         if self.timer {
-            println!("Run Time: real {:.3}", elapsed(&v));
+            outln!("Run Time: real {:.3}", elapsed(&v));
         }
         Ok(())
     }
@@ -123,7 +126,7 @@ impl Sqlite {
         let like = |col: &str| if arg.is_empty() { String::new() } else { format!(" AND {col} LIKE {}", quote_lit(arg)) };
         match cmd {
             "quit" | "exit" | "q" => return Ok(Flow::Quit),
-            "help" => println!("{HELP}"),
+            "help" => outln!("{HELP}"),
             "tables" => {
                 let sql = format!(
                     "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'{} ORDER BY 1",
@@ -132,7 +135,7 @@ impl Sqlite {
                 let names: Vec<String> = self.rows(s, &sql)?.iter().map(|r| table::cell(&r[0], "")).collect();
                 let w = names.iter().map(|n| n.chars().count()).max().unwrap_or(0) + 2;
                 for chunk in names.chunks((80 / w.max(1)).max(1)) {
-                    println!("{}", chunk.iter().map(|n| format!("{n:<w$}")).collect::<String>().trim_end());
+                    outln!("{}", chunk.iter().map(|n| format!("{n:<w$}")).collect::<String>().trim_end());
                 }
             }
             "schema" => {
@@ -142,26 +145,26 @@ impl Sqlite {
                     like("tbl_name")
                 );
                 for r in self.rows(s, &sql)? {
-                    println!("{};", table::cell(&r[0], ""));
+                    outln!("{};", table::cell(&r[0], ""));
                 }
             }
             "indexes" | "indices" => {
                 let sql = format!("SELECT name FROM sqlite_schema WHERE type = 'index'{} ORDER BY 1", like("tbl_name"));
                 for r in self.rows(s, &sql)? {
-                    println!("{}", table::cell(&r[0], ""));
+                    outln!("{}", table::cell(&r[0], ""));
                 }
             }
             "databases" => {
                 let mode = if s.readonly { "r/o" } else { "r/w" };
                 for r in self.rows(s, "SELECT name, file FROM pragma_database_list ORDER BY seq")? {
-                    println!("{}: {} {mode}", table::cell(&r[0], ""), table::cell(&r[1], ""));
+                    outln!("{}: {} {mode}", table::cell(&r[0], ""), table::cell(&r[1], ""));
                 }
             }
             "mode" => match MODES.iter().find(|(n, _)| *n == arg) {
                 Some((_, m)) => self.mode = *m,
                 None if arg.is_empty() => {
                     let cur = MODES.iter().find(|(_, m)| *m == self.mode).map(|(n, _)| *n).unwrap_or("");
-                    println!("current output mode: {cur}");
+                    outln!("current output mode: {cur}");
                 }
                 None => bail!("Error: mode should be one of: box column csv json line list table"),
             },

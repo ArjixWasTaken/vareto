@@ -67,6 +67,12 @@ enum Cmd {
         /// Run these commands and exit.
         #[arg(short, long)]
         execute: Option<String>,
+        /// mysql: keep going after an error in a script.
+        #[arg(short, long)]
+        force: bool,
+        /// psql: set a variable, as `\set name value` (repeatable).
+        #[arg(short = 'v', long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
     },
     /// Config file helpers.
     Config {
@@ -201,10 +207,10 @@ async fn run_cli(daemon: &Daemon, cmd: Cmd) -> Result<()> {
         Cmd::Redis { connection, args } => {
             print(&daemon.call(Request::Query { connection, query: QuerySpec::Redis { args }, limit: None }).await?)
         }
-        Cmd::Shell { connection, database, limit, execute } => {
-            let ok = repl::run(daemon, repl::Options { connection, database, limit, execute }).await?;
-            if !ok {
-                std::process::exit(1);
+        Cmd::Shell { connection, database, limit, execute, force, set } => {
+            let code = repl::run(daemon, repl::Options { connection, database, limit, execute, force, set }).await?;
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Cmd::Config { cmd } => match cmd {

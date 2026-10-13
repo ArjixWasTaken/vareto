@@ -354,7 +354,10 @@ async fn serve_client_inner(state: &State, client: u64, stream: tokio::net::Unix
         };
         let resp = match resp {
             Ok(result) => Response::Ok { result },
-            Err(e) => Response::Err { error: format!("{e:#}") },
+            Err(e) => {
+                let info = e.chain().find_map(|c| c.downcast_ref::<crate::db::DbError>()).map(|d| d.info.clone());
+                Response::Err { error: format!("{e:#}"), info }
+            }
         };
         ipc::send(&mut conn, &resp).await?;
         state.touch();

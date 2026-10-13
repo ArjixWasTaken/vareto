@@ -1,12 +1,13 @@
 //! psql.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
+use super::out::outln;
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Open, SqlBuf};
 use super::table::{self, QueryResult, Style};
-use super::{elapsed, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
+use super::{elapsed, error_info, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Expanded {
@@ -17,6 +18,10 @@ enum Expanded {
 
 pub struct Psql {
     buf: SqlBuf,
+    /// psql variables (`\set`), including the special ones like ON_ERROR_STOP.
+    vars: std::collections::BTreeMap<String, String>,
+    /// The statement an error's position refers to (empty for internal queries).
+    stmt: String,
     /// The last statement sent, for `\g` on an empty buffer.
     last: String,
     expanded: Expanded,
@@ -85,6 +90,85 @@ fn relkinds(cmd: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// A server error the way psql prints it: severity and message, the statement
+/// line with a caret under the error position, then DETAIL / HINT / CONTEXT.
+pub fn format_error(info: &Value, stmt: &str) -> String {
+    let mut out = format!("{}:  {}", info["severity"].as_str().unwrap_or("ERROR"), info["message"].as_str().unwrap_or(""));
+    if let (Some(pos), false) = (info["position"].as_u64(), stmt.is_empty()) {
+        // 1-based, in characters.
+        let before: String = stmt.chars().take(pos.saturating_sub(1) as usize).collect();
+        let line_no = before.matches('\n').count() + 1;
+        let col = before.rsplit('\n').next().unwrap_or("").chars().count();
+        let line = stmt.lines().nth(line_no - 1).unwrap_or("");
+        let prefix = format!("LINE {line_no}: ");
+        out.push_str(&format!("\n{prefix}{line}\n{}^", " ".repeat(prefix.chars().count() + col)));
+    }
+    for (key, label) in [("detail", "DETAIL"), ("hint", "HINT"), ("where", "CONTEXT")] {
+        if let Some(v) = info[key].as_str() {
+            out.push_str(&format!("\n{label}:  {v}"));
+        }
+    }
+    out
+}
+
+/// psql's boolean values: on/off, true/false, yes/no, 1/0, case-insensitive, and
+/// unique prefixes of the words.
+pub fn bool_value(v: &str) -> Option<bool> {
+    let v = v.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    let word = |w: &str| w.starts_with(&v);
+    if v == "1" || word("true") || word("yes") || (v.len() > 1 && word("on")) {
+        Some(true)
+    } else if v == "0" || word("false") || word("no") || (v.len() > 1 && word("off")) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Meta-command arguments: whitespace-separated, with '…' quoting (`''` and
+/// backslash escapes inside).
+pub fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            return out;
+        }
+        let mut cur = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                break;
+            }
+            chars.next();
+            if c != '\'' {
+                cur.push(c);
+                continue;
+            }
+            while let Some(c) = chars.next() {
+                match c {
+                    '\'' if chars.peek() == Some(&'\'') => {
+                        chars.next();
+                        cur.push('\'');
+                    }
+                    '\'' => break,
+                    '\\' => match chars.next() {
+                        Some('n') => cur.push('\n'),
+                        Some('t') => cur.push('\t'),
+                        Some(c) => cur.push(c),
+                        None => {}
+                    },
+                    c => cur.push(c),
+                }
+            }
+        }
+        out.push(cur);
+    }
+}
+
 /// The tag psql prints for a statement without rows.
 fn command_tag(sql: &str, rows: u64) -> String {
     let words: Vec<String> = sql.split_whitespace().take(2).map(|w| w.trim_end_matches(';').to_uppercase()).collect();
@@ -108,12 +192,31 @@ fn command_tag(sql: &str, rows: u64) -> String {
 }
 
 fn term_width() -> usize {
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(100)
+    super::out::width()
 }
 
 impl Psql {
-    pub fn new() -> Self {
-        Self { buf: SqlBuf::new(Dialect::Postgres), last: String::new(), expanded: Expanded::Off, timing: false, tables: Vec::new() }
+    pub fn new(opts: &super::Options) -> Result<Self> {
+        let mut vars = std::collections::BTreeMap::new();
+        for kv in &opts.set {
+            let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+            if k.is_empty() {
+                bail!("invalid variable assignment {kv:?} (expected NAME=VALUE)");
+            }
+            vars.insert(k.to_string(), v.to_string());
+        }
+        // psql pages results taller than the terminal by default.
+        super::out::set_pager(super::out::Pager::Auto, std::env::var("PSQL_PAGER").ok());
+        Ok(Self::with_vars(vars))
+    }
+
+    fn with_vars(vars: std::collections::BTreeMap<String, String>) -> Self {
+        Self { buf: SqlBuf::new(Dialect::Postgres), vars, stmt: String::new(), last: String::new(), expanded: Expanded::Off, timing: false, tables: Vec::new() }
+    }
+
+    /// A boolean variable, read the way psql does (on/off, true/false, yes/no, 1/0).
+    fn flag(&self, name: &str) -> bool {
+        self.vars.get(name).is_some_and(|v| bool_value(v).unwrap_or(false))
     }
 
     fn print_rows(&self, title: Option<&str>, columns: &[String], rows: &[Vec<Value>], vertical: bool) {
@@ -125,48 +228,53 @@ impl Psql {
             });
         if expanded {
             if rows.is_empty() {
-                println!("(0 rows)");
+                outln!("(0 rows)");
             } else {
-                println!("{}", table::expanded_psql(columns, rows));
+                outln!("{}", table::expanded_psql(columns, rows));
             }
         } else {
             let t = table::table(columns, rows, Style::Psql, true, &table::psql_cell);
             if let Some(title) = title {
                 let w = t.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-                println!("{}", format!("{title:^w$}").trim_end());
+                outln!("{}", format!("{title:^w$}").trim_end());
             }
-            println!("{t}");
-            println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+            outln!("{t}");
+            outln!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
         }
-        println!();
+        outln!();
     }
 
     fn execute(&mut self, sql: &str, end: End, s: &mut Session) -> Result<()> {
         self.last = sql.to_string();
+        self.stmt = sql.to_string();
         let v = s.sql(sql)?;
-        match QueryResult::from_json(&v) {
-            QueryResult::Table { columns, rows, truncated } => {
-                self.print_rows(None, &columns, &rows, end == End::Vertical);
-                if truncated {
-                    println!("(more rows exist; only the first {} are shown, see --limit)\n", rows.len());
+        for part in QueryResult::from_json(&v).into_parts() {
+            match part {
+                QueryResult::Table { columns, rows, truncated, .. } => {
+                    self.print_rows(None, &columns, &rows, end == End::Vertical);
+                    if truncated {
+                        outln!("(more rows exist; only the first {} are shown, see --limit)\n", rows.len());
+                    }
                 }
+                QueryResult::Affected { rows, .. } => outln!("{}", command_tag(sql, rows)),
+                QueryResult::Docs { docs, .. } => outln!("{}", serde_json::to_string_pretty(&Value::Array(docs))?),
+                QueryResult::Value(v) => outln!("{}", serde_json::to_string_pretty(&v)?),
+                QueryResult::Multi(_) => {}
             }
-            QueryResult::Affected { rows, .. } => println!("{}", command_tag(sql, rows)),
-            QueryResult::Docs { docs, .. } => println!("{}", serde_json::to_string_pretty(&Value::Array(docs))?),
-            QueryResult::Value(v) => println!("{}", serde_json::to_string_pretty(&v)?),
         }
         if self.timing {
-            println!("Time: {:.3} ms", elapsed(&v) * 1000.0);
+            outln!("Time: {:.3} ms", elapsed(&v) * 1000.0);
         }
         Ok(())
     }
 
     /// Run an internal catalog query and print it under `title`.
     fn listing(&mut self, s: &mut Session, title: &str, sql: &str, none: &str) -> Result<()> {
+        self.stmt.clear();
         let v = s.query_limit(crate::ipc::QuerySpec::Sql { sql: sql.into() }, Some(5000))?;
         if let QueryResult::Table { columns, rows, .. } = QueryResult::from_json(&v) {
             if rows.is_empty() && !none.is_empty() {
-                println!("{none}");
+                outln!("{none}");
             } else {
                 self.print_rows(Some(title), &columns, &rows, false);
             }
@@ -199,6 +307,7 @@ impl Psql {
     }
 
     fn describe(&mut self, s: &mut Session, name: &str) -> Result<()> {
+        self.stmt.clear();
         let reg = format!("{}::regclass", quote_lit(name));
         let head = s.sql(&format!(
             "SELECT n.nspname, c.relname, c.relkind::text FROM pg_catalog.pg_class c \
@@ -228,15 +337,15 @@ impl Psql {
         let QueryResult::Table { columns, rows, .. } = QueryResult::from_json(&cols) else { return Ok(()) };
         let t = table::table(&columns, &rows, Style::Psql, true, &table::psql_cell);
         let w = t.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-        println!("{}", format!("{:^w$}", format!("{what} \"{schema}.{rel}\"")).trim_end());
-        println!("{t}");
+        outln!("{}", format!("{:^w$}", format!("{what} \"{schema}.{rel}\"")).trim_end());
+        outln!("{t}");
 
         let section = |s: &mut Session, title: &str, sql: String, fmt: &dyn Fn(&[Value]) -> String| -> Result<()> {
             if let QueryResult::Table { rows, .. } = QueryResult::from_json(&s.sql(&sql)?) {
                 if !rows.is_empty() {
-                    println!("{title}:");
+                    outln!("{title}:");
                     for r in &rows {
-                        println!("    {}", fmt(r));
+                        outln!("    {}", fmt(r));
                     }
                 }
             }
@@ -283,15 +392,15 @@ impl Psql {
             ),
             &|r| format!("TABLE \"{}\" CONSTRAINT \"{}\" {}", table::cell(&r[0], ""), table::cell(&r[1], ""), table::cell(&r[2], "")),
         )?;
-        println!();
+        outln!();
         Ok(())
     }
 
     fn meta(&mut self, cmd: &str, arg: &str, s: &mut Session) -> Result<Flow> {
         match cmd {
             "q" | "quit" => return Ok(Flow::Quit),
-            "?" => println!("{HELP}"),
-            "h" | "help" => println!("SQL syntax help is not available in vareto; see https://www.postgresql.org/docs/current/sql-commands.html"),
+            "?" => outln!("{HELP}"),
+            "h" | "help" => outln!("SQL syntax help is not available in vareto; see https://www.postgresql.org/docs/current/sql-commands.html"),
             "g" | "gx" => {
                 let sql = if self.buf.is_empty() { self.last.clone() } else { self.buf.take() };
                 if !sql.is_empty() {
@@ -300,14 +409,32 @@ impl Psql {
             }
             "r" | "reset" => {
                 self.buf.clear();
-                println!("Query buffer reset (cleared).");
+                outln!("Query buffer reset (cleared).");
             }
             "p" | "print" => {
                 let b = self.buf.take();
-                println!("{}", if b.is_empty() { &self.last } else { &b });
+                outln!("{}", if b.is_empty() { &self.last } else { &b });
                 self.buf.push_line(&b);
             }
-            "echo" => println!("{arg}"),
+            "echo" => outln!("{arg}"),
+            "set" => {
+                if arg.is_empty() {
+                    for (k, v) in &self.vars {
+                        outln!("{k} = '{v}'");
+                    }
+                } else {
+                    let mut words = split_args(arg).into_iter();
+                    let name = words.next().unwrap_or_default();
+                    if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        bail!("invalid variable name: \"{name}\"");
+                    }
+                    self.vars.insert(name, words.collect::<String>());
+                }
+            }
+            "unset" => {
+                let name = arg.split_whitespace().next().context("\\unset: missing required argument")?;
+                self.vars.remove(name);
+            }
             "i" | "include" => {
                 let text = read_script(arg)?;
                 return run_script(self, s, &text);
@@ -325,7 +452,7 @@ impl Psql {
                     Expanded::Off => "off",
                     Expanded::Auto => "auto",
                 };
-                println!("Expanded display is {state}.");
+                outln!("Expanded display is {state}.");
             }
             "timing" => {
                 self.timing = match arg {
@@ -333,19 +460,19 @@ impl Psql {
                     "off" => false,
                     _ => !self.timing,
                 };
-                println!("Timing is {}.", if self.timing { "on" } else { "off" });
+                outln!("Timing is {}.", if self.timing { "on" } else { "off" });
             }
             "c" | "connect" => {
                 if let Some(db) = arg.split_whitespace().next().filter(|d| *d != "-") {
                     s.use_db(db)?;
                 }
-                println!(
+                outln!(
                     "You are now connected to database \"{}\" as user \"{}\".",
                     s.database.as_deref().unwrap_or(""),
                     s.user.as_deref().unwrap_or("")
                 );
             }
-            "conninfo" => println!(
+            "conninfo" => outln!(
                 "You are connected to database \"{}\" as user \"{}\" on {} (vareto connection \"{}\"{}).",
                 s.database.as_deref().unwrap_or(""),
                 s.user.as_deref().unwrap_or(""),
@@ -460,11 +587,26 @@ impl Flavor for Psql {
         !self.buf.is_empty()
     }
 
+    fn stop_on_error(&self) -> bool {
+        self.flag("ON_ERROR_STOP")
+    }
+
+    fn stop_status(&self) -> i32 {
+        3
+    }
+
+    fn finish_status(&self, _errors: usize) -> i32 {
+        0
+    }
+
     fn reset(&mut self) {
         self.buf.clear();
     }
 
     fn error(&self, e: &anyhow::Error) -> String {
+        if let Some(info) = error_info(e).filter(|i| i.get("severity").is_some()) {
+            return format_error(info, &self.stmt);
+        }
         let t = error_text(e);
         if t.starts_with("invalid command") || t.starts_with("Did not find") { t } else { format!("ERROR:  {t}") }
     }
@@ -485,6 +627,27 @@ impl Flavor for Psql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variables() {
+        assert_eq!(split_args("x 'a b' 'it''s' c'd'e '\\t'"), vec!["x", "a b", "it's", "cde", "\t"]);
+        for (v, b) in [("on", Some(true)), ("OFF", Some(false)), ("t", Some(true)), ("1", Some(true)), ("n", Some(false)), ("o", None), ("maybe", None)] {
+            assert_eq!(bool_value(v), b, "{v}");
+        }
+    }
+
+    #[test]
+    fn errors() {
+        let info = serde_json::json!({
+            "severity": "ERROR", "message": "column \"nope\" does not exist", "position": 14,
+            "hint": "Perhaps you meant to reference the column \"t.note\".",
+        });
+        assert_eq!(
+            format_error(&info, "select id,\n  nope from t"),
+            "ERROR:  column \"nope\" does not exist\nLINE 2:   nope from t\n          ^\nHINT:  Perhaps you meant to reference the column \"t.note\"."
+        );
+        assert_eq!(format_error(&serde_json::json!({"severity": "FATAL", "message": "x"}), ""), "FATAL:  x");
+    }
 
     #[test]
     fn tags() {

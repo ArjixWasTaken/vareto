@@ -97,10 +97,8 @@ async fn run_query(state: &State, name: &str, q: &QuerySpec, limit: usize, force
     let mut out = match (&live.backend, q) {
         (Backend::Sql(p), QuerySpec::Sql { sql }) => {
             let mut out = p.run(sql, limit, conn.readonly, timeout).await?;
-            if let Output::Table { columns, .. } = &mut out {
-                if let Some(t) = readonly::single_table(dialect(conn.cfg.kind), sql) {
-                    columns.iter_mut().for_each(|c| c.table = Some(t.clone()));
-                }
+            if let Some(t) = readonly::single_table(dialect(conn.cfg.kind), sql) {
+                out.set_table(&t);
             }
             out
         }
