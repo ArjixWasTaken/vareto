@@ -1857,6 +1857,7 @@ impl Flavor for Psql {
             tables: self.tables.clone(),
             columns: self.columns.clone(),
             other: Vec::new(),
+            dotted: false,
         }
     }
 }

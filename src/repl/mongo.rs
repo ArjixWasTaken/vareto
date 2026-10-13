@@ -26,6 +26,8 @@ const LOOP_ITERATION_LIMIT: u64 = 100_000_000;
 enum ToJs {
     Eval(String),
     Reply(String),
+    /// The shell's method and helper names, for completion.
+    Names,
 }
 
 enum FromJs {
@@ -33,7 +35,34 @@ enum FromJs {
     Call(String),
     /// Evaluation finished: an error to show, and whether `exit()` was called.
     Done(Option<String>, bool),
+    /// JSON: `{db, collection, cursor, objects: {rs: [...], ...}, globals}`.
+    Names(String),
 }
+
+/// Asks the prelude what its objects have, so completion offers exactly the shell's
+/// methods. Methods end in `(`. The collection and the cursor are probes: a cursor
+/// is lazy, so nothing reaches the server.
+const NAMES_JS: &str = r#"JSON.stringify((() => {
+  const names = (o) => {
+    const out = new Set();
+    for (let p = o; p && p !== Object.prototype && p !== Function.prototype; p = Object.getPrototypeOf(p)) {
+      for (const k of Object.getOwnPropertyNames(p)) {
+        if (k.startsWith('_') || k === 'constructor') continue;
+        let v;
+        try { v = o[k]; } catch (e) { continue; }
+        out.add(typeof v === 'function' ? k + '(' : k);
+      }
+    }
+    return [...out];
+  };
+  const coll = db.completionprobe;
+  const objects = {};
+  for (const k of ['rs', 'sh', 'sp', 'config']) if (globalThis[k]) objects[k] = names(globalThis[k]);
+  const globals = Object.getOwnPropertyNames(globalThis)
+    .filter((k) => !k.startsWith('_') && /^[A-Za-z]/.test(k) && typeof globalThis[k] === 'function')
+    .map((k) => k + '(');
+  return { db: names(db), collection: names(coll), cursor: names(coll.find({})), objects, globals };
+})())"#;
 
 thread_local! {
     /// The JS thread's end of the channels, for the native functions.
@@ -179,6 +208,11 @@ fn js_main(tx: Sender<FromJs>, rx: Receiver<ToJs>, interactive: bool) {
         return;
     }
     while let Some(msg) = bridge_recv() {
+        if let ToJs::Names = msg {
+            let names = eval_str(&mut ctx, NAMES_JS).ok().and_then(|v| v.as_string().map(|s| s.to_std_string_escaped())).unwrap_or_default();
+            bridge_send(FromJs::Names(names));
+            continue;
+        }
         let ToJs::Eval(code) = msg else { continue };
         let res = eval_str(&mut ctx, &code).and_then(|v| {
             ctx.global_object().set(js_string!("__last"), v, false, &mut ctx)?;
@@ -252,6 +286,8 @@ pub struct Mongo {
     tx: Sender<ToJs>,
     rx: Receiver<FromJs>,
     collections: Vec<String>,
+    /// What the prelude's objects have ([`NAMES_JS`]).
+    names: Value,
 }
 
 impl Mongo {
@@ -268,7 +304,12 @@ impl Mongo {
             Ok(FromJs::Ready(Err(e))) => bail!(e),
             _ => bail!("the JavaScript engine failed to start"),
         }
-        Ok(Self { buf: Vec::new(), tx: to_js, rx: from_js, collections: Vec::new() })
+        to_js.send(ToJs::Names).ok();
+        let names = match from_js.recv() {
+            Ok(FromJs::Names(n)) => serde_json::from_str(&n).unwrap_or_default(),
+            _ => Value::Null,
+        };
+        Ok(Self { buf: Vec::new(), tx: to_js, rx: from_js, collections: Vec::new(), names })
     }
 
     fn eval(&mut self, code: String, s: &mut Session) -> Result<Flow> {
@@ -295,7 +336,7 @@ impl Mongo {
                     }
                     return Ok(if quit { Flow::Quit } else { Flow::Continue });
                 }
-                FromJs::Ready(_) => {}
+                FromJs::Ready(_) | FromJs::Names(_) => {}
             }
         }
     }
@@ -366,12 +407,6 @@ fn shell_command(line: &str) -> Option<String> {
     }
 }
 
-const METHODS: &[&str] = &[
-    "find(", "findOne(", "aggregate(", "countDocuments(", "estimatedDocumentCount(", "distinct(", "insertOne(",
-    "insertMany(", "updateOne(", "updateMany(", "replaceOne(", "deleteOne(", "deleteMany(", "getIndexes(",
-    "createIndex(", "dropIndex(", "drop(", "stats(",
-];
-
 impl Flavor for Mongo {
     fn banner(&self, s: &Session) -> String {
         format!(
@@ -435,11 +470,22 @@ impl Flavor for Mongo {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let list = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect() };
+        let coll_methods = list(&self.names["collection"]);
+        w.extend(list(&self.names["db"]).into_iter().map(|m| format!("db.{m}")));
         for c in &self.collections {
             w.push(format!("db.{c}"));
-            w.extend(METHODS.iter().map(|m| format!("db.{c}.{m}")));
+            w.extend(coll_methods.iter().map(|m| format!("db.{c}.{m}")));
         }
-        Completions::flat(w)
+        // After a call (`db.c.find().so`), the word starts at the dot.
+        w.extend(list(&self.names["cursor"]).into_iter().map(|m| format!(".{m}")));
+        if let Some(objects) = self.names["objects"].as_object() {
+            for (o, methods) in objects {
+                w.extend(list(methods).into_iter().map(|m| format!("{o}.{m}")));
+            }
+        }
+        w.extend(list(&self.names["globals"]));
+        Completions { dotted: true, ..Completions::flat(w) }
     }
 }
 

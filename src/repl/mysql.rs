@@ -708,6 +708,7 @@ impl Flavor for Mysql {
             tables: self.tables.clone(),
             columns: self.columns.clone(),
             other: Vec::new(),
+            dotted: false,
         }
     }
 }

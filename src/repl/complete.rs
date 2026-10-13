@@ -15,6 +15,9 @@ pub struct Completions {
     pub columns: Vec<(String, String)>,
     /// Everything else (Redis commands, mongosh helpers): offered everywhere.
     pub other: Vec<String>,
+    /// `other` holds dotted paths (`db.coll.find(`): offer one level at a time, so
+    /// `db.pro` lists collections and `db.product.` that collection's methods.
+    pub dotted: bool,
 }
 
 impl Completions {
@@ -108,7 +111,15 @@ pub fn complete(c: &Completions, line: &str, pos: usize) -> (usize, Vec<String>)
         if ctx == Context::Start {
             out.extend(c.commands.iter().filter(|w| matching(w)).cloned());
         }
-        out.extend(c.other.iter().filter(|w| matching(w)).cloned());
+        let level = |w: &String| -> String {
+            match w[word.len()..].find('.') {
+                // Keep the dot when it's the next character, so the next Tab goes on.
+                Some(0) => w[..word.len() + 1].to_string(),
+                Some(i) => w[..word.len() + i].to_string(),
+                None => w.clone(),
+            }
+        };
+        out.extend(c.other.iter().filter(|w| matching(w)).map(|w| if c.dotted { level(w) } else { w.clone() }));
     }
     out.sort();
     out.dedup();
@@ -126,6 +137,7 @@ mod tests {
             tables: vec!["users".into(), "orders".into()],
             columns: vec![("users".into(), "id".into()), ("users".into(), "email".into()), ("orders".into(), "user_id".into())],
             other: Vec::new(),
+            dotted: false,
         }
     }
 
@@ -148,5 +160,16 @@ mod tests {
         assert_eq!(cands("update o"), vec!["orders"]);
         assert_eq!(cands("select * from users u, o"), vec!["orders"]);
         assert_eq!(cands("\\d u"), vec!["users"]);
+    }
+
+    #[test]
+    fn dotted_levels() {
+        let words = ["db.product", "db.product.find(", "db.productcategory", "db.productcategory.find(", "db.listCollections("];
+        let c = Completions { other: words.iter().map(|s| s.to_string()).collect(), dotted: true, ..Completions::default() };
+        let cands = |line: &str| complete(&c, line, line.len()).1;
+        assert_eq!(cands("db.prod"), vec!["db.product", "db.productcategory"]);
+        assert_eq!(cands("db.product"), vec!["db.product.", "db.productcategory"]);
+        assert_eq!(cands("db.product."), vec!["db.product.find("]);
+        assert_eq!(cands("db.l"), vec!["db.listCollections("]);
     }
 }

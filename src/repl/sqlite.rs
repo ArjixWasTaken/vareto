@@ -428,6 +428,7 @@ impl Flavor for Sqlite {
             tables: self.tables.clone(),
             columns: self.columns.clone(),
             other: Vec::new(),
+            dotted: false,
         }
     }
 }
