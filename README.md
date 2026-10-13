@@ -299,10 +299,21 @@ vareto shell pg -v day=2024-01-01 < report.sql   # psql variables
 
 Scripts handle errors the way the native client does. mysql stops at the first error
 (exit 1) unless `-f/--force`. psql reports the error and goes on, unless
-`ON_ERROR_STOP` is set (exit 3). The other shells stop at the first error. Tab
-completion knows where it is in a statement: it offers tables after `FROM`/`JOIN`/
-`UPDATE`/..., columns after `SELECT`/`WHERE`/`ON`/..., `table.` followed by that
-table's columns, and client commands after `\`.
+`ON_ERROR_STOP` is set (exit 3). The other shells stop at the first error.
+
+Tab opens a completion popup under the cursor:
+- **Matching:** fuzzy, ranked like fzf (`pcat` finds `productcategory`), with
+  prefix matches first. The list narrows as you keep typing.
+- **Kinds:** each candidate shows what it is (table, column, keyword, command,
+  collection, method, key).
+- **Keys:** Tab or the arrow keys move through the list, and Enter inserts the
+  pick.
+- **One word at a time:** in `db.product.fi` or `users.em`, only the part after
+  the last dot is completed.
+- **Context:** tables after `FROM`/`JOIN`/`UPDATE`/..., columns after
+  `SELECT`/`WHERE`/`ON`/..., and client commands after `\`.
+
+A multi-line statement is one history entry, and Up brings it back whole.
 
 The shell pins one connection in the daemon for as long as it runs, so session state
 behaves as it does in the native client: `USE`, `SET`, `\c`, transactions and Redis

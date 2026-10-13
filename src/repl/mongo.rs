@@ -12,6 +12,7 @@ use boa_engine::{js_string, Context, JsNativeError, JsResult, JsString, JsValue,
 use serde_json::{json, Value};
 
 use super::session::Session;
+use super::complete::Kind;
 use super::{error_text, names, Completions, Flavor, Flow};
 use crate::ipc::{MongoQuery, QuerySpec};
 
@@ -485,7 +486,23 @@ impl Flavor for Mongo {
             }
         }
         w.extend(list(&self.names["globals"]));
-        Completions { dotted: true, ..Completions::flat(w) }
+        let kind = |w: &str| {
+            if w.ends_with('(') {
+                Kind::Method
+            } else if w.starts_with("db.") {
+                Kind::Collection
+            } else {
+                Kind::Command
+            }
+        };
+        let other = w
+            .into_iter()
+            .map(|w| {
+                let k = kind(&w);
+                (w, k)
+            })
+            .collect();
+        Completions { other, dotted: true, ..Completions::default() }
     }
 }
 

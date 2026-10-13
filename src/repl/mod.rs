@@ -18,17 +18,12 @@ mod sqlite;
 mod sqlbuf;
 mod table;
 
-use std::cell::RefCell;
+use std::borrow::Cow;
 use std::io::{BufRead, IsTerminal};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use rustyline::completion::Completer;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::history::DefaultHistory;
-use rustyline::validate::Validator;
-use rustyline::error::ReadlineError;
 
 use crate::client::Daemon;
 use crate::config::Kind;
@@ -328,101 +323,268 @@ fn finish_script(f: &mut dyn Flavor, r: Result<Flow>) -> i32 {
     }
 }
 
-struct Helper {
-    words: Rc<RefCell<Completions>>,
+/// Our candidates, reedline's popup: each one shows its kind as a second column,
+/// with the characters that matched highlighted.
+struct ShellCompleter {
+    words: Arc<Mutex<Completions>>,
 }
 
-impl Completer for Helper {
-    type Candidate = String;
-
-    fn complete(&self, line: &str, pos: usize, _: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
-        Ok(complete::complete(&self.words.borrow(), line, pos))
+impl reedline::Completer for ShellCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> reedline::CompletionResult {
+        let (start, cands) = complete::complete(&self.words.lock().unwrap(), line, pos);
+        let width = cands.iter().map(|c| c.text.chars().count()).max().unwrap_or(0).min(48);
+        let suggestions: Vec<reedline::Suggestion> = cands
+            .into_iter()
+            .map(|c| {
+                let label = c.kind.label();
+                reedline::Suggestion {
+                    display_override: (!label.is_empty()).then(|| format!("{:<width$}  {label}", c.text)),
+                    value: c.text,
+                    span: reedline::Span::new(start, pos),
+                    append_whitespace: false,
+                    match_indices: Some(c.indices),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        reedline::CompletionResult::fresh(suggestions)
     }
 }
 
-impl Hinter for Helper {
-    type Hint = String;
+/// The flavor's prompt, shown as it is.
+struct ShellPrompt(String);
+
+impl reedline::Prompt for ShellPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.0)
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _: reedline::PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_history_search_indicator(&self, h: reedline::PromptHistorySearch) -> Cow<'_, str> {
+        Cow::Owned(format!("(history search: {}) ", h.term))
+    }
+    fn get_prompt_color(&self) -> reedline::Color {
+        reedline::Color::Default
+    }
 }
-impl Highlighter for Helper {}
-impl Validator for Helper {}
-impl rustyline::Helper for Helper {}
+
+/// reedline's file history, holding whole statements: the shells read a line at a
+/// time, so reedline's own save of each submitted line is skipped, and the loop
+/// saves a statement once it's complete.
+struct StatementHistory {
+    inner: reedline::FileBackedHistory,
+    accept: Arc<AtomicBool>,
+}
+
+impl reedline::History for StatementHistory {
+    fn save(&mut self, h: reedline::HistoryItem) -> reedline::Result<reedline::HistoryItem> {
+        if self.accept.load(Ordering::Relaxed) { self.inner.save(h) } else { Ok(h) }
+    }
+    fn load(&self, id: reedline::HistoryItemId) -> reedline::Result<reedline::HistoryItem> {
+        self.inner.load(id)
+    }
+    fn count(&self, query: reedline::SearchQuery) -> reedline::Result<i64> {
+        self.inner.count(query)
+    }
+    fn search(&self, query: reedline::SearchQuery) -> reedline::Result<Vec<reedline::HistoryItem>> {
+        self.inner.search(query)
+    }
+    fn update(&mut self, id: reedline::HistoryItemId, updater: &dyn Fn(reedline::HistoryItem) -> reedline::HistoryItem) -> reedline::Result<()> {
+        self.inner.update(id, updater)
+    }
+    fn clear(&mut self) -> reedline::Result<()> {
+        self.inner.clear()
+    }
+    fn delete(&mut self, h: reedline::HistoryItemId) -> reedline::Result<()> {
+        self.inner.delete(h)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+    fn session(&self) -> Option<reedline::HistorySessionId> {
+        self.inner.session()
+    }
+}
+
+/// Entries of a rustyline history file (`#V2`: `\n` and `\\` escaped), or `None`
+/// when `text` isn't one.
+fn rustyline_history(text: &str) -> Option<Vec<String>> {
+    let mut lines = text.lines();
+    if lines.next()? != "#V2" {
+        return None;
+    }
+    Some(
+        lines
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let mut out = String::with_capacity(l.len());
+                let mut chars = l.chars();
+                while let Some(c) = chars.next() {
+                    match (c, c == '\\') {
+                        (_, true) => match chars.next() {
+                            Some('n') => out.push('\n'),
+                            Some(other) => out.push(other),
+                            None => out.push('\\'),
+                        },
+                        (c, false) => out.push(c),
+                    }
+                }
+                out
+            })
+            .collect(),
+    )
+}
+
+/// How reedline's history file writes a newline inside an entry.
+const REEDLINE_NEWLINE: &str = "<\\n>";
+
+/// History files written by the rustyline-based shell become reedline's format
+/// (one entry per line, newlines as `<\n>`); the original is kept beside it.
+fn migrate_history(path: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Some(entries) = rustyline_history(&text) else { return };
+    let backup = std::path::PathBuf::from(format!("{}.rustyline", path.display()));
+    if std::fs::copy(path, &backup).is_err() {
+        return;
+    }
+    let body: String = entries.iter().map(|e| e.replace('\n', REEDLINE_NEWLINE) + "\n").collect();
+    std::fs::write(path, body).ok();
+}
 
 fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32 {
-    let config = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).auto_add_history(false).max_history_size(5000).map(|b| b.build());
-    let mut ed: rustyline::Editor<Helper, DefaultHistory> = match config.and_then(rustyline::Editor::with_config) {
-        Ok(e) => e,
+    use reedline::{default_emacs_keybindings, Emacs, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal};
+    let history_path = crate::paths::state_dir().join("history").join(connection);
+    if let Some(dir) = history_path.parent() {
+        crate::paths::ensure_private_dir(dir).ok();
+    }
+    migrate_history(&history_path);
+    let accept = Arc::new(AtomicBool::new(false));
+    let history = match reedline::FileBackedHistory::with_file(5000, history_path.clone()) {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("cannot start the line editor: {e}");
+            eprintln!("cannot open the history file {}: {e}", history_path.display());
             return 1;
         }
     };
-    let words = Rc::new(RefCell::new(Completions::default()));
-    ed.set_helper(Some(Helper { words: words.clone() }));
-    let history = crate::paths::state_dir().join("history").join(connection);
-    if let Some(dir) = history.parent() {
-        crate::paths::ensure_private_dir(dir).ok();
-    }
-    ed.load_history(&history).ok();
+    let words = Arc::new(Mutex::new(Completions::default()));
+    let mut keys = default_emacs_keybindings();
+    keys.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![ReedlineEvent::Menu("completion_menu".into()), ReedlineEvent::MenuNext]),
+    );
+    keys.add_binding(KeyModifiers::SHIFT, KeyCode::BackTab, ReedlineEvent::MenuPrevious);
+    let menu = IdeMenu::default().with_name("completion_menu").with_marker("").with_default_border();
+    let mut ed = Reedline::create()
+        .with_history(Box::new(StatementHistory { inner: history, accept: accept.clone() }))
+        .with_completer(Box::new(ShellCompleter { words: words.clone() }))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_quick_completions(true)
+        .with_edit_mode(Box::new(Emacs::new(keys)));
 
     println!("{}", f.banner(s));
     f.refresh(s);
-    *words.borrow_mut() = f.completions();
+    *words.lock().unwrap() = f.completions();
     let mut entry: Vec<String> = Vec::new();
-    loop {
+    'session: loop {
         let db = s.database.clone();
-        if let Some((w, h)) = ed.dimensions() {
+        if let Ok((w, h)) = crossterm::terminal::size() {
             out::set_size(w as usize, h as usize);
         }
-        match ed.readline(&f.prompt(s)) {
-            Ok(line) => {
-                entry.push(line.clone());
-                let flow = f.line(&line, s);
-                out::flush();
-                if !f.pending() {
-                    let text = entry.join("\n");
-                    if !text.trim().is_empty() {
-                        ed.add_history_entry(text).ok();
-                    }
-                    entry.clear();
-                }
-                match flow {
-                    Ok(Flow::Quit) => break,
-                    Ok(Flow::Continue) => {}
-                    Ok(Flow::History(to)) => {
-                        let lines: Vec<String> = ed.history().iter().map(|h| h.to_string()).collect();
-                        match to {
-                            Some(path) => match std::fs::write(expand_home(&path), lines.join("\n") + "\n") {
-                                Ok(()) => println!("Wrote history to file \"{path}\"."),
-                                Err(e) => eprintln!("{path}: {e}"),
-                            },
-                            None => println!("{}", lines.join("\n")),
+        let signal = match ed.read_line(&ShellPrompt(f.prompt(s))) {
+            Ok(sig) => sig,
+            Err(e) => {
+                eprintln!("{e}");
+                break;
+            }
+        };
+        match signal {
+            // A recalled or pasted multi-line statement arrives at once; the
+            // shells take it a line at a time.
+            Signal::Success(buffer) => {
+                for line in buffer.split('\n') {
+                    entry.push(line.to_string());
+                    let flow = f.line(line, s);
+                    out::flush();
+                    if !f.pending() {
+                        let text = entry.join("\n");
+                        if !text.trim().is_empty() {
+                            accept.store(true, Ordering::Relaxed);
+                            ed.history_mut().save(reedline::HistoryItem::from_command_line(text)).ok();
+                            accept.store(false, Ordering::Relaxed);
+                            ed.sync_history().ok();
                         }
+                        entry.clear();
                     }
-                    Err(e) => eprintln!("{}", f.error(&e)),
+                    match flow {
+                        Ok(Flow::Quit) => break 'session,
+                        Ok(Flow::Continue) => {}
+                        Ok(Flow::History(to)) => {
+                            let query = reedline::SearchQuery::everything(reedline::SearchDirection::Forward, None);
+                            let lines: Vec<String> = ed.history().search(query).unwrap_or_default().into_iter().map(|h| h.command_line).collect();
+                            match to {
+                                Some(path) => match std::fs::write(expand_home(&path), lines.join("\n") + "\n") {
+                                    Ok(()) => println!("Wrote history to file \"{path}\"."),
+                                    Err(e) => eprintln!("{path}: {e}"),
+                                },
+                                None => println!("{}", lines.join("\n")),
+                            }
+                        }
+                        Err(e) => eprintln!("{}", f.error(&e)),
+                    }
                 }
                 if s.database != db {
                     f.refresh(s);
                 }
                 // Cheap, and picks up `rehash`.
-                *words.borrow_mut() = f.completions();
+                *words.lock().unwrap() = f.completions();
             }
-            Err(ReadlineError::Interrupted) => {
+            Signal::CtrlC => {
                 f.reset(s);
                 entry.clear();
             }
-            Err(ReadlineError::Eof) => {
+            Signal::CtrlD => {
                 if !f.pending() {
                     break;
                 }
                 f.reset(s);
                 entry.clear();
             }
-            Err(e) => {
-                eprintln!("{e}");
-                break;
-            }
+            _ => {}
         }
     }
-    ed.save_history(&history).ok();
+    ed.sync_history().ok();
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rustyline_history_converts() {
+        let dir = std::env::temp_dir().join(format!("vareto-hist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conn");
+        std::fs::write(&path, "#V2\nselect 1;\nselect\\n  2;\na\\\\b\n").unwrap();
+        migrate_history(&path);
+        assert!(dir.join("conn.rustyline").exists());
+        // reedline's own reader sees the same entries, multi-line one included.
+        use reedline::History as _;
+        let h = reedline::FileBackedHistory::with_file(100, path.clone()).unwrap();
+        let q = reedline::SearchQuery::everything(reedline::SearchDirection::Forward, None);
+        let entries: Vec<String> = h.search(q).unwrap().into_iter().map(|i| i.command_line).collect();
+        assert_eq!(entries, vec!["select 1;", "select\n  2;", "a\\b"]);
+        // A second run leaves the converted file alone.
+        migrate_history(&path);
+        assert!(!std::fs::read_to_string(&path).unwrap().starts_with("#V2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

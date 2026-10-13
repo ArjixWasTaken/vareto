@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::session::Session;
+use super::complete::Kind;
 use super::{error_text, Completions, Flavor, Flow};
 use crate::ipc::QuerySpec;
 
@@ -230,7 +231,9 @@ impl Flavor for Redis {
     }
 
     fn completions(&self) -> Completions {
-        Completions::flat(COMMANDS.iter().map(|c| c.to_string()).chain(self.keys.iter().cloned()).collect())
+        let commands = COMMANDS.iter().map(|c| (c.to_string(), Kind::Command));
+        let keys = self.keys.iter().map(|k| (k.clone(), Kind::Key));
+        Completions { other: commands.chain(keys).collect(), ..Completions::default() }
     }
 }
 
