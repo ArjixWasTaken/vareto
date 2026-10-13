@@ -75,9 +75,11 @@ pub fn to_json(v: RV) -> Value {
 impl Redis {
     pub async fn connect(url: &str) -> Result<Self> {
         let client = redis::Client::open(url)?;
+        // No fixed response timeout: every call is bounded by the configured
+        // query/export timeout instead.
         let cfg = redis::aio::ConnectionManagerConfig::new()
             .set_connection_timeout(Some(Duration::from_secs(10)))
-            .set_response_timeout(Some(Duration::from_secs(60)));
+            .set_response_timeout(None);
         let mut con = client.get_connection_manager_with_config(cfg).await.context("connecting to Redis")?;
         let _: RV = redis::cmd("PING").query_async(&mut con).await.context("connecting to Redis")?;
         Ok(Self { con })
