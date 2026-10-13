@@ -94,7 +94,12 @@ impl Session {
     /// Writes fail with a broken pipe if the daemon gives up early.
     pub fn start_with_fd(&mut self, req: Request) -> Result<std::fs::File> {
         let mut client = self.client.take().context("a streaming request is still in progress")?;
-        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        // `pipe2` isn't on macOS: set close-on-exec separately, so programs the shell
+        // starts (`\!`, pagers) don't inherit the pipe and keep it open.
+        let (read, write) = nix::unistd::pipe()?;
+        for fd in [&read, &write] {
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
+        }
         self.pending = Some(self.rt.spawn(async move {
             let res = match client.send_with_fd(&req, read.as_fd()).await {
                 Ok(()) => {
