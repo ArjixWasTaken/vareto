@@ -36,6 +36,8 @@ pub struct Live {
 pub struct State {
     store: Mutex<ConfigStore>,
     pub tunnels: AsyncMutex<HashMap<String, Arc<Tunnel>>>,
+    /// One gate per tunnel name, held while that tunnel is being opened.
+    opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     pub conns: AsyncMutex<HashMap<String, Arc<Live>>>,
     /// SSH sessions shared by all forwards to the same SSH destination.
     pub ssh: Arc<SessionPool>,
@@ -66,20 +68,34 @@ impl State {
             ),
             None => format!("unknown tunnel {name:?}"),
         })?;
-        let mut tunnels = self.tunnels.lock().await;
-        if let Some(t) = tunnels.get(name) {
-            if t.cfg == tcfg && (!pin || t.pinned) {
-                t.touch();
-                return Ok(t.clone());
+        let usable = |t: &Tunnel| t.cfg == tcfg && (!pin || t.pinned);
+        if let Some(t) = self.tunnels.lock().await.get(name).filter(|t| usable(t)) {
+            t.touch();
+            return Ok(t.clone());
+        }
+        // Opening can take seconds (SSH handshake, ProxyJump, retries), so it happens
+        // outside the map lock: queries through other tunnels, `status` and the
+        // reaper don't wait for it. The per-name gate keeps two openers of the same
+        // tunnel from racing (a fixed `local` port can only be bound once).
+        let gate = self.opening.lock().unwrap().entry(name.to_string()).or_default().clone();
+        let _opening = gate.lock().await;
+        {
+            let mut tunnels = self.tunnels.lock().await;
+            if let Some(t) = tunnels.get(name) {
+                if usable(t) {
+                    // Opened by whoever held the gate before us.
+                    t.touch();
+                    return Ok(t.clone());
+                }
+                // Config changed, or a lazy tunnel is being pinned: reopen.
+                let old = tunnels.remove(name).unwrap();
+                self.drop_conns_for_tunnel(name).await;
+                old.close();
+                self.release_unused_session(&tunnels, &old.target).await;
             }
-            // Config changed, or a lazy tunnel is being pinned: reopen.
-            let old = tunnels.remove(name).unwrap();
-            self.drop_conns_for_tunnel(name).await;
-            old.close();
-            self.release_unused_session(&tunnels, &old.target).await;
         }
         let t = Tunnel::open(name, &tcfg, pin, self.ssh.clone()).await?;
-        tunnels.insert(name.to_string(), t.clone());
+        self.tunnels.lock().await.insert(name.to_string(), t.clone());
         Ok(t)
     }
 
@@ -253,6 +269,7 @@ pub async fn run() -> Result<()> {
     let state = Arc::new(State {
         store: Mutex::new(ConfigStore::new(false)),
         tunnels: Default::default(),
+        opening: Default::default(),
         conns: Default::default(),
         ssh: Default::default(),
         sessions: Default::default(),

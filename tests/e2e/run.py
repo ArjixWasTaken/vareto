@@ -4,7 +4,7 @@
     python3 tests/e2e/run.py            # builds vareto, starts compose, runs checks
     KEEP=1 python3 tests/e2e/run.py     # leave containers running afterwards
 """
-import json, os, subprocess, sys, tempfile, time, pathlib, shutil
+import json, os, signal, subprocess, sys, tempfile, time, pathlib, shutil
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -57,7 +57,9 @@ shutil.copy(keys / "id_ed25519", ssh_dir / "id_ed25519")
 os.chmod(ssh_dir / "id_ed25519", 0o600)
 (ssh_dir / "config").write_text(
     "Host e2e-bastion\n  HostName 127.0.0.1\n  Port 22220\n  User tester\n  IdentityFile %s\n\n"
-    "Host e2e-inner\n  HostName sshd\n  User tester\n  ProxyJump e2e-bastion\n" % (ssh_dir / "id_ed25519")
+    "Host e2e-inner\n  HostName sshd\n  User tester\n  ProxyJump e2e-bastion\n\n"
+    # TEST-NET-1: never routed, so connecting hangs until the SSH connect timeout.
+    "Host e2e-dead\n  HostName 192.0.2.1\n  User tester\n" % (ssh_dir / "id_ed25519")
 )
 (cfg_dir / "config.toml").write_text("""
 [defaults]
@@ -152,6 +154,11 @@ kind = "postgres"
 socket = "%(sock)s"
 user = "postgres"
 database = "shop"
+
+[connections.dead]
+kind = "postgres"
+ssh = "e2e-dead"
+host = "db"
 
 [connections.lite]
 kind = "sqlite"
@@ -310,6 +317,33 @@ try:
     check("mongosh: bulkWrite, cursor options, explain, unsupported methods say why", r.returncode != 0
           and r.stdout.startswith("switched to db scratch\n1\n[ { _id: 2 } ]\nscratch.bulk")
           and "watch() is not available in the vareto shell (change streams" in r.stderr, r.stdout + r.stderr)
+    # A hop that hangs while connecting must not hold up queries through other tunnels.
+    dead = subprocess.Popen([str(BIN), "sql", "dead", "SELECT 1"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    t0 = time.time()
+    r = v("sql", "pg", "SELECT 1 AS one", ok=False)
+    took = time.time() - t0
+    dead.kill()
+    check("a hanging SSH hop doesn't stall other tunnels", r.returncode == 0 and took < 3, f"{took:.1f}s {r.stderr}")
+
+    # Ctrl-C: during a query it cancels the query; in a script outside a query it ends the shell.
+    p = subprocess.Popen([str(BIN), "shell", "pg-rw"], env=env, text=True, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdin.write("select pg_sleep(1.8);\n"); p.stdin.flush()
+    time.sleep(0.8); p.send_signal(signal.SIGINT)
+    out, err = p.communicate(timeout=10)
+    check("Ctrl-C cancels the running query", "canceling statement due to user request" in err, err)
+    p = subprocess.Popen([str(BIN), "shell", "mongo"], env=env, text=True, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdin.write("db.customers.countDocuments()\nconfig.set('loopIterationLimit', 1e15)\nwhile (true) {}\n"); p.stdin.flush()
+    time.sleep(2); p.send_signal(signal.SIGINT)
+    try:
+        p.communicate(timeout=5)
+        check("Ctrl-C ends a script stuck outside a query", p.returncode == 130, p.returncode)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        check("Ctrl-C ends a script stuck outside a query", False, "still running 5s after SIGINT")
+
     r = shell("lite", ".tables\n.mode column\nselect id, body, score from notes order by id;\ninsert into notes (body) values ('x');\n")
     check("sqlite3: dot commands, column mode, read-only file", r.returncode != 0 and r.stdout.startswith("notes")
           and "id  body    score\n--  ------  -----\n 1  first     1.5" in r.stdout and "read-only" in r.stderr,

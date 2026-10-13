@@ -62,21 +62,12 @@ impl Session {
     pub fn call(&mut self, req: Request) -> Result<Value> {
         let (id, ro) = (self.id, self.force_readonly);
         let client = &mut self.client;
-        self.rt.block_on(async move {
-            let call = client.call(&req);
-            tokio::pin!(call);
-            loop {
-                tokio::select! {
-                    r = &mut call => return r,
-                    _ = tokio::signal::ctrl_c() => {
-                        let d = Daemon { force_readonly: ro };
-                        if let Ok(mut c) = d.connect().await {
-                            c.call(&Request::SessionCancel { session: id }).await.ok();
-                        }
-                    }
-                }
+        self.rt.block_on(super::interrupt::during(client.call(&req), || async move {
+            let d = Daemon { force_readonly: ro };
+            if let Ok(mut c) = d.connect().await {
+                c.call(&Request::SessionCancel { session: id }).await.ok();
             }
-        })
+        }))
     }
 
     pub fn query(&mut self, query: QuerySpec) -> Result<Value> {

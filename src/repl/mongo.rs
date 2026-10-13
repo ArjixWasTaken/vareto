@@ -273,12 +273,19 @@ impl Mongo {
 
     fn eval(&mut self, code: String, s: &mut Session) -> Result<Flow> {
         self.tx.send(ToJs::Eval(code)).context("the JavaScript engine has stopped")?;
+        // A Ctrl-C while JavaScript runs can't stop the engine, but it does stop
+        // the script at its next database call.
+        let interrupts = super::interrupt::count();
         loop {
             match self.rx.recv().context("the JavaScript engine has stopped")? {
                 FromJs::Call(req) => {
-                    let resp = match handle(&req, s) {
-                        Ok(v) => json!({ "ok": v }),
-                        Err(e) => json!({ "error": error_text(&e) }),
+                    let resp = if super::interrupt::count() != interrupts {
+                        json!({ "error": "interrupted (Ctrl-C)" })
+                    } else {
+                        match handle(&req, s) {
+                            Ok(v) => json!({ "ok": v }),
+                            Err(e) => json!({ "error": error_text(&e) }),
+                        }
                     };
                     self.tx.send(ToJs::Reply(resp.to_string())).ok();
                 }

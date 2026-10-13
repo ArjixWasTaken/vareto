@@ -84,6 +84,32 @@ impl Sink for Collector {
     }
 }
 
+/// Run blocking file I/O from inside the async row stream. On a multi-threaded
+/// runtime the worker hands its other tasks off first, so a slow disk doesn't stall
+/// them; outside a runtime (tests) it simply runs.
+fn tokio_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// The export file. Writes reach it in 256 KiB chunks from the `BufWriter` in front,
+/// each one through [`tokio_blocking`].
+struct BlockingFile(std::fs::File);
+
+impl std::io::Write for BlockingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        tokio_blocking(|| self.0.write(buf))
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        tokio_blocking(|| self.0.write_all(buf))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        tokio_blocking(|| self.0.flush())
+    }
+}
+
 /// How many documents decide the CSV columns of a document export.
 const CSV_DOC_SAMPLE: usize = 1000;
 
@@ -93,8 +119,8 @@ pub struct ExportWriter<'m> {
     masker: &'m Masker,
     table: Option<String>,
     collection: Option<String>,
-    out: Option<std::io::BufWriter<std::fs::File>>,
-    csv: Option<csv::Writer<std::io::BufWriter<std::fs::File>>>,
+    out: Option<std::io::BufWriter<BlockingFile>>,
+    csv: Option<csv::Writer<std::io::BufWriter<BlockingFile>>>,
     columns: Vec<Column>,
     /// Document CSV: first documents, held back until the header is known.
     pending: Vec<Value>,
@@ -107,10 +133,14 @@ pub struct ExportWriter<'m> {
 impl<'m> ExportWriter<'m> {
     /// `table`: source table for SQL `table.column` mask rules; `collection`: for Mongo.
     pub fn create(path: &Path, format: ExportFormat, masker: &'m Masker, table: Option<String>, collection: Option<String>) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let file = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let file = tokio_blocking(|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::File::create(path)
+        })
+        .with_context(|| format!("creating {}", path.display()))?;
+        let file = BlockingFile(file);
         Ok(Self {
             format,
             masker,
@@ -127,7 +157,7 @@ impl<'m> ExportWriter<'m> {
         })
     }
 
-    fn csv(&mut self) -> &mut csv::Writer<std::io::BufWriter<std::fs::File>> {
+    fn csv(&mut self) -> &mut csv::Writer<std::io::BufWriter<BlockingFile>> {
         if self.csv.is_none() {
             self.csv = Some(csv::Writer::from_writer(self.out.take().expect("writer")));
         }

@@ -1,6 +1,7 @@
 //! `vareto shell`: an interactive shell that behaves like each database's own
 //! client (mysql, psql, sqlite3, redis-cli, mongosh), on a pinned daemon session.
 
+mod interrupt;
 mod mongo;
 mod mysql;
 mod psql;
@@ -121,9 +122,10 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<bool> {
     let client = daemon.connect().await?;
     let rt = tokio::runtime::Handle::current();
     let ro = daemon.force_readonly;
+    let interactive = opts.execute.is_none() && std::io::stdin().is_terminal();
+    interrupt::install(&rt, interactive);
     tokio::task::spawn_blocking(move || {
         let mut s = Session::open(rt, client, ro, &opts.connection, opts.database.clone(), opts.limit)?;
-        let interactive = opts.execute.is_none() && std::io::stdin().is_terminal();
         let mut f: Box<dyn Flavor> = match s.kind {
             Kind::Mysql => Box::new(mysql::Mysql::new(&s)),
             Kind::Postgres => Box::new(psql::Psql::new()),
