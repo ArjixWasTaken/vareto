@@ -8,6 +8,7 @@ mod mcp;
 mod paths;
 mod readonly;
 mod render;
+mod repl;
 mod secrets;
 mod ssh;
 
@@ -52,6 +53,21 @@ enum Cmd {
     Mongo { connection: String, query: String, #[arg(long)] limit: Option<usize> },
     /// Run a Redis command.
     Redis { connection: String, #[arg(trailing_var_arg = true, required = true)] args: Vec<String> },
+    /// Interactive shell in the style of the database's own client (mysql, psql,
+    /// sqlite3, redis-cli, mongosh). Reads a script from stdin when it isn't a terminal.
+    #[command(alias = "repl")]
+    Shell {
+        connection: String,
+        /// Start in this database (Redis: db number).
+        #[arg(short, long)]
+        database: Option<String>,
+        /// Max rows per statement (default from config).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Run these commands and exit.
+        #[arg(short, long)]
+        execute: Option<String>,
+    },
     /// Config file helpers.
     Config {
         #[command(subcommand)]
@@ -178,6 +194,12 @@ async fn run_cli(daemon: &Daemon, cmd: Cmd) -> Result<()> {
         }
         Cmd::Redis { connection, args } => {
             print(&daemon.call(Request::Query { connection, query: QuerySpec::Redis { args }, limit: None }).await?)
+        }
+        Cmd::Shell { connection, database, limit, execute } => {
+            let ok = repl::run(daemon, repl::Options { connection, database, limit, execute }).await?;
+            if !ok {
+                std::process::exit(1);
+            }
         }
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Path => {

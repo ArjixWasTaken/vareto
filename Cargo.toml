@@ -12,6 +12,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
+comfy-table = "=8.0.1"
 csv = "1.4.0"
 directories = "6.0.0"
 fake = "5.1.0"
@@ -27,6 +28,7 @@ regex = "1.13.1"
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "macros"] }
 rpassword = "7.5.4"
 russh = "0.64.1"
+rustyline = { version = "=18.0.1", default-features = false, features = ["with-file-history"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
