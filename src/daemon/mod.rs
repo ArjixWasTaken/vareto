@@ -132,6 +132,10 @@ impl State {
         }
         self.drop_conn(&conn.name).await;
 
+        // Resolve the password first, so a missing keyring entry or failing
+        // password_cmd doesn't leave a pointless tunnel open behind it.
+        let c2 = conn.clone();
+        let password = tokio::task::spawn_blocking(move || crate::secrets::password(&c2)).await??;
         let (host, port) = match &route {
             Route::Direct { host, port } => (host.clone(), *port),
             Route::Tunnel(t) => {
@@ -139,8 +143,6 @@ impl State {
                 (t.local.ip().to_string(), t.local.port())
             }
         };
-        let c2 = conn.clone();
-        let password = tokio::task::spawn_blocking(move || crate::secrets::password(&c2)).await??;
         let backend = self.connect_backend(conn, &host, port, password.as_deref(), tunnel_name.is_some()).await;
         let backend = match (backend, &tunnel_name) {
             (Ok(b), _) => b,
