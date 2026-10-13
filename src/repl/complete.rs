@@ -167,6 +167,29 @@ pub fn candidates(c: &Completions, line: &str, pos: usize) -> (usize, Vec<(Strin
     (start, out)
 }
 
+/// The words at the level of the word at `pos` (after the last dot of a path),
+/// unranked: (where the word starts, the word, the words).
+fn level_words<'a>(c: &Completions, line: &'a str, pos: usize) -> (usize, &'a str, Vec<(String, Kind)>) {
+    let (start, all) = candidates(c, line, pos);
+    let word = &line[start..pos];
+    let cut = word.rfind('.').map(|i| i + 1).unwrap_or(0);
+    let parent = &word[..cut];
+    let mut seen = std::collections::HashSet::new();
+    let words = all
+        .into_iter()
+        .filter(|(text, _)| text.len() > cut && text.is_char_boundary(cut) && text[..cut].eq_ignore_ascii_case(parent))
+        .map(|(text, kind)| (text[cut..].to_string(), kind))
+        .filter(|(text, _)| seen.insert(text.clone()))
+        .collect();
+    (start + cut, &word[cut..], words)
+}
+
+/// Every word that fits at `pos`, unranked, for the fzf finder to rank (Ctrl-T):
+/// (where the word starts, the word typed so far, the words).
+pub fn complete_all<'a>(c: &Completions, line: &'a str, pos: usize) -> (usize, &'a str, Vec<(String, Kind)>) {
+    level_words(c, line, pos)
+}
+
 /// Candidates for the word at `pos`, best first: fzf-style fuzzy matches, with
 /// those that start with the word ahead. Completion is per word: in a dotted path
 /// (`db.product.fi`, `users.em`) only the part after the last dot is completed and
@@ -174,20 +197,7 @@ pub fn candidates(c: &Completions, line: &str, pos: usize) -> (usize, Vec<(Strin
 /// empty word gets every candidate of its context, in order. Returns where the
 /// replaced word starts.
 pub fn complete(c: &Completions, line: &str, pos: usize) -> (usize, Vec<Candidate>) {
-    let (start, all) = candidates(c, line, pos);
-    let word = &line[start..pos];
-    // The word proper: after the last dot of a path.
-    let cut = word.rfind('.').map(|i| i + 1).unwrap_or(0);
-    let parent = &word[..cut];
-    let needle = &word[cut..];
-    let mut seen = std::collections::HashSet::new();
-    let words: Vec<(String, Kind)> = all
-        .into_iter()
-        .filter(|(text, _)| text.len() > cut && text.is_char_boundary(cut) && text[..cut].eq_ignore_ascii_case(parent))
-        .map(|(text, kind)| (text[cut..].to_string(), kind))
-        .filter(|(text, _)| seen.insert(text.clone()))
-        .collect();
-    let start = start + cut;
+    let (start, needle, words) = level_words(c, line, pos);
     if needle.is_empty() {
         return (start, words.into_iter().map(|(text, kind)| Candidate { text, kind, indices: Vec::new() }).collect());
     }

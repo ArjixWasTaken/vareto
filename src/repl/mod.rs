@@ -458,6 +458,87 @@ fn migrate_history(path: &std::path::Path) {
     std::fs::write(path, body).ok();
 }
 
+/// The host commands Ctrl-T and Ctrl-R send: they open the fzf finder (skim).
+const FIND_COMPLETION: &str = "vareto:find-completion";
+const FIND_HISTORY: &str = "vareto:find-history";
+
+/// One entry of the fzf finder: matched on `text`, shown with `note`, inserts `value`.
+struct Pick {
+    text: String,
+    value: String,
+    note: &'static str,
+    /// Width the text is padded to, so the notes line up.
+    width: usize,
+}
+
+impl skim::SkimItem for Pick {
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.text)
+    }
+
+    fn display(&self, context: skim::DisplayContext) -> ratatui_core::text::Line<'_> {
+        let mut line = context.to_line(Cow::Borrowed(&self.text));
+        if !self.note.is_empty() {
+            let dim = ratatui_core::style::Style::default().add_modifier(ratatui_core::style::Modifier::DIM);
+            let pad = self.width.saturating_sub(self.text.chars().count()) + 2;
+            line.push_span(ratatui_core::text::Span::styled(format!("{:pad$}{}", "", self.note), dim));
+        }
+        line
+    }
+
+    fn output(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.value)
+    }
+}
+
+/// Run the fzf finder (skim) below the prompt; the chosen entry's value, or
+/// `None` when it was left with Esc.
+fn finder(picks: Vec<Pick>, query: &str) -> Option<String> {
+    // Open below the line being edited, as fzf does.
+    print!("\r\n");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let mut o = skim::SkimOptions::default();
+    o.height = "40%".into();
+    o.reverse = true;
+    o.query = (!query.is_empty()).then(|| query.to_string());
+    let out = skim::Skim::run_items(o.build(), picks).ok()?;
+    if out.is_abort {
+        return None;
+    }
+    out.selected_items.first().map(|m| m.item.output().into_owned())
+}
+
+/// Ctrl-T / Ctrl-R: open the finder on completions for the word at the cursor, or
+/// on the history, then put its pick into the buffer reedline kept.
+fn run_finder(ed: &mut reedline::Reedline, which: &str, words: &Mutex<Completions>) {
+    use reedline::EditCommand;
+    let buffer = ed.current_buffer_contents().to_string();
+    let pos = ed.current_insertion_point();
+    let (new, cursor) = if which == FIND_COMPLETION {
+        let (start, typed, all) = complete::complete_all(&words.lock().unwrap(), &buffer, pos);
+        let width = all.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0).min(48);
+        let picks = all.into_iter().map(|(text, kind)| Pick { value: text.clone(), text, note: kind.label(), width }).collect();
+        let Some(v) = finder(picks, typed) else { return };
+        (format!("{}{v}{}", &buffer[..start], &buffer[pos..]), start + v.len())
+    } else {
+        let query = reedline::SearchQuery::everything(reedline::SearchDirection::Backward, None);
+        let mut seen = std::collections::HashSet::new();
+        let picks: Vec<Pick> = ed
+            .history()
+            .search(query)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| h.command_line)
+            .filter(|c| seen.insert(c.clone()))
+            .map(|c| Pick { text: c.replace('\n', " ↵ "), value: c, note: "", width: 0 })
+            .collect();
+        let Some(v) = finder(picks, buffer.trim()) else { return };
+        let len = v.len();
+        (v, len)
+    };
+    ed.run_edit_commands(&[EditCommand::Clear, EditCommand::InsertString(new), EditCommand::MoveToPosition { position: cursor, select: false }]);
+}
+
 fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32 {
     use reedline::{default_emacs_keybindings, Emacs, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal};
     let history_path = crate::paths::state_dir().join("history").join(connection);
@@ -481,6 +562,9 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
         ReedlineEvent::UntilFound(vec![ReedlineEvent::Menu("completion_menu".into()), ReedlineEvent::MenuNext]),
     );
     keys.add_binding(KeyModifiers::SHIFT, KeyCode::BackTab, ReedlineEvent::MenuPrevious);
+    // fzf's bindings: Ctrl-T finds a completion, Ctrl-R a history entry.
+    keys.add_binding(KeyModifiers::CONTROL, KeyCode::Char('t'), ReedlineEvent::ExecuteHostCommand(FIND_COMPLETION.into()));
+    keys.add_binding(KeyModifiers::CONTROL, KeyCode::Char('r'), ReedlineEvent::ExecuteHostCommand(FIND_HISTORY.into()));
     let menu = IdeMenu::default().with_name("completion_menu").with_marker("").with_default_border();
     let mut ed = Reedline::create()
         .with_history(Box::new(StatementHistory { inner: history, accept: accept.clone() }))
@@ -546,6 +630,8 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
                 // Cheap, and picks up `rehash`.
                 *words.lock().unwrap() = f.completions();
             }
+            // The editor is suspended with its buffer kept; the next read_line resumes it.
+            Signal::HostCommand(which) => run_finder(&mut ed, &which, &words),
             Signal::CtrlC => {
                 f.reset(s);
                 entry.clear();
