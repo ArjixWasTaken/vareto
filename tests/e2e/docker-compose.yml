@@ -1,0 +1,31 @@
+# End-to-end environment: the databases are only reachable from inside the
+# `internal` network, so every test query must go through the SSH tunnel.
+name: vareto-e2e
+services:
+  sshd:
+    build: ./sshd
+    ports: ["127.0.0.1:22220:22"]
+    volumes: ["${KEYS_DIR}:/keys:ro"]
+    networks: [internal, edge]
+  postgres:
+    image: postgres:18-alpine
+    environment: { POSTGRES_PASSWORD: pgpass, POSTGRES_DB: shop }
+    volumes: ["./seed/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    networks: [internal]
+  mariadb:
+    image: mariadb:10.11
+    environment: { MARIADB_ROOT_PASSWORD: rootpass, MARIADB_DATABASE: shop, MARIADB_USER: app, MARIADB_PASSWORD: "my pass@1" }
+    volumes: ["./seed/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    networks: [internal]
+  mongo:
+    image: mongo:7
+    environment: { MONGO_INITDB_ROOT_USERNAME: root, MONGO_INITDB_ROOT_PASSWORD: mongopass, MONGO_INITDB_DATABASE: shop }
+    volumes: ["./seed/mongo.js:/docker-entrypoint-initdb.d/seed.js:ro"]
+    networks: [internal]
+  redis:
+    image: redis:alpine
+    command: ["redis-server", "--requirepass", "redispass"]
+    networks: [internal]
+networks:
+  internal: { internal: true }
+  edge: {}

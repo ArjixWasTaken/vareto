@@ -1,0 +1,53 @@
+# vareto configuration. Connections saved by the assistant go to saved.toml
+# next to this file and are always read-only.
+
+[defaults]
+row_limit = 200            # rows/documents returned per query (max 5000)
+max_cell_chars = 2000      # longer values are truncated in responses
+idle_timeout = "15m"       # close on-demand tunnels after this long unused
+daemon_idle_timeout = "30m"
+query_timeout = "60s"
+readonly = true            # default for connections that don't set `readonly`
+
+# Masking applied to every connection (merged with per-connection rules).
+# [defaults.mask]
+# columns = [{ match = "*password*" }, { match = "*token*" }, { match = "*secret*" }]
+# detect = ["email", "card"]
+
+# A named tunnel: host is a ~/.ssh/config alias or [user@]host[:port].
+[tunnels.prod]
+host = "prod-bastion"
+remote = "10.0.0.5:5432"   # as seen from the SSH server; "/path/to.sock" also works
+# local = "127.0.0.1:15432" # fixed local port (default: ephemeral)
+
+[connections.prod-pg]
+kind = "postgres"          # mysql | mariadb | postgres | mongodb | redis
+tunnel = "prod"
+user = "readonly"
+password = "${env:PROD_PG_PASSWORD}"   # or password_cmd = "pass show prod/pg", or keyring = true
+database = "app"
+description = "Production app database"
+[connections.prod-pg.mask]
+seed = "${env:VARETO_MASK_SEED}"   # secret salt for `hash`/`fake` (recommended)
+columns = [
+  { match = "users.email", strategy = "fake" },          # redact | partial | hash | null | fake
+  { match = "users.name", strategy = "fake" },           # kind guessed from the column name
+  { match = "orders.contact", strategy = "fake", as = "phone" },
+  { match = "*password*", strategy = "redact" },
+]
+detect = ["email", "phone", "card", "iban"]
+detect_strategy = "fake"   # partial (default) | redact | hash | fake
+
+# Shorthand: tunnel through an SSH host to a DB on that host's localhost.
+[connections.staging-mysql]
+kind = "mysql"
+ssh = "staging"            # host/port below are resolved on the SSH server
+port = 3306
+user = "app"
+password_cmd = "pass show staging/mysql"
+database = "app"
+readonly = false           # writes allowed (only a human can set this)
+
+[connections.local-redis]
+kind = "redis"
+host = "127.0.0.1"

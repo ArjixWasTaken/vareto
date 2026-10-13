@@ -1,0 +1,17 @@
+{
+  "name": "vareto",
+  "owner": {
+    "name": "ArjixWasTaken"
+  },
+  "metadata": {
+    "description": "vareto: SSH-tunnelling database MCP server and its usage skill"
+  },
+  "plugins": [
+    {
+      "name": "vareto",
+      "source": "./plugin",
+      "description": "Query MySQL/MariaDB, PostgreSQL, MongoDB and Redis (directly or through SSH tunnels) via the vareto MCP server, with read-only enforcement and data masking.",
+      "version": "0.1.0"
+    }
+  ]
+}

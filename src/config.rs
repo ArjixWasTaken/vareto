@@ -1,0 +1,472 @@
+//! Configuration: the human-edited `config.toml` plus the LLM-managed `saved.toml`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::mask::MaskConfig;
+use crate::paths;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub defaults: Defaults,
+    #[serde(default)]
+    pub tunnels: BTreeMap<String, TunnelConfig>,
+    #[serde(default)]
+    pub connections: BTreeMap<String, ConnectionConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Defaults {
+    /// Max rows/documents returned to the model per query.
+    pub row_limit: usize,
+    /// Max characters per returned cell before it is truncated.
+    pub max_cell_chars: usize,
+    /// Close tunnels (and their DB pools) after this long without use.
+    #[serde(with = "duration_str")]
+    pub idle_timeout: Duration,
+    /// The daemon exits after this long with no open tunnels and no requests.
+    #[serde(with = "duration_str")]
+    pub daemon_idle_timeout: Duration,
+    /// Readonly default for connections that don't specify it.
+    pub readonly: bool,
+    /// Statement timeout applied to queries.
+    #[serde(with = "duration_str")]
+    pub query_timeout: Duration,
+    /// Masking applied to every connection (merged with per-connection rules).
+    pub mask: MaskConfig,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            row_limit: 200,
+            max_cell_chars: 2000,
+            idle_timeout: Duration::from_secs(15 * 60),
+            daemon_idle_timeout: Duration::from_secs(30 * 60),
+            readonly: true,
+            query_timeout: Duration::from_secs(60),
+            mask: MaskConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelConfig {
+    /// `~/.ssh/config` alias or hostname, optionally `user@host:port`.
+    pub host: String,
+    /// Address to forward to, as seen from the SSH server, e.g. `127.0.0.1:5432`.
+    pub remote: String,
+    /// Fixed local bind address; an ephemeral `127.0.0.1` port when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[serde(alias = "mariadb")]
+    Mysql,
+    #[serde(alias = "postgresql", alias = "pg")]
+    Postgres,
+    #[serde(alias = "mongo")]
+    Mongodb,
+    Redis,
+}
+
+impl Kind {
+    pub fn default_port(self) -> u16 {
+        match self {
+            Kind::Mysql => 3306,
+            Kind::Postgres => 5432,
+            Kind::Mongodb => 27017,
+            Kind::Redis => 6379,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Mysql => "mysql",
+            Kind::Postgres => "postgres",
+            Kind::Mongodb => "mongodb",
+            Kind::Redis => "redis",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionConfig {
+    pub kind: Kind,
+    /// Name of a `[tunnels.*]` entry to connect through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<String>,
+    /// Shorthand: SSH host to tunnel through to `host:port` (an implicit tunnel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
+    /// DB host. With `ssh`, it is resolved on the SSH server (default 127.0.0.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Plaintext, or `${env:VAR}` references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Shell command whose trimmed stdout is the password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_cmd: Option<String>,
+    /// Read the password from the OS keyring (service `vareto`, account = connection name).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keyring: bool,
+    /// Database (SQL), default database (Mongo) or db index (Redis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readonly: Option<bool>,
+    /// Extra driver parameters (e.g. `sslmode`, `authSource`, `tls`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "MaskConfig::is_empty")]
+    pub mask: MaskConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    Config,
+    Saved,
+}
+
+/// A connection after merging both files.
+#[derive(Debug, Clone)]
+pub struct Connection {
+    pub name: String,
+    pub cfg: ConnectionConfig,
+    pub source: Source,
+    pub readonly: bool,
+}
+
+/// Where a connection's traffic goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    Direct { host: String, port: u16 },
+    Tunnel(String),
+}
+
+impl Connection {
+    pub fn route(&self) -> Route {
+        if let Some(t) = &self.cfg.tunnel {
+            Route::Tunnel(t.clone())
+        } else if self.cfg.ssh.is_some() {
+            Route::Tunnel(implicit_tunnel_name(&self.name))
+        } else {
+            Route::Direct {
+                host: self.cfg.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                port: self.cfg.port.unwrap_or(self.cfg.kind.default_port()),
+            }
+        }
+    }
+}
+
+pub fn implicit_tunnel_name(conn: &str) -> String {
+    format!("@{conn}")
+}
+
+/// Fully merged, validated configuration.
+#[derive(Debug, Clone, Default)]
+pub struct Resolved {
+    pub defaults: Defaults,
+    pub tunnels: BTreeMap<String, TunnelConfig>,
+    pub connections: BTreeMap<String, Connection>,
+}
+
+impl Resolved {
+    pub fn connection(&self, name: &str) -> Result<&Connection> {
+        self.connections.get(name).with_context(|| {
+            let known: Vec<_> = self.connections.keys().map(String::as_str).collect();
+            format!("unknown connection {name:?} (known: {})", known.join(", "))
+        })
+    }
+}
+
+pub fn load_file(path: &Path) -> Result<Config> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Merge `config.toml` and `saved.toml`. `force_readonly` comes from `--readonly`.
+pub fn resolve(main: Config, saved: Config, force_readonly: bool) -> Result<Resolved> {
+    let mut tunnels = main.tunnels;
+    for (name, t) in saved.tunnels {
+        if tunnels.contains_key(&name) {
+            bail!("tunnel {name:?} is defined in both config.toml and saved.toml");
+        }
+        tunnels.insert(name, t);
+    }
+
+    let mut connections = BTreeMap::new();
+    let all = main
+        .connections
+        .into_iter()
+        .map(|c| (c, Source::Config))
+        .chain(saved.connections.into_iter().map(|c| (c, Source::Saved)));
+    for ((name, cfg), source) in all {
+        if connections.contains_key(&name) {
+            bail!("connection {name:?} is defined in both config.toml and saved.toml");
+        }
+        if cfg.tunnel.is_some() && cfg.ssh.is_some() {
+            bail!("connection {name:?}: set either `tunnel` or `ssh`, not both");
+        }
+        if let Some(t) = &cfg.tunnel {
+            if !tunnels.contains_key(t) {
+                bail!("connection {name:?} references unknown tunnel {t:?}");
+            }
+        }
+        // Readonly can only be relaxed by a human, in config.toml.
+        let readonly = force_readonly
+            || source == Source::Saved
+            || cfg.readonly.unwrap_or(main.defaults.readonly);
+        if let Some(ssh) = &cfg.ssh {
+            let remote_host = cfg.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+            let remote_port = cfg.port.unwrap_or(cfg.kind.default_port());
+            tunnels.insert(
+                implicit_tunnel_name(&name),
+                TunnelConfig {
+                    host: ssh.clone(),
+                    remote: join_host_port(&remote_host, remote_port),
+                    local: None,
+                    user: None,
+                    port: None,
+                    identity: None,
+                },
+            );
+        }
+        connections.insert(name.clone(), Connection { name, cfg, source, readonly });
+    }
+
+    Ok(Resolved { defaults: main.defaults, tunnels, connections })
+}
+
+pub fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Split `host:port` / `[v6]:port`.
+pub fn split_host_port(s: &str) -> Result<(String, u16)> {
+    let (host, port) = s.rsplit_once(':').with_context(|| format!("{s:?} is not host:port"))?;
+    let port = port.parse().with_context(|| format!("invalid port in {s:?}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok((host.to_string(), port))
+}
+
+/// Loads config files and reloads them when their mtime changes.
+pub struct ConfigStore {
+    force_readonly: bool,
+    stamp: Option<(Option<SystemTime>, Option<SystemTime>)>,
+    current: std::sync::Arc<Resolved>,
+}
+
+fn mtime(p: &Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+impl ConfigStore {
+    pub fn new(force_readonly: bool) -> Self {
+        Self { force_readonly, stamp: None, current: Default::default() }
+    }
+
+    pub fn paths() -> (PathBuf, PathBuf) {
+        (paths::config_file(), paths::saved_file())
+    }
+
+    /// Current config, re-read from disk if either file changed.
+    pub fn get(&mut self) -> Result<std::sync::Arc<Resolved>> {
+        let (main_p, saved_p) = Self::paths();
+        let stamp = (mtime(&main_p), mtime(&saved_p));
+        if self.stamp != Some(stamp) {
+            let resolved = resolve(load_file(&main_p)?, load_file(&saved_p)?, self.force_readonly)?;
+            self.current = std::sync::Arc::new(resolved);
+            self.stamp = Some(stamp);
+        }
+        Ok(self.current.clone())
+    }
+}
+
+/// Resolve `${env:VAR}` references inside a string.
+pub fn interpolate_env(s: &str) -> Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${env:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 6..];
+        let end = after.find('}').with_context(|| format!("unterminated ${{env:...}} in {s:?}"))?;
+        let var = &after[..end];
+        let val = std::env::var(var).with_context(|| format!("environment variable {var} is not set"))?;
+        out.push_str(&val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Parse durations like `90s`, `15m`, `1h`, `1h30m`, or a bare number of seconds.
+pub fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Ok(Duration::from_secs(n));
+    }
+    let mut total = 0u64;
+    let mut num = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        let n: u64 = num.parse().with_context(|| format!("invalid duration {s:?}"))?;
+        num.clear();
+        total += n * match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86400,
+            _ => bail!("invalid duration unit {c:?} in {s:?}"),
+        };
+    }
+    if !num.is_empty() {
+        bail!("invalid duration {s:?} (missing unit)");
+    }
+    Ok(Duration::from_secs(total))
+}
+
+mod duration_str {
+    use serde::{Deserialize, Deserializer};
+    use std::time::Duration;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Secs(u64),
+            Str(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Secs(n) => Ok(Duration::from_secs(n)),
+            Raw::Str(s) => super::parse_duration(&s).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Config {
+        toml::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert!(parse_duration("10x").is_err());
+        assert!(parse_duration("1h30").is_err());
+    }
+
+    #[test]
+    fn env_interpolation() {
+        // SAFETY: tests in this module don't read this variable concurrently.
+        unsafe { std::env::set_var("VARETO_TEST_PW", "s3cret") };
+        assert_eq!(interpolate_env("${env:VARETO_TEST_PW}").unwrap(), "s3cret");
+        assert_eq!(interpolate_env("a-${env:VARETO_TEST_PW}-b").unwrap(), "a-s3cret-b");
+        assert_eq!(interpolate_env("plain").unwrap(), "plain");
+        assert!(interpolate_env("${env:VARETO_DEFINITELY_UNSET}").is_err());
+    }
+
+    #[test]
+    fn readonly_rules() {
+        let main = parse(
+            r#"
+            [defaults]
+            readonly = false
+            idle_timeout = "5m"
+            [connections.rw]
+            kind = "postgres"
+            [connections.ro]
+            kind = "mysql"
+            readonly = true
+            "#,
+        );
+        let saved = parse(
+            r#"
+            [connections.llm]
+            kind = "redis"
+            readonly = false
+            "#,
+        );
+        let r = resolve(main.clone(), saved.clone(), false).unwrap();
+        assert!(!r.connections["rw"].readonly);
+        assert!(r.connections["ro"].readonly);
+        assert!(r.connections["llm"].readonly, "saved connections are always readonly");
+        assert_eq!(r.defaults.idle_timeout, Duration::from_secs(300));
+
+        let forced = resolve(main, saved, true).unwrap();
+        assert!(forced.connections.values().all(|c| c.readonly));
+    }
+
+    #[test]
+    fn implicit_tunnel() {
+        let main = parse(
+            r#"
+            [connections.prod]
+            kind = "postgres"
+            ssh = "bastion"
+            "#,
+        );
+        let r = resolve(main, Config::default(), false).unwrap();
+        let c = &r.connections["prod"];
+        assert_eq!(c.route(), Route::Tunnel("@prod".into()));
+        assert_eq!(r.tunnels["@prod"].remote, "127.0.0.1:5432");
+        assert_eq!(r.tunnels["@prod"].host, "bastion");
+    }
+
+    #[test]
+    fn duplicates_and_unknown_tunnels_rejected() {
+        let main = parse("[connections.a]\nkind = \"redis\"\n");
+        let saved = parse("[connections.a]\nkind = \"redis\"\n");
+        assert!(resolve(main, saved, false).is_err());
+        let bad = parse("[connections.a]\nkind = \"redis\"\ntunnel = \"nope\"\n");
+        assert!(resolve(bad, Config::default(), false).is_err());
+    }
+
+    #[test]
+    fn host_port() {
+        assert_eq!(split_host_port("db:5432").unwrap(), ("db".into(), 5432));
+        assert_eq!(split_host_port("[::1]:6379").unwrap(), ("::1".into(), 6379));
+        assert_eq!(join_host_port("::1", 1), "[::1]:1");
+    }
+}
