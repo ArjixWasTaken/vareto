@@ -12,7 +12,7 @@ use super::psql_vars::{bool_value, interpolate, split_args, split_meta, Vars};
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Mode, Open, SqlBuf};
 use super::table::{self, QueryResult};
-use super::{elapsed, error_info, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
+use super::{elapsed, error_info, error_text, names, pairs, read_script, run_script, Flavor, Flow, Completions, COLUMN_LIMIT, SQL_KEYWORDS};
 
 /// One level of `\if`.
 struct Cond {
@@ -42,6 +42,7 @@ pub struct Psql {
     /// Directories of the scripts being run, innermost last (for `\ir`).
     script_dirs: Vec<std::path::PathBuf>,
     tables: Vec<String>,
+    columns: Vec<(String, String)>,
 }
 
 const HELP: &str = "\
@@ -309,6 +310,7 @@ impl Psql {
             warned_readonly_tx: false,
             script_dirs: Vec::new(),
             tables: Vec::new(),
+            columns: Vec::new(),
         };
         p.sync_conn_vars(s);
         Ok(p)
@@ -1544,6 +1546,21 @@ impl Flavor for Psql {
 
     fn refresh(&mut self, s: &mut Session) {
         self.tables = s.list_tables(None, None).map(|v| names(&v)).unwrap_or_default();
+        self.columns = s
+            .query_limit(
+                crate::ipc::QuerySpec::Sql {
+                    sql: "SELECT c.relname::text, a.attname::text FROM pg_catalog.pg_attribute a \
+                          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND a.attnum > 0 AND NOT a.attisdropped \
+                          AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                          AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 1, a.attnum"
+                        .into(),
+                },
+                Some(COLUMN_LIMIT),
+            )
+            .map(|v| pairs(&v))
+            .unwrap_or_default();
         self.superuser = s
             .sql("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user")
             .ok()
@@ -1552,14 +1569,23 @@ impl Flavor for Psql {
         self.sync_conn_vars(s);
     }
 
-    fn words(&self) -> Vec<String> {
+    fn completions(&self) -> Completions {
         let metas = [
             "\\q", "\\?", "\\l", "\\c", "\\conninfo", "\\d", "\\dt", "\\dv", "\\di", "\\dn", "\\df", "\\du", "\\ds", "\\dm",
             "\\x", "\\timing", "\\g", "\\gx", "\\gset", "\\gexec", "\\watch", "\\crosstabview", "\\i", "\\ir", "\\echo",
             "\\qecho", "\\warn", "\\p", "\\r", "\\e", "\\w", "\\s", "\\o", "\\set", "\\unset", "\\pset", "\\a", "\\t", "\\f",
             "\\C", "\\H", "\\T", "\\if", "\\elif", "\\else", "\\endif", "\\prompt", "\\getenv", "\\setenv", "\\cd", "\\!",
+            "\\errverbose", "\\sf", "\\sv", "\\ef", "\\ev", "\\z", "\\dp", "\\dx", "\\dT", "\\dD", "\\dE", "\\dy", "\\dL",
+            "\\dO", "\\dP", "\\dX", "\\db", "\\dconfig", "\\drds", "\\drg", "\\dRp", "\\dRs", "\\da", "\\dA", "\\dc",
+            "\\dC", "\\dd", "\\ddp", "\\do", "\\dF", "\\des", "\\det", "\\deu", "\\dew", "\\dg", "\\dt+", "\\d+",
         ];
-        SQL_KEYWORDS.iter().chain(metas.iter()).map(|w| w.to_string()).chain(self.tables.iter().cloned()).collect()
+        Completions {
+            keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
+            commands: metas.iter().map(|w| w.to_string()).collect(),
+            tables: self.tables.clone(),
+            columns: self.columns.clone(),
+            other: Vec::new(),
+        }
     }
 }
 

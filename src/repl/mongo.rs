@@ -12,7 +12,7 @@ use boa_engine::{js_string, Context, JsNativeError, JsResult, JsString, JsValue,
 use serde_json::{json, Value};
 
 use super::session::Session;
-use super::{error_text, names, Flavor, Flow};
+use super::{error_text, names, Completions, Flavor, Flow};
 use crate::ipc::{MongoQuery, QuerySpec};
 
 const PRELUDE: &str = include_str!("mongo_prelude.js");
@@ -430,7 +430,7 @@ impl Flavor for Mongo {
         self.collections = s.list_tables(s.database.clone(), None).map(|v| names(&v)).unwrap_or_default();
     }
 
-    fn words(&self) -> Vec<String> {
+    fn completions(&self) -> Completions {
         let mut w: Vec<String> = ["show dbs", "show collections", "show users", "use", "it", "exit", "help", "db.", "ObjectId(", "ISODate("]
             .iter()
             .map(|s| s.to_string())
@@ -439,7 +439,7 @@ impl Flavor for Mongo {
             w.push(format!("db.{c}"));
             w.extend(METHODS.iter().map(|m| format!("db.{c}.{m}")));
         }
-        w
+        Completions::flat(w)
     }
 }
 

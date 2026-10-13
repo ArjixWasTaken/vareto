@@ -7,7 +7,7 @@ use super::out::outln;
 use super::session::Session;
 use super::sqlbuf::{Dialect, SqlBuf};
 use super::table::{self, QueryResult, Style};
-use super::{elapsed, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
+use super::{elapsed, error_text, names, pairs, read_script, run_script, Flavor, Flow, Completions, COLUMN_LIMIT, SQL_KEYWORDS};
 use crate::db::sql::quote_lit;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct Sqlite {
     timer: bool,
     null: String,
     tables: Vec<String>,
+    columns: Vec<(String, String)>,
 }
 
 const HELP: &str = "\
@@ -63,7 +64,7 @@ fn on_off(arg: &str) -> Result<bool> {
 
 impl Sqlite {
     pub fn new() -> Self {
-        Self { buf: SqlBuf::new(Dialect::Sqlite), mode: Mode::Box, headers: true, timer: false, null: String::new(), tables: Vec::new() }
+        Self { buf: SqlBuf::new(Dialect::Sqlite), mode: Mode::Box, headers: true, timer: false, null: String::new(), tables: Vec::new(), columns: Vec::new() }
     }
 
     fn print(&self, columns: &[String], rows: &[Vec<Value>]) {
@@ -231,10 +232,27 @@ impl Flavor for Sqlite {
 
     fn refresh(&mut self, s: &mut Session) {
         self.tables = s.list_tables(None, None).map(|v| names(&v)).unwrap_or_default();
+        self.columns = s
+            .query_limit(
+                crate::ipc::QuerySpec::Sql {
+                    sql: "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
+                          WHERE m.type IN ('table', 'view') ORDER BY m.name, p.cid"
+                        .into(),
+                },
+                Some(COLUMN_LIMIT),
+            )
+            .map(|v| pairs(&v))
+            .unwrap_or_default();
     }
 
-    fn words(&self) -> Vec<String> {
+    fn completions(&self) -> Completions {
         let dots = [".tables", ".schema", ".indexes", ".databases", ".mode", ".headers", ".timer", ".read", ".help", ".quit", ".exit", ".nullvalue"];
-        SQL_KEYWORDS.iter().chain(dots.iter()).map(|w| w.to_string()).chain(self.tables.iter().cloned()).collect()
+        Completions {
+            keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
+            commands: dots.iter().map(|w| w.to_string()).collect(),
+            tables: self.tables.clone(),
+            columns: self.columns.clone(),
+            other: Vec::new(),
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! `vareto shell`: an interactive shell that behaves like each database's own
 //! client (mysql, psql, sqlite3, redis-cli, mongosh), on a pinned daemon session.
 
+mod complete;
 mod edit;
 mod interrupt;
 mod mongo;
@@ -30,6 +31,7 @@ use rustyline::error::ReadlineError;
 
 use crate::client::Daemon;
 use crate::config::Kind;
+use complete::Completions;
 use session::Session;
 
 pub struct Options {
@@ -146,8 +148,8 @@ pub trait Flavor {
     fn error(&self, e: &anyhow::Error) -> String;
     /// Reload completion words (table names, ...) after connecting or switching databases.
     fn refresh(&mut self, _s: &mut Session) {}
-    /// Words for tab completion.
-    fn words(&self) -> Vec<String>;
+    /// What tab completion offers.
+    fn completions(&self) -> Completions;
     /// Whether a script stops at its first error (mysql), or reports it and goes on
     /// (psql unless `ON_ERROR_STOP`).
     fn stop_on_error(&self) -> bool {
@@ -167,6 +169,9 @@ pub trait Flavor {
 static SCRIPT_ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Completion words shared by the SQL shells.
+/// Most `(table, column)` pairs loaded for completion.
+pub const COLUMN_LIMIT: usize = 5000;
+
 pub const SQL_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET", "INSERT", "INTO", "VALUES",
     "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "INDEX", "VIEW", "DROP", "ALTER", "ADD", "COLUMN", "JOIN",
@@ -192,6 +197,17 @@ pub fn elapsed(v: &serde_json::Value) -> f64 {
 }
 
 /// Names from a `ListTables` response (SQL tables, Mongo collections).
+/// (table, column) pairs from the first two columns of a result, for completion.
+pub fn pairs(v: &serde_json::Value) -> Vec<(String, String)> {
+    match table::QueryResult::from_json(v) {
+        table::QueryResult::Table { rows, .. } => rows
+            .iter()
+            .filter_map(|r| Some((r.first()?.as_str()?.to_string(), r.get(1)?.as_str()?.to_string())))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn names(v: &serde_json::Value) -> Vec<String> {
     match table::QueryResult::from_json(v) {
         table::QueryResult::Table { columns, rows, .. } => {
@@ -309,37 +325,14 @@ fn finish_script(f: &mut dyn Flavor, r: Result<Flow>) -> i32 {
 }
 
 struct Helper {
-    words: Rc<RefCell<Vec<String>>>,
+    words: Rc<RefCell<Completions>>,
 }
 
 impl Completer for Helper {
     type Candidate = String;
 
     fn complete(&self, line: &str, pos: usize, _: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
-        let start = line[..pos]
-            .rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '\\' | '$')))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let word = &line[start..pos];
-        if word.is_empty() {
-            return Ok((pos, Vec::new()));
-        }
-        let lower = word.to_lowercase();
-        let upper = word.chars().next().is_some_and(char::is_uppercase);
-        let mut out: Vec<String> = self
-            .words
-            .borrow()
-            .iter()
-            .filter(|w| w.to_lowercase().starts_with(&lower) && w.len() > word.len())
-            .map(|w| {
-                // Keywords follow the case being typed.
-                let kw = w.chars().all(|c| c.is_ascii_uppercase() || c == ' ');
-                if kw && !upper { w.to_lowercase() } else { w.clone() }
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        Ok((start, out))
+        Ok(complete::complete(&self.words.borrow(), line, pos))
     }
 }
 
@@ -351,7 +344,7 @@ impl Validator for Helper {}
 impl rustyline::Helper for Helper {}
 
 fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32 {
-    let config = rustyline::Config::builder().auto_add_history(false).max_history_size(5000).map(|b| b.build());
+    let config = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).auto_add_history(false).max_history_size(5000).map(|b| b.build());
     let mut ed: rustyline::Editor<Helper, DefaultHistory> = match config.and_then(rustyline::Editor::with_config) {
         Ok(e) => e,
         Err(e) => {
@@ -359,7 +352,7 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
             return 1;
         }
     };
-    let words = Rc::new(RefCell::new(Vec::new()));
+    let words = Rc::new(RefCell::new(Completions::default()));
     ed.set_helper(Some(Helper { words: words.clone() }));
     let history = crate::paths::state_dir().join("history").join(connection);
     if let Some(dir) = history.parent() {
@@ -369,7 +362,7 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
 
     println!("{}", f.banner(s));
     f.refresh(s);
-    *words.borrow_mut() = f.words();
+    *words.borrow_mut() = f.completions();
     let mut entry: Vec<String> = Vec::new();
     loop {
         let db = s.database.clone();
@@ -407,7 +400,7 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
                     f.refresh(s);
                 }
                 // Cheap, and picks up `rehash`.
-                *words.borrow_mut() = f.words();
+                *words.borrow_mut() = f.completions();
             }
             Err(ReadlineError::Interrupted) => {
                 f.reset();

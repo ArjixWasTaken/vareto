@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::session::Session;
-use super::{error_text, Flavor, Flow};
+use super::{error_text, Completions, Flavor, Flow};
 use crate::ipc::QuerySpec;
 
 pub struct Redis {
@@ -229,8 +229,8 @@ impl Flavor for Redis {
         self.keys = v["documents"].as_array().into_iter().flatten().filter_map(|d| d["key"].as_str().map(str::to_string)).take(1000).collect();
     }
 
-    fn words(&self) -> Vec<String> {
-        COMMANDS.iter().map(|c| c.to_string()).chain(self.keys.iter().cloned()).collect()
+    fn completions(&self) -> Completions {
+        Completions::flat(COMMANDS.iter().map(|c| c.to_string()).chain(self.keys.iter().cloned()).collect())
     }
 }
 

@@ -7,7 +7,7 @@ use super::out::{self, outln};
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Mode, Open, SqlBuf};
 use super::table::{self, QueryResult, Style};
-use super::{elapsed, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
+use super::{elapsed, error_text, names, pairs, read_script, run_script, Flavor, Flow, Completions, COLUMN_LIMIT, SQL_KEYWORDS};
 
 /// Command-line options of the real client that the shell supports.
 #[derive(Clone, Debug, Default)]
@@ -47,6 +47,7 @@ pub struct Mysql {
     tee_file: Option<String>,
     pager_cmd: Option<String>,
     tables: Vec<String>,
+    columns: Vec<(String, String)>,
 }
 
 const HELP: &str = "\
@@ -159,6 +160,7 @@ impl Mysql {
             tee_file: None,
             pager_cmd: None,
             tables: Vec::new(),
+            columns: Vec::new(),
         })
     }
 
@@ -626,14 +628,34 @@ impl Flavor for Mysql {
 
     fn refresh(&mut self, s: &mut Session) {
         self.tables = s.list_tables(s.database.clone(), None).map(|v| names(&v)).unwrap_or_default();
+        self.columns = if s.database.is_some() {
+            s.query_limit(
+                crate::ipc::QuerySpec::Sql {
+                    sql: "SELECT table_name, column_name FROM information_schema.columns \
+                          WHERE table_schema = DATABASE() ORDER BY table_name, ordinal_position"
+                        .into(),
+                },
+                Some(COLUMN_LIMIT),
+            )
+            .map(|v| pairs(&v))
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
     }
 
-    fn words(&self) -> Vec<String> {
+    fn completions(&self) -> Completions {
         let cmds = [
             "quit", "exit", "help", "status", "source", "delimiter", "use", "clear", "connect", "edit", "ego", "go", "nopager",
             "notee", "nowarning", "pager", "print", "prompt", "rehash", "resetconnection", "system", "tee", "warnings", "charset",
         ];
-        SQL_KEYWORDS.iter().chain(cmds.iter()).map(|w| w.to_string()).chain(self.tables.iter().cloned()).collect()
+        Completions {
+            keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
+            commands: cmds.iter().map(|w| w.to_string()).collect(),
+            tables: self.tables.clone(),
+            columns: self.columns.clone(),
+            other: Vec::new(),
+        }
     }
 }
 
