@@ -227,7 +227,6 @@ async fn execute(inner: &mut Inner, conn: &Connection, q: &QuerySpec, limit: usi
             if kind == Kind::Mysql && sql.trim_start().get(..3).is_some_and(|w| w.eq_ignore_ascii_case("use")) {
                 inner.database = c.scalar("SELECT DATABASE()").await?.as_str().map(str::to_string);
             }
-            extra.insert("in_transaction".into(), json!(c.in_transaction()));
             out
         }
         (Pinned::Mongo, Backend::Mongo(m), QuerySpec::Mongo(mq)) => {

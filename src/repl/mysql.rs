@@ -163,7 +163,9 @@ impl Flavor for Mysql {
     }
 
     fn error(&self, e: &anyhow::Error) -> String {
-        format!("ERROR: {}", error_text(e))
+        let t = error_text(e);
+        // Server errors carry their code: `ERROR 1146 (42S02): Table ...`.
+        if t.starts_with(|c: char| c.is_ascii_digit()) { format!("ERROR {t}") } else { format!("ERROR: {t}") }
     }
 
     fn refresh(&mut self, s: &mut Session) {

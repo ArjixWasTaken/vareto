@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use super::session::Session;
+use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Open, SqlBuf};
 use super::table::{self, QueryResult, Style};
 use super::{elapsed, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
@@ -415,7 +415,11 @@ impl Flavor for Psql {
 
     fn prompt(&self, s: &Session) -> String {
         let db = s.database.as_deref().unwrap_or("");
-        let tx = if s.in_transaction { "*" } else { "" };
+        let tx = match s.tx {
+            Tx::Idle => "",
+            Tx::Active => "*",
+            Tx::Failed => "!",
+        };
         match self.buf.open() {
             None => format!("{db}={tx}> "),
             Some(Open::Statement) => format!("{db}-{tx}> "),

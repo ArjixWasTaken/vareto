@@ -1,6 +1,7 @@
 //! `vareto shell`: an interactive shell that behaves like each database's own
 //! client (mysql, psql, sqlite3, redis-cli, mongosh), on a pinned daemon session.
 
+mod mongo;
 mod mysql;
 mod psql;
 mod redis;
@@ -127,7 +128,7 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<bool> {
             Kind::Postgres => Box::new(psql::Psql::new()),
             Kind::Redis => Box::new(redis::Redis::new()),
             Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
-            other => anyhow::bail!("no shell for {} connections yet", other.as_str()),
+            Kind::Mongodb => Box::new(mongo::Mongo::new()?),
         };
         let ok = if let Some(cmds) = &opts.execute {
             script(f.as_mut(), &mut s, cmds)

@@ -258,6 +258,7 @@ impl SqlPool {
         tokio::time::timeout(timeout + Duration::from_secs(5), fut)
             .await
             .map_err(|_| anyhow::anyhow!("query timed out after {}s", timeout.as_secs()))?
+            .map_err(server_message)
     }
 
     /// A dedicated connection taken out of the pool (for an interactive session).
@@ -443,6 +444,17 @@ async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn S
     }
 }
 
+/// A database error as the server words it, without sqlx's wrapper (and without
+/// Postgres's `at line N`, which is a line in the server's own C source).
+/// MySQL keeps its code: `1146 (42S02): Table 'x' doesn't exist`.
+fn server_message(e: anyhow::Error) -> anyhow::Error {
+    let Some(sqlx::Error::Database(d)) = e.downcast_ref::<sqlx::Error>() else { return e };
+    match d.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+        Some(pg) => anyhow::anyhow!("{}", pg.message()),
+        None => anyhow::anyhow!("{d}"),
+    }
+}
+
 async fn sqlite_stream(c: &mut sqlx::SqliteConnection, sql: &str, sink: &mut dyn Sink) -> Result<()> {
     drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, |r: &sqlx::sqlite::SqliteQueryResult| r.rows_affected()).await
 }
@@ -475,12 +487,13 @@ impl SqlConn {
     /// Run user SQL on this connection. `readonly` wraps it in a READ ONLY
     /// transaction that is rolled back.
     pub async fn stream(&mut self, sql: &str, sink: &mut dyn Sink, readonly: bool) -> Result<()> {
-        match self {
+        let res = match self {
             SqlConn::Postgres(c) => pg_stream(c, sql, sink, readonly, None).await,
             SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None).await,
             // Read-only connections open the file read-only.
             SqlConn::Sqlite(c) => sqlite_stream(c, sql, sink).await,
-        }
+        };
+        res.map_err(server_message)
     }
 
     pub async fn run(&mut self, sql: &str, limit: usize, readonly: bool) -> Result<Output> {
@@ -494,15 +507,6 @@ impl SqlConn {
         match self.run(sql, 1, false).await? {
             Output::Table { rows, .. } => Ok(rows.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null)),
             _ => Ok(Value::Null),
-        }
-    }
-
-    pub fn in_transaction(&self) -> bool {
-        use sqlx::Connection as _;
-        match self {
-            SqlConn::Postgres(c) => c.is_in_transaction(),
-            SqlConn::Mysql(c) => c.is_in_transaction(),
-            SqlConn::Sqlite(c) => c.is_in_transaction(),
         }
     }
 

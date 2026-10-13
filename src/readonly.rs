@@ -8,7 +8,17 @@ use crate::ipc::{MongoOp, MongoQuery};
 
 // ---------------------------------------------------------------- MongoDB
 
+/// Informational commands a read-only connection may run.
+const MONGO_READ_COMMANDS: &[&str] = &[
+    "listIndexes", "listCollections", "listDatabases", "collStats", "dbStats", "dataSize", "buildInfo",
+    "buildinfo", "hello", "isMaster", "ismaster", "ping", "serverStatus", "usersInfo", "rolesInfo",
+    "connectionStatus", "hostInfo", "count", "distinct",
+];
+
 pub fn check_mongo(q: &MongoQuery) -> Result<()> {
+    if q.op == MongoOp::RunCommand {
+        return check_mongo_command(q.command.as_ref().unwrap_or(&Value::Null));
+    }
     if !q.op.is_read() {
         bail!("read-only connection: {:?} is a write operation", q.op);
     }
@@ -18,6 +28,23 @@ pub fn check_mongo(q: &MongoQuery) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn check_mongo_command(cmd: &Value) -> Result<()> {
+    let Some((name, arg)) = cmd.as_object().and_then(|m| m.iter().next()) else { bail!("command must be a non-empty document") };
+    match name.as_str() {
+        n if MONGO_READ_COMMANDS.contains(&n) => Ok(()),
+        // explain runs (the plan of) its inner command, which must itself be a read.
+        "explain" => match arg.as_object().and_then(|m| m.keys().next()).map(String::as_str) {
+            Some("find" | "count" | "distinct") => Ok(()),
+            Some("aggregate") => match arg.get("pipeline").and_then(Value::as_array).into_iter().flatten().find_map(find_write_stage) {
+                Some(stage) => bail!("read-only connection: aggregation stage {stage} writes data"),
+                None => Ok(()),
+            },
+            _ => bail!("read-only connection: only find/aggregate/count/distinct can be explained"),
+        },
+        n => bail!("read-only connection: command {n} is not on the read-only allowlist"),
+    }
 }
 
 /// Find `$out`/`$merge` anywhere (including `$facet`, `$lookup.pipeline`, `$unionWith`).
@@ -380,6 +407,9 @@ mod tests {
             field: None,
             documents: None,
             update: None,
+            limit: None,
+            upsert: None,
+            command: None,
         }
     }
 
@@ -398,6 +428,14 @@ mod tests {
         assert!(check_mongo(&mq(MongoOp::Aggregate, Some(vec![json!({"$out": "x"})]))).is_err());
         let nested = json!({"$facet": {"a": [{"$merge": {"into": "x"}}]}});
         assert!(check_mongo(&mq(MongoOp::Aggregate, Some(vec![nested]))).is_err());
+        assert!(check_mongo(&mq(MongoOp::ReplaceOne, None)).is_err());
+        let cmd = |c: Value| MongoQuery { command: Some(c), ..mq(MongoOp::RunCommand, None) };
+        assert!(check_mongo(&cmd(json!({"listIndexes": "c"}))).is_ok());
+        assert!(check_mongo(&cmd(json!({"explain": {"find": "c", "filter": {}}}))).is_ok());
+        assert!(check_mongo(&cmd(json!({"explain": {"aggregate": "c", "pipeline": [{"$out": "x"}]}}))).is_err());
+        assert!(check_mongo(&cmd(json!({"explain": {"delete": "c"}}))).is_err());
+        assert!(check_mongo(&cmd(json!({"drop": "c"}))).is_err());
+        assert!(check_mongo(&cmd(json!({"createIndexes": "c"}))).is_err());
     }
 
     #[test]

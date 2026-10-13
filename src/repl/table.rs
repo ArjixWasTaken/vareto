@@ -6,8 +6,8 @@ use serde_json::Value;
 /// A query response from the daemon (the shape of `Output::to_json`).
 pub enum QueryResult {
     Table { columns: Vec<String>, rows: Vec<Vec<Value>>, truncated: bool },
-    Docs { docs: Vec<Value>, truncated: bool },
-    Affected { rows: u64, detail: Option<Value> },
+    Docs { docs: Vec<Value> },
+    Affected { rows: u64 },
     Value(Value),
 }
 
@@ -22,9 +22,9 @@ impl QueryResult {
                 .unwrap_or_default();
             QueryResult::Table { columns, rows, truncated }
         } else if let Some(docs) = v["documents"].as_array() {
-            QueryResult::Docs { docs: docs.clone(), truncated }
+            QueryResult::Docs { docs: docs.clone() }
         } else if let Some(n) = v["affected_rows"].as_u64() {
-            QueryResult::Affected { rows: n, detail: v.get("detail").cloned() }
+            QueryResult::Affected { rows: n }
         } else {
             QueryResult::Value(v["result"].clone())
         }

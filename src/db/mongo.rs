@@ -59,6 +59,33 @@ fn opt_doc(v: &Option<Value>, what: &str) -> Result<Document> {
     v.as_ref().map(|v| to_doc(v, what)).transpose().map(Option::unwrap_or_default)
 }
 
+/// The server's own message for driver errors that would otherwise print as
+/// debug structs (`E11000 duplicate key error ...`).
+fn server_message(e: anyhow::Error) -> anyhow::Error {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    let Some(me) = e.downcast_ref::<mongodb::error::Error>() else { return e };
+    let msg = match &*me.kind {
+        ErrorKind::Write(WriteFailure::WriteError(w)) => w.message.clone(),
+        ErrorKind::Write(WriteFailure::WriteConcernError(w)) => w.message.clone(),
+        ErrorKind::Command(c) => format!("{} ({})", c.message, c.code_name),
+        ErrorKind::InsertMany(im) => match (&im.write_errors, &im.write_concern_error) {
+            (Some(errs), _) if !errs.is_empty() => errs.iter().map(|w| w.message.clone()).collect::<Vec<_>>().join("; "),
+            (_, Some(w)) => w.message.clone(),
+            _ => return e,
+        },
+        _ => return e,
+    };
+    anyhow::anyhow!(msg)
+}
+
+fn update_detail(r: &mongodb::results::UpdateResult) -> Value {
+    let mut v = json!({ "matched": r.matched_count, "modified": r.modified_count });
+    if let Some(id) = &r.upserted_id {
+        v["upserted_id"] = id.clone().into_relaxed_extjson();
+    }
+    v
+}
+
 fn to_json(d: Document) -> Value {
     Bson::Document(d).into_relaxed_extjson()
 }
@@ -100,17 +127,30 @@ impl Mongo {
         tokio::time::timeout(timeout + Duration::from_secs(5), fut)
             .await
             .map_err(|_| anyhow::anyhow!("query timed out after {}s", timeout.as_secs()))?
+            .map_err(server_message)
     }
 
     async fn stream_inner(&self, q: &MongoQuery, limit: Option<usize>, sink: &mut dyn Sink, timeout: Duration) -> Result<()> {
+        if q.op == MongoOp::RunCommand {
+            let cmd = to_doc(q.command.as_ref().context("run_command needs `command`")?, "command")?;
+            let out = self.db(q.database.as_deref())?.run_command(cmd).await?;
+            return sink.value(to_json(out));
+        }
+        if q.collection.is_empty() {
+            bail!("{:?} needs `collection`", q.op);
+        }
         let coll = self.db(q.database.as_deref())?.collection::<Document>(&q.collection);
         let filter = opt_doc(&q.filter, "filter")?;
         match q.op {
             MongoOp::Find => {
                 let mut find = coll.find(filter).max_time(timeout);
-                if let Some(l) = limit {
-                    // One extra so the collector can tell the result was truncated.
-                    find = find.limit((l + 1) as i64);
+                // One extra so the collector can tell the result was truncated.
+                let server_limit = match (limit.map(|l| l as u64 + 1), q.limit.filter(|&l| l > 0)) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if let Some(l) = server_limit {
+                    find = find.limit(l as i64);
                 }
                 if let Some(p) = &q.projection {
                     find = find.projection(to_doc(p, "projection")?);
@@ -166,7 +206,10 @@ impl Mongo {
                     .map(|d| to_doc(d, "document"))
                     .collect::<Result<Vec<_>>>()?;
                 let r = coll.insert_many(docs).await?;
-                sink.affected(r.inserted_ids.len() as u64, None)?
+                let mut ids: Vec<(usize, Bson)> = r.inserted_ids.into_iter().collect();
+                ids.sort_by_key(|(i, _)| *i);
+                let ids: Vec<Value> = ids.into_iter().map(|(_, id)| id.into_relaxed_extjson()).collect();
+                sink.affected(ids.len() as u64, Some(json!({ "inserted_ids": ids })))?
             }
             MongoOp::UpdateOne | MongoOp::UpdateMany => {
                 let update = q.update.as_ref().context("update needs `update`")?;
@@ -176,13 +219,20 @@ impl Mongo {
                     ),
                     v => mongodb::options::UpdateModifications::Document(to_doc(v, "update")?),
                 };
+                let upsert = q.upsert.unwrap_or(false);
                 let r = if q.op == MongoOp::UpdateOne {
-                    coll.update_one(filter, update).await?
+                    coll.update_one(filter, update).upsert(upsert).await?
                 } else {
-                    coll.update_many(filter, update).await?
+                    coll.update_many(filter, update).upsert(upsert).await?
                 };
-                sink.affected(r.modified_count, Some(json!({ "matched": r.matched_count, "modified": r.modified_count })))?
+                sink.affected(r.modified_count, Some(update_detail(&r)))?
             }
+            MongoOp::ReplaceOne => {
+                let d = q.documents.as_ref().and_then(|d| d.first()).context("replace_one needs `documents` (the replacement)")?;
+                let r = coll.replace_one(filter, to_doc(d, "replacement")?).upsert(q.upsert.unwrap_or(false)).await?;
+                sink.affected(r.modified_count, Some(update_detail(&r)))?
+            }
+            MongoOp::RunCommand => unreachable!("handled above"),
             MongoOp::DeleteOne => sink.affected(coll.delete_one(filter).await?.deleted_count, None)?,
             MongoOp::DeleteMany => sink.affected(coll.delete_many(filter).await?.deleted_count, None)?,
         }

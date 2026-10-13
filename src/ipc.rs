@@ -106,8 +106,12 @@ pub enum MongoOp {
     InsertMany,
     UpdateOne,
     UpdateMany,
+    ReplaceOne,
     DeleteOne,
     DeleteMany,
+    /// A database command (`command`), e.g. `{"listIndexes": "users"}`. Read-only
+    /// connections allow only informational commands.
+    RunCommand,
 }
 
 impl MongoOp {
@@ -123,6 +127,8 @@ pub struct MongoQuery {
     /// Database; defaults to the connection's database.
     #[serde(default)]
     pub database: Option<String>,
+    /// Collection (not needed for run_command).
+    #[serde(default)]
     pub collection: String,
     pub op: MongoOp,
     /// Query filter (find, count, distinct, update_*, delete_*).
@@ -137,6 +143,9 @@ pub struct MongoQuery {
     /// Documents to skip (find).
     #[serde(default)]
     pub skip: Option<u64>,
+    /// Cursor limit (find); the response is also capped by the request's `limit`.
+    #[serde(default)]
+    pub limit: Option<u64>,
     /// Aggregation pipeline (aggregate).
     #[serde(default)]
     pub pipeline: Option<Vec<Value>>,
@@ -149,6 +158,12 @@ pub struct MongoQuery {
     /// Update document or pipeline (update_*).
     #[serde(default)]
     pub update: Option<Value>,
+    /// Insert when nothing matches (update_*, replace_one).
+    #[serde(default)]
+    pub upsert: Option<bool>,
+    /// The command document (run_command).
+    #[serde(default)]
+    pub command: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
