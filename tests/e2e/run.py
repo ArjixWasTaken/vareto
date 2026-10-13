@@ -312,6 +312,12 @@ try:
           and " g\n---\n 5\n" in r.stdout and " g\n---\n 6\n" in r.stdout and " r | 1\n---+---\n x | 9" in r.stdout
           and r.stdout.count("(every 0.1s)") == 2 and "Expanded display is on." not in r.stdout and r.stdout.rstrip().endswith("on"),
           r.stdout + r.stderr)
+    r = shell("pg-rw", "\\dt+\n\\d orders_pkey\n\\dx\n\\sf+ pg_catalog.lower(text)\nselect emial from users;\n\\errverbose\n"
+                       "\\set ON_ERROR_ROLLBACK on\nbegin;\nselect nope;\nselect 1 as alive;\nrollback;\n\\d nope\n")
+    check("psql: \\d+ sizes, index layout, \\dx, \\sf+, \\errverbose, ON_ERROR_ROLLBACK", r.returncode == 0
+          and " Size |" in r.stdout and 'primary key, btree, for table "public.orders"' in r.stdout and "plpgsql" in r.stdout
+          and "1       AS $function$lower$function$" in r.stdout and "LOCATION:" in r.stderr
+          and " alive\n-------\n     1" in r.stdout and 'Did not find any relation named "nope".' in r.stderr, r.stdout + r.stderr)
     r = shell("maria-rw", "call two_results();\nselect id, data from users order by id;\nselect * from users where id < 0;\n")
     check("mysql: each result set of a CALL, binary as hex, Empty set", r.returncode == 0
           and "| a |\n+---+\n| 1 |" in r.stdout and "| b | c |" in r.stdout and "Query OK, 0 rows affected" in r.stdout

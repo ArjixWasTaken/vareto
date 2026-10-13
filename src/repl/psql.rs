@@ -6,11 +6,12 @@ use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
 use super::out::{self, outln};
+use super::psql_catalog::{self as catalog, lit, Listing, Mods};
 use super::psql_print::{crosstab, PrintOpts};
 use super::psql_vars::{bool_value, interpolate, split_args, split_meta, Vars};
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Mode, Open, SqlBuf};
-use super::table::{self, QueryResult, Style};
+use super::table::{self, QueryResult};
 use super::{elapsed, error_info, error_text, names, read_script, run_script, Flavor, Flow, SQL_KEYWORDS};
 
 /// One level of `\if`.
@@ -35,6 +36,9 @@ pub struct Psql {
     cond: Vec<Cond>,
     superuser: bool,
     interactive: bool,
+    /// The last error and the statement it came from (`\errverbose`).
+    last_error: Option<(Value, String)>,
+    warned_readonly_tx: bool,
     /// Directories of the scripts being run, innermost last (for `\ir`).
     script_dirs: Vec<std::path::PathBuf>,
     tables: Vec<String>,
@@ -76,17 +80,56 @@ Conditional
   \\endif                 end conditional block
 
 Informational
+  (options: S = show system objects, + = additional detail, x = expanded output)
   \\d[S+]                 list tables, views, and sequences
-  \\d NAME                describe table, view, sequence, or index
-  \\df [PATTERN]          list functions
-  \\di [PATTERN]          list indexes
-  \\dm [PATTERN]          list materialized views
-  \\dn [PATTERN]          list schemas
-  \\ds [PATTERN]          list sequences
-  \\dt [PATTERN]          list tables
-  \\du [PATTERN]          list roles
-  \\dv [PATTERN]          list views
-  \\l [PATTERN]           list databases
+  \\d[S+]  NAME           describe table, view, sequence, or index
+  \\da[S]  [PATTERN]      list aggregates
+  \\dA[+]  [PATTERN]      list access methods
+  \\dAc / \\dAf / \\dAo / \\dAp [AMPTRN [...]]  list operator classes, families, operators, support functions
+  \\db[+]  [PATTERN]      list tablespaces
+  \\dc[S+] [PATTERN]      list conversions
+  \\dconfig[+] [PATTERN]  list configuration parameters
+  \\dC[+]  [PATTERN]      list casts
+  \\dd[S]  [PATTERN]      show object descriptions not displayed elsewhere
+  \\dD[S+] [PATTERN]      list domains
+  \\ddp    [PATTERN]      list default privileges
+  \\dE[S+] [PATTERN]      list foreign tables
+  \\des[+] [PATTERN]      list foreign servers
+  \\det[+] [PATTERN]      list foreign tables
+  \\deu[+] [PATTERN]      list user mappings
+  \\dew[+] [PATTERN]      list foreign-data wrappers
+  \\df[anptw][S+] [PATTERN]  list [only agg/normal/procedure/trigger/window] functions
+  \\dF[+]  [PATTERN]      list text search configurations
+  \\dFd[+] / \\dFp[+] / \\dFt[+] [PATTERN]  list text search dictionaries, parsers, templates
+  \\dg[S+] [PATTERN]      list roles
+  \\di[S+] [PATTERN]      list indexes
+  \\dl[+]                 list large objects, same as \\lo_list
+  \\dL[S+] [PATTERN]      list procedural languages
+  \\dm[S+] [PATTERN]      list materialized views
+  \\dn[S+] [PATTERN]      list schemas
+  \\do[S+] [OPPTRN [TYPEPTRN [TYPEPTRN]]]  list operators
+  \\dO[S+] [PATTERN]      list collations
+  \\dp[S]  [PATTERN]      list table, view, and sequence access privileges
+  \\dP[itn+] [PATTERN]    list [only index/table] partitioned relations [n=nested]
+  \\drds [ROLEPTRN [DBPTRN]] list per-database role settings
+  \\drg[S] [PATTERN]      list role grants
+  \\dRp[+] [PATTERN]      list replication publications
+  \\dRs[+] [PATTERN]      list replication subscriptions
+  \\ds[S+] [PATTERN]      list sequences
+  \\dt[S+] [PATTERN]      list tables
+  \\dT[S+] [PATTERN]      list data types
+  \\du[S+] [PATTERN]      list roles
+  \\dv[S+] [PATTERN]      list views
+  \\dx[+]  [PATTERN]      list extensions
+  \\dX     [PATTERN]      list extended statistics
+  \\dy[+]  [PATTERN]      list event triggers
+  \\l[+]   [PATTERN]      list databases
+  \\sf[+]  FUNCNAME       show a function's definition
+  \\sv[+]  VIEWNAME       show a view's definition
+  \\z[S]   [PATTERN]      same as \\dp
+  \\ef [FUNCNAME]         edit function definition with external editor
+  \\ev [VIEWNAME]         edit view definition with external editor
+  \\errverbose            show most recent error message at maximum verbosity
 
 Formatting
   \\a                     toggle between unaligned and aligned output mode
@@ -115,35 +158,6 @@ Variables
   \\prompt [TEXT] NAME    prompt user to set internal variable
   \\set [NAME [VALUE]]    set internal variable, or list all if no parameters
   \\unset NAME            unset (delete) internal variable";
-
-/// A string literal (standard_conforming_strings: backslashes are literal).
-fn quote_lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// A psql-style pattern (`*`, `?`, optional `schema.`) as SQL conditions on the
-/// given schema and name columns.
-fn pattern_sql(pattern: &str, schema_col: &str, name_col: &str, visible: &str) -> String {
-    let re = |p: &str| format!("^({})$", regex::escape(p).replace("\\*", ".*").replace("\\?", "."));
-    match pattern.split_once('.') {
-        Some((sc, name)) => format!("{schema_col} ~ {} AND {name_col} ~ {}", quote_lit(&re(sc)), quote_lit(&re(name))),
-        None if pattern.is_empty() => visible.to_string(),
-        None => format!("{name_col} ~ {} AND {visible}", quote_lit(&re(pattern))),
-    }
-}
-
-fn relkinds(cmd: &str) -> Option<(&'static str, &'static str)> {
-    // (relkinds, what psql calls them when none are found)
-    Some(match cmd {
-        "" => ("'r','p','v','m','S','f'", "relations"),
-        "t" => ("'r','p'", "tables"),
-        "v" => ("'v'", "views"),
-        "m" => ("'m'", "materialized views"),
-        "i" => ("'i','I'", "indexes"),
-        "s" => ("'S'", "sequences"),
-        _ => return None,
-    })
-}
 
 /// A server error the way psql prints it: severity and message, the statement
 /// line with a caret under the error position, then DETAIL / HINT / CONTEXT.
@@ -187,13 +201,32 @@ fn command_tag(sql: &str, rows: u64) -> String {
     match first {
         "INSERT" => format!("INSERT 0 {rows}"),
         "UPDATE" | "DELETE" | "MERGE" | "COPY" | "MOVE" | "FETCH" | "SELECT" => format!("{first} {rows}"),
+        // CREATE TABLE … AS and materialized views report the rows they stored.
+        "CREATE" if sql.to_uppercase().split_whitespace().nth(1) == Some("MATERIALIZED")
+            || (sql.to_uppercase().contains(" AS ") && sql.to_uppercase().split_whitespace().any(|w| w == "TABLE")
+                && !sql.to_uppercase().contains("FUNCTION") && !sql.to_uppercase().contains("PROCEDURE")) =>
+        {
+            format!("SELECT {rows}")
+        }
         "CREATE" | "DROP" | "ALTER" => {
-            let second = words.get(1).map(String::as_str).unwrap_or("");
-            match second {
-                "UNIQUE" => format!("{first} INDEX"),
-                "OR" | "TEMP" | "TEMPORARY" | "UNLOGGED" => format!("{first} TABLE"),
-                _ => format!("{first} {second}"),
-            }
+            let upper = sql.to_uppercase();
+            let mut rest = upper.split_whitespace().skip(1).peekable();
+            // CREATE OR REPLACE VIEW → CREATE VIEW; CREATE TEMP TABLE → CREATE TABLE.
+            while rest.next_if(|w| matches!(*w, "OR" | "REPLACE" | "TEMP" | "TEMPORARY" | "UNLOGGED" | "GLOBAL" | "LOCAL" | "RECURSIVE" | "TRUSTED" | "PROCEDURAL")).is_some() {}
+            let words: Vec<&str> = rest.collect();
+            let w = |i: usize| words.get(i).copied().unwrap_or_default();
+            // Object types of more than one word keep them all.
+            let object = match w(0) {
+                "UNIQUE" => "INDEX".to_string(),
+                "DEFAULT" | "CONSTRAINT" => w(1).to_string(),
+                "MATERIALIZED" | "EVENT" | "ACCESS" | "USER" => format!("{} {}", w(0), w(1)),
+                "FOREIGN" if w(1) == "DATA" => format!("FOREIGN DATA {}", w(2)),
+                "FOREIGN" => format!("FOREIGN {}", w(1)),
+                "TEXT" => format!("TEXT SEARCH {}", w(2)),
+                "OPERATOR" if matches!(w(1), "CLASS" | "FAMILY") => format!("OPERATOR {}", w(1)),
+                other => other.to_string(),
+            };
+            format!("{first} {object}")
         }
         "START" => "START TRANSACTION".into(),
         "END" => "COMMIT".into(),
@@ -272,6 +305,8 @@ impl Psql {
             cond: Vec::new(),
             superuser: false,
             interactive,
+            last_error: None,
+            warned_readonly_tx: false,
             script_dirs: Vec::new(),
             tables: Vec::new(),
         };
@@ -333,7 +368,38 @@ impl Psql {
         if self.var("ECHO") == "queries" || (self.var("ECHO") == "all" && self.interactive) {
             outln!("{sql}");
         }
-        match s.sql(sql) {
+        // AUTOCOMMIT off: an implicit BEGIN. ON_ERROR_ROLLBACK: a savepoint around
+        // each statement inside a transaction, so an error doesn't abort it.
+        let autocommit = !matches!(bool_value(self.var("AUTOCOMMIT")), Some(false));
+        let rollback_mode = self.var("ON_ERROR_ROLLBACK").to_ascii_lowercase();
+        let wants_rollback = rollback_mode == "interactive" && self.interactive || bool_value(&rollback_mode) == Some(true);
+        let control = Self::needs_no_begin(sql);
+        if s.readonly && (!autocommit || wants_rollback) {
+            if !self.warned_readonly_tx {
+                eprintln!("(AUTOCOMMIT off / ON_ERROR_ROLLBACK have no effect on a read-only connection)");
+                self.warned_readonly_tx = true;
+            }
+        } else if !autocommit && s.tx == Tx::Idle && !control {
+            s.sql("BEGIN")?;
+        }
+        let savepoint = !s.readonly && wants_rollback && s.tx == Tx::Active && !control;
+        if savepoint {
+            s.sql("SAVEPOINT pg_psql_temporary_savepoint")?;
+        }
+        let res = s.sql(sql);
+        if savepoint {
+            match &res {
+                Ok(_) => {
+                    s.sql("RELEASE pg_psql_temporary_savepoint").ok();
+                }
+                Err(_) => {
+                    if s.sql("ROLLBACK TO pg_psql_temporary_savepoint").is_ok() {
+                        s.tx = Tx::Active;
+                    }
+                }
+            }
+        }
+        match res {
             Ok(v) => {
                 let rows: u64 = QueryResult::from_json(&v)
                     .into_parts()
@@ -359,6 +425,9 @@ impl Psql {
                 self.vars.insert("LAST_ERROR_MESSAGE".into(), msg);
                 if self.var("ECHO") == "errors" {
                     eprintln!("STATEMENT:  {sql}");
+                }
+                if let Some(info) = error_info(&e) {
+                    self.last_error = Some((info.clone(), sql.to_string()));
                 }
                 Err(e)
             }
@@ -426,133 +495,478 @@ impl Psql {
         Ok(Some(s.query_limit(crate::ipc::QuerySpec::Sql { sql: sql.into() }, Some(5000))?))
     }
 
-    /// Run an internal catalog query and print it under `title`.
-    fn listing(&mut self, s: &mut Session, title: &str, sql: &str, none: &str) -> Result<()> {
-        let Some(v) = self.hidden(sql, s)? else { return Ok(()) };
-        if let QueryResult::Table { columns, rows, .. } = QueryResult::from_json(&v) {
-            if rows.is_empty() && !none.is_empty() {
+    /// Rows of an internal catalog query (shown first when ECHO_HIDDEN is set).
+    fn catalog(&mut self, s: &mut Session, sql: &str) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+        let Some(v) = self.hidden(sql, s)? else { return Ok(None) };
+        Ok(Some(match QueryResult::from_json(&v) {
+            QueryResult::Table { columns, rows, .. } => (columns, rows),
+            _ => (Vec::new(), Vec::new()),
+        }))
+    }
+
+    /// Run a catalog listing and print it under its title.
+    fn listing(&mut self, s: &mut Session, l: &Listing, expanded: bool) -> Result<()> {
+        let Some((columns, rows)) = self.catalog(s, &l.sql)? else { return Ok(()) };
+        if rows.is_empty() {
+            if let Some(none) = &l.none {
                 outln!("{none}");
-            } else {
-                let mut opts = self.print.clone();
-                opts.title = Some(title.to_string());
-                self.print_rows(&opts, &columns, &rows, false);
+                return Ok(());
+            }
+        }
+        let mut opts = self.print.clone();
+        opts.title = Some(l.title.clone());
+        self.print_rows(&opts, &columns, &rows, expanded);
+        Ok(())
+    }
+
+    fn server_version_num(&self) -> u32 {
+        self.var("SERVER_VERSION_NUM").parse().unwrap_or(180000)
+    }
+
+    /// `\d PATTERN`: describe each matching relation.
+    fn describe_matching(&mut self, s: &mut Session, pat: &str, m: Mods) -> Result<()> {
+        let sql = format!(
+            "SELECT c.oid FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r','p','v','m','S','f','i','I','c') AND {} ORDER BY n.nspname, c.relname",
+            catalog::pattern(Some(pat), "n.nspname", "c.relname", "pg_catalog.pg_table_is_visible(c.oid)", m),
+        );
+        let Some((_, rows)) = self.catalog(s, &sql)? else { return Ok(()) };
+        if rows.is_empty() {
+            bail!("Did not find any relation named \"{pat}\".");
+        }
+        for r in rows {
+            self.describe(s, &table::cell(&r[0], ""), m)?;
+        }
+        Ok(())
+    }
+
+    /// A section after the columns of `\d` ("Indexes:", "Triggers:", ...).
+    fn section(&mut self, s: &mut Session, title: &str, sql: &str, fmt: &dyn Fn(&[Value]) -> String) -> Result<()> {
+        if let Some((_, rows)) = self.catalog(s, sql)? {
+            if !rows.is_empty() {
+                outln!("{title}:");
+                for r in &rows {
+                    outln!("    {}", fmt(r));
+                }
             }
         }
         Ok(())
     }
 
-    fn list_relations(&mut self, s: &mut Session, kind: &str, pattern: &str) -> Result<()> {
-        let (kinds, what) = relkinds(kind).expect("checked by caller");
-        let index = kind == "i";
-        let sql = format!(
-            "SELECT n.nspname AS \"Schema\", c.relname AS \"Name\", \
-             CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
-             WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' \
-             WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END AS \"Type\", \
-             pg_catalog.pg_get_userbyid(c.relowner) AS \"Owner\"{} \
-             FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace{} \
-             WHERE c.relkind IN ({kinds}) AND n.nspname <> 'pg_catalog' AND n.nspname !~ '^pg_toast' \
-             AND n.nspname <> 'information_schema' AND {} ORDER BY 1, 2",
-            if index { ", c2.relname AS \"Table\"" } else { "" },
-            if index {
-                " LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid"
-            } else {
-                ""
-            },
-            pattern_sql(pattern, "n.nspname", "c.relname", "pg_catalog.pg_table_is_visible(c.oid)"),
-        );
-        let none = if pattern.is_empty() { format!("Did not find any {what}.") } else { format!("Did not find any {what} named \"{pattern}\".") };
-        self.listing(s, "List of relations", &sql, &none)
-    }
-
-    fn describe(&mut self, s: &mut Session, name: &str) -> Result<()> {
-        self.stmt.clear();
-        let reg = format!("{}::regclass", quote_lit(name));
-        let head = s.sql(&format!(
-            "SELECT n.nspname, c.relname, c.relkind::text FROM pg_catalog.pg_class c \
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = {reg}"
-        ))?;
-        let QueryResult::Table { rows, .. } = QueryResult::from_json(&head) else { bail!("Did not find any relation named \"{name}\".") };
-        let Some(row) = rows.first() else { bail!("Did not find any relation named \"{name}\".") };
-        let (schema, rel, kind) = (table::cell(&row[0], ""), table::cell(&row[1], ""), table::cell(&row[2], ""));
-        let what = match kind.as_str() {
-            "v" => "View",
-            "m" => "Materialized view",
-            "i" | "I" => "Index",
-            "S" => "Sequence",
-            "f" => "Foreign table",
-            "p" => "Partitioned table",
-            _ => "Table",
+    /// `\d NAME` for one relation, by OID.
+    fn describe(&mut self, s: &mut Session, oid: &str, m: Mods) -> Result<()> {
+        let ver = self.server_version_num();
+        let am = if ver >= 120000 { "am.amname" } else { "NULL" };
+        let am_join = if ver >= 120000 { "LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam" } else { "" };
+        let Some((_, head)) = self.catalog(
+            s,
+            &format!(
+                "SELECT n.nspname, c.relname, c.relkind::text, c.relpersistence::text, c.relrowsecurity, c.relforcerowsecurity, \
+                 {}, {am}, pg_catalog.array_to_string(c.reloptions, ', ') \
+                 FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace {am_join} WHERE c.oid = {oid}",
+                if ver >= 100000 { "c.relispartition" } else { "false" },
+            ),
+        )?
+        else {
+            return Ok(());
         };
-        let cols = s.sql(&format!(
-            "SELECT a.attname AS \"Column\", pg_catalog.format_type(a.atttypid, a.atttypmod) AS \"Type\", \
-             (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t \
-              WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS \"Collation\", \
-             CASE WHEN a.attnotnull THEN 'not null' ELSE '' END AS \"Nullable\", \
-             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS \"Default\" \
-             FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-             WHERE a.attrelid = {reg} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
-        ))?;
-        let QueryResult::Table { columns, rows, .. } = QueryResult::from_json(&cols) else { return Ok(()) };
-        let t = table::table(&columns, &rows, Style::Psql, true, &table::psql_cell);
-        let w = t.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-        outln!("{}", format!("{:^w$}", format!("{what} \"{schema}.{rel}\"")).trim_end());
-        outln!("{t}");
+        let Some(h) = head.first() else { bail!("Did not find any relation with OID {oid}.") };
+        let txt = |i: usize| table::cell(&h[i], "");
+        let (schema, rel, kind, persistence) = (txt(0), txt(1), txt(2), txt(3));
+        let (rls, forced, is_partition) = (h[4] == Value::Bool(true), h[5] == Value::Bool(true), h[6] == Value::Bool(true));
+        let (access_method, options) = (txt(7), txt(8));
+        let unlogged = if persistence == "u" { "Unlogged " } else { "" };
+        let what = match kind.as_str() {
+            "v" => "View".to_string(),
+            "m" => format!("{unlogged}Materialized view"),
+            "i" => format!("{unlogged}Index"),
+            "I" => format!("{unlogged}Partitioned index"),
+            "S" => format!("{unlogged}Sequence"),
+            "f" => "Foreign table".into(),
+            "p" => format!("{unlogged}Partitioned table"),
+            "c" => "Composite type".into(),
+            _ => if unlogged.is_empty() { "Table".into() } else { "Unlogged table".into() },
+        };
+        let title = format!("{what} \"{schema}.{rel}\"");
+        let mut opts = self.print.clone();
+        opts.footer = false;
+        opts.title = Some(title);
 
-        let section = |s: &mut Session, title: &str, sql: String, fmt: &dyn Fn(&[Value]) -> String| -> Result<()> {
-            if let QueryResult::Table { rows, .. } = QueryResult::from_json(&s.sql(&sql)?) {
-                if !rows.is_empty() {
-                    outln!("{title}:");
-                    for r in &rows {
-                        outln!("    {}", fmt(r));
+        if kind == "S" {
+            if let Some((cols, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT pg_catalog.format_type(seqtypid, NULL) AS \"Type\", seqstart AS \"Start\", seqmin AS \"Minimum\", \
+                     seqmax AS \"Maximum\", seqincrement AS \"Increment\", CASE WHEN seqcycle THEN 'yes' ELSE 'no' END AS \"Cycles?\", \
+                     seqcache AS \"Cache\" FROM pg_catalog.pg_sequence WHERE seqrelid = {oid}"
+                ),
+            )? {
+                outln!("{}", opts.render(&cols, &rows, m.expanded, out::width()));
+            }
+            let owned = format!(
+                "SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) || '.' || pg_catalog.quote_ident(a.attname), d.deptype::text \
+                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_depend d ON c.oid = d.refobjid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid \
+                 WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+                 AND d.objid = {oid} AND d.deptype IN ('a', 'i')"
+            );
+            if let Some((_, rows)) = self.catalog(s, &owned)? {
+                for r in rows {
+                    let col = table::cell(&r[0], "");
+                    if table::cell(&r[1], "") == "i" {
+                        outln!("Sequence for identity column: {col}");
+                    } else {
+                        outln!("Owned by: {col}");
                     }
                 }
             }
-            Ok(())
-        };
-        section(
-            s,
-            "Indexes",
-            format!(
-                "SELECT c2.relname, i.indisprimary, i.indisunique, pg_catalog.pg_get_indexdef(i.indexrelid) \
-                 FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid \
-                 WHERE i.indrelid = {reg} ORDER BY i.indisprimary DESC, c2.relname"
-            ),
-            &|r| {
-                let def = table::cell(&r[3], "");
-                let using = def.split_once(" USING ").map(|(_, u)| u.to_string()).unwrap_or(def);
-                let kind = if r[1] == Value::Bool(true) {
-                    "PRIMARY KEY, "
-                } else if r[2] == Value::Bool(true) {
-                    "UNIQUE, "
-                } else {
-                    ""
-                };
-                format!("\"{}\" {kind}{using}", table::cell(&r[0], ""))
-            },
-        )?;
-        for (title, kind) in [("Check constraints", "c"), ("Foreign-key constraints", "f")] {
-            section(
+            outln!();
+            return Ok(());
+        }
+
+        if kind == "i" || kind == "I" {
+            if let Some((cols, rows)) = self.catalog(
                 s,
-                title,
-                format!(
-                    "SELECT conname, pg_catalog.pg_get_constraintdef(oid, true) FROM pg_catalog.pg_constraint \
-                     WHERE conrelid = {reg} AND contype = '{kind}' ORDER BY 1"
+                &format!(
+                    "SELECT a.attname AS \"Column\", pg_catalog.format_type(a.atttypid, a.atttypmod) AS \"Type\", \
+                     CASE WHEN a.attnum <= (SELECT i.indnkeyatts FROM pg_catalog.pg_index i WHERE i.indexrelid = {oid}) THEN 'yes' ELSE 'no' END AS \"Key?\", \
+                     pg_catalog.pg_get_indexdef(a.attrelid, a.attnum, true) AS \"Definition\"{} \
+                     FROM pg_catalog.pg_attribute a WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    if m.verbose {
+                        ", CASE a.attstorage WHEN 'p' THEN 'plain' WHEN 'm' THEN 'main' WHEN 'x' THEN 'extended' WHEN 'e' THEN 'external' END AS \"Storage\""
+                    } else {
+                        ""
+                    },
                 ),
-                &|r| format!("\"{}\" {}", table::cell(&r[0], ""), table::cell(&r[1], "")),
+            )? {
+                outln!("{}", opts.render(&cols, &rows, m.expanded, out::width()));
+            }
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT i.indisprimary, i.indisunique, am.amname, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c2.relname), \
+                     pg_catalog.pg_get_expr(i.indpred, i.indrelid, true), i.indisvalid \
+                     FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid JOIN pg_catalog.pg_am am ON am.oid = c.relam \
+                     JOIN pg_catalog.pg_class c2 ON c2.oid = i.indrelid JOIN pg_catalog.pg_namespace n ON n.oid = c2.relnamespace \
+                     WHERE i.indexrelid = {oid}"
+                ),
+            )? {
+                if let Some(r) = rows.first() {
+                    let mut f = String::new();
+                    if r[0] == Value::Bool(true) {
+                        f.push_str("primary key, ");
+                    } else if r[1] == Value::Bool(true) {
+                        f.push_str("unique, ");
+                    }
+                    f.push_str(&format!("{}, for table \"{}\"", table::cell(&r[2], ""), table::cell(&r[3], "").replace('"', "")));
+                    if !r[4].is_null() {
+                        f.push_str(&format!(", predicate ({})", table::cell(&r[4], "")));
+                    }
+                    if r[5] == Value::Bool(false) {
+                        f.push_str(", invalid");
+                    }
+                    outln!("{f}");
+                }
+            }
+            outln!();
+            return Ok(());
+        }
+
+        // Tables, views, materialized views, foreign tables, composite types.
+        let default = if ver >= 120000 {
+            "CASE WHEN a.attidentity = 'a' THEN 'generated always as identity' \
+             WHEN a.attidentity = 'd' THEN 'generated by default as identity' \
+             WHEN a.attgenerated = 's' THEN 'generated always as (' || pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) || ') stored' \
+             ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) END"
+        } else {
+            "pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)"
+        };
+        let mut extra = String::new();
+        if m.verbose {
+            extra.push_str(", CASE a.attstorage WHEN 'p' THEN 'plain' WHEN 'm' THEN 'main' WHEN 'x' THEN 'extended' WHEN 'e' THEN 'external' END AS \"Storage\"");
+            if ver >= 140000 && matches!(kind.as_str(), "r" | "p" | "m") {
+                extra.push_str(", CASE a.attcompression WHEN 'p' THEN 'pglz' WHEN 'l' THEN 'lz4' END AS \"Compression\"");
+            }
+            if matches!(kind.as_str(), "r" | "p" | "m" | "f") {
+                extra.push_str(", NULLIF(a.attstattarget, -1) AS \"Stats target\"");
+            }
+            extra.push_str(", pg_catalog.col_description(a.attrelid, a.attnum) AS \"Description\"");
+        }
+        if let Some((cols, rows)) = self.catalog(
+            s,
+            &format!(
+                "SELECT a.attname AS \"Column\", pg_catalog.format_type(a.atttypid, a.atttypmod) AS \"Type\", \
+                 (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t \
+                  WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS \"Collation\", \
+                 CASE WHEN a.attnotnull THEN 'not null' ELSE '' END AS \"Nullable\", {default} AS \"Default\"{extra} \
+                 FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+            ),
+        )? {
+            outln!("{}", opts.render(&cols, &rows, m.expanded, out::width()));
+        }
+
+        if is_partition {
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT inhparent::pg_catalog.regclass::pg_catalog.text || ' ' || pg_catalog.pg_get_expr(c.relpartbound, c.oid), \
+                     pg_catalog.pg_get_partition_constraintdef(c.oid) \
+                     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_inherits i ON c.oid = i.inhrelid WHERE c.oid = {oid}"
+                ),
+            )? {
+                if let Some(r) = rows.first() {
+                    outln!("Partition of: {}", table::cell(&r[0], ""));
+                    if m.verbose && !r[1].is_null() {
+                        outln!("Partition constraint: {}", table::cell(&r[1], ""));
+                    }
+                }
+            }
+        }
+        if kind == "p" {
+            if let Some((_, rows)) = self.catalog(s, &format!("SELECT pg_catalog.pg_get_partkeydef({oid})"))? {
+                if let Some(r) = rows.first() {
+                    outln!("Partition key: {}", table::cell(&r[0], ""));
+                }
+            }
+        }
+        if kind == "f" {
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT s.srvname, pg_catalog.array_to_string(ft.ftoptions, ', ') FROM pg_catalog.pg_foreign_table ft \
+                     JOIN pg_catalog.pg_foreign_server s ON s.oid = ft.ftserver WHERE ft.ftrelid = {oid}"
+                ),
+            )? {
+                if let Some(r) = rows.first() {
+                    outln!("Server: {}", table::cell(&r[0], ""));
+                    if !r[1].is_null() && table::cell(&r[1], "") != "" {
+                        outln!("FDW options: ({})", table::cell(&r[1], ""));
+                    }
+                }
+            }
+        }
+        if matches!(kind.as_str(), "r" | "p" | "m") {
+            self.section(
+                s,
+                "Indexes",
+                &format!(
+                    "SELECT c2.relname, i.indisprimary, i.indisunique, pg_catalog.pg_get_indexdef(i.indexrelid, 0, true), \
+                     con.contype::text, i.indisvalid, i.indisclustered \
+                     FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid \
+                     LEFT JOIN pg_catalog.pg_constraint con ON con.conrelid = i.indrelid AND con.conindid = i.indexrelid AND con.contype IN ('p','u','x') \
+                     WHERE i.indrelid = {oid} ORDER BY i.indisprimary DESC, c2.relname"
+                ),
+                &|r| {
+                    let def = table::cell(&r[3], "");
+                    let using = def.split_once(" USING ").map(|(_, u)| u.to_string()).unwrap_or(def);
+                    let kind = match (r[1] == Value::Bool(true), r[2] == Value::Bool(true), table::cell(&r[4], "").as_str()) {
+                        (true, _, _) => "PRIMARY KEY, ",
+                        (_, true, "u") => "UNIQUE CONSTRAINT, ",
+                        (_, true, _) => "UNIQUE, ",
+                        (_, _, "x") => "EXCLUDE CONSTRAINT, ",
+                        _ => "",
+                    };
+                    let mut line = format!("\"{}\" {kind}{using}", table::cell(&r[0], ""));
+                    if r[6] == Value::Bool(true) {
+                        line.push_str(" CLUSTER");
+                    }
+                    if r[5] == Value::Bool(false) {
+                        line.push_str(" INVALID");
+                    }
+                    line
+                },
             )?;
         }
-        section(
-            s,
-            "Referenced by",
-            format!(
-                "SELECT conrelid::regclass::text, conname, pg_catalog.pg_get_constraintdef(oid, true) \
-                 FROM pg_catalog.pg_constraint WHERE confrelid = {reg} AND contype = 'f' ORDER BY 1, 2"
-            ),
-            &|r| format!("TABLE \"{}\" CONSTRAINT \"{}\" {}", table::cell(&r[0], ""), table::cell(&r[1], ""), table::cell(&r[2], "")),
-        )?;
+        if matches!(kind.as_str(), "r" | "p" | "f") {
+            for (title, contype) in [("Check constraints", "c"), ("Foreign-key constraints", "f")] {
+                self.section(
+                    s,
+                    title,
+                    &format!(
+                        "SELECT conname, pg_catalog.pg_get_constraintdef(oid, true) FROM pg_catalog.pg_constraint \
+                         WHERE conrelid = {oid} AND contype = '{contype}' ORDER BY 1"
+                    ),
+                    &|r| format!("\"{}\" {}", table::cell(&r[0], ""), table::cell(&r[1], "")),
+                )?;
+            }
+            self.section(
+                s,
+                "Referenced by",
+                &format!(
+                    "SELECT conrelid::pg_catalog.regclass::pg_catalog.text, conname, pg_catalog.pg_get_constraintdef(oid, true) \
+                     FROM pg_catalog.pg_constraint WHERE confrelid = {oid} AND contype = 'f' ORDER BY 1, 2"
+                ),
+                &|r| format!("TABLE \"{}\" CONSTRAINT \"{}\" {}", table::cell(&r[0], ""), table::cell(&r[1], ""), table::cell(&r[2], "")),
+            )?;
+        }
+        if matches!(kind.as_str(), "r" | "p") {
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT pol.polname, pol.polpermissive, \
+                     CASE WHEN pol.polroles = '{{0}}' THEN NULL ELSE pg_catalog.array_to_string(array(SELECT rolname FROM pg_catalog.pg_roles \
+                      WHERE oid = any (pol.polroles) ORDER BY 1), ',') END, \
+                     pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid), \
+                     CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' END \
+                     FROM pg_catalog.pg_policy pol WHERE pol.polrelid = {oid} ORDER BY 1"
+                ),
+            )? {
+                let header = match (rls, forced) {
+                    (true, true) => Some("Policies (forced row security enabled):"),
+                    (true, false) => Some("Policies:"),
+                    (false, _) if !rows.is_empty() => Some("Policies (row security disabled):"),
+                    _ => None,
+                };
+                if let Some(h) = header {
+                    outln!("{h}");
+                    if rows.is_empty() {
+                        outln!("    (none)");
+                    }
+                    for r in rows {
+                        let mut line = format!("    POLICY \"{}\"", table::cell(&r[0], ""));
+                        if r[1] == Value::Bool(false) {
+                            line.push_str(" AS RESTRICTIVE");
+                        }
+                        if !r[5].is_null() {
+                            line.push_str(&format!(" FOR {}", table::cell(&r[5], "")));
+                        }
+                        if !r[2].is_null() {
+                            line.push_str(&format!("\n      TO {}", table::cell(&r[2], "")));
+                        }
+                        if !r[3].is_null() {
+                            line.push_str(&format!("\n      USING ({})", table::cell(&r[3], "")));
+                        }
+                        if !r[4].is_null() {
+                            line.push_str(&format!("\n      WITH CHECK ({})", table::cell(&r[4], "")));
+                        }
+                        outln!("{line}");
+                    }
+                }
+            }
+        }
+        if matches!(kind.as_str(), "r" | "p" | "v" | "m" | "f") {
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT pg_catalog.pg_get_triggerdef(t.oid, true), t.tgenabled::text FROM pg_catalog.pg_trigger t \
+                     WHERE t.tgrelid = {oid} AND NOT t.tgisinternal ORDER BY t.tgname"
+                ),
+            )? {
+                let def = |r: &Vec<Value>| {
+                    let d = table::cell(&r[0], "");
+                    d.strip_prefix("CREATE CONSTRAINT TRIGGER ").or_else(|| d.strip_prefix("CREATE TRIGGER ")).unwrap_or(&d).to_string()
+                };
+                let (enabled, disabled): (Vec<_>, Vec<_>) = rows.iter().partition(|r| table::cell(&r[1], "") != "D");
+                for (title, list) in [("Triggers", enabled), ("Disabled user triggers", disabled)] {
+                    if !list.is_empty() {
+                        outln!("{title}:");
+                        for r in list {
+                            outln!("    {}", def(r));
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(kind.as_str(), "r" | "p" | "f") && !is_partition {
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT c.oid::pg_catalog.regclass::pg_catalog.text FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_inherits i ON c.oid = i.inhparent WHERE i.inhrelid = {oid} ORDER BY inhseqno"
+                ),
+            )? {
+                let names: Vec<String> = rows.iter().map(|r| table::cell(&r[0], "")).collect();
+                if !names.is_empty() {
+                    outln!("Inherits: {}", names.join(",\n          "));
+                }
+            }
+        }
+        if matches!(kind.as_str(), "r" | "p" | "f") {
+            if let Some((_, rows)) = self.catalog(
+                s,
+                &format!(
+                    "SELECT c.oid::pg_catalog.regclass::pg_catalog.text, pg_catalog.pg_get_expr(c.relpartbound, c.oid) \
+                     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_inherits i ON c.oid = i.inhrelid \
+                     WHERE i.inhparent = {oid} ORDER BY c.oid::pg_catalog.regclass::pg_catalog.text"
+                ),
+            )? {
+                let n = rows.len();
+                let (label, count) = if kind == "p" { ("Partitions", "partitions") } else { ("Child tables", "child tables") };
+                if m.verbose && n > 0 {
+                    let items: Vec<String> = rows
+                        .iter()
+                        .map(|r| if r[1].is_null() { table::cell(&r[0], "") } else { format!("{} {}", table::cell(&r[0], ""), table::cell(&r[1], "")) })
+                        .collect();
+                    outln!("{label}: {}", items.join(&format!(",\n{}", " ".repeat(label.len() + 2))));
+                } else if n > 0 || kind == "p" {
+                    outln!("Number of {count}: {n} (Use \\d+ to list them.)");
+                }
+            }
+        }
+        if matches!(kind.as_str(), "r" | "p") && ver >= 100000 {
+            self.section(
+                s,
+                "Publications",
+                &format!(
+                    "SELECT pubname FROM pg_catalog.pg_publication WHERE puballtables \
+                     UNION SELECT p.pubname FROM pg_catalog.pg_publication p JOIN pg_catalog.pg_publication_rel pr ON pr.prpubid = p.oid \
+                     WHERE pr.prrelid = {oid} ORDER BY 1"
+                ),
+                &|r| format!("\"{}\"", table::cell(&r[0], "")),
+            )?;
+        }
+        if m.verbose {
+            if matches!(kind.as_str(), "v" | "m") {
+                if let Some((_, rows)) = self.catalog(s, &format!("SELECT pg_catalog.pg_get_viewdef({oid}::pg_catalog.oid, true)"))? {
+                    if let Some(r) = rows.first() {
+                        outln!("View definition:\n{}", table::cell(&r[0], ""));
+                    }
+                }
+            }
+            if !access_method.is_empty() && matches!(kind.as_str(), "r" | "m") {
+                outln!("Access method: {access_method}");
+            }
+            if !options.is_empty() {
+                outln!("Options: {options}");
+            }
+        }
         outln!();
         Ok(())
+    }
+
+    /// `\sf` / `\sv`: a function's or view's definition.
+    fn definition(&mut self, s: &mut Session, what: &str, name: &str) -> Result<Option<String>> {
+        let sql = if what == "function" {
+            format!("SELECT pg_catalog.pg_get_functiondef({})", catalog::function_oid(name)?)
+        } else {
+            format!(
+                "SELECT CASE c.relkind WHEN 'm' THEN 'CREATE MATERIALIZED VIEW ' ELSE 'CREATE OR REPLACE VIEW ' END || \
+                 pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) || ' AS' || E'\\n' || \
+                 pg_catalog.rtrim(pg_catalog.pg_get_viewdef(c.oid, true), ';') \
+                 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.oid = {}::pg_catalog.regclass AND c.relkind IN ('v', 'm')",
+                lit(name)
+            )
+        };
+        let Some((_, rows)) = self.catalog(s, &sql)? else { return Ok(None) };
+        match rows.first() {
+            Some(r) => Ok(Some(table::cell(&r[0], ""))),
+            None => bail!("\"{name}\" is not a view"),
+        }
+    }
+
+    /// psql's command_no_begin: statements an implicit BEGIN must not precede.
+    fn needs_no_begin(sql: &str) -> bool {
+        let words: Vec<String> = sql.split_whitespace().take(3).map(|w| w.trim_end_matches(';').to_uppercase()).collect();
+        let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+        matches!(w(0), "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE" | "VACUUM" | "DISCARD")
+            || (w(0) == "PREPARE" && w(1) == "TRANSACTION")
+            || ((w(0) == "COMMIT" || w(0) == "ROLLBACK") && w(1) == "PREPARED")
+            || (matches!(w(0), "CREATE" | "DROP") && matches!(w(1), "DATABASE" | "TABLESPACE"))
+            || (w(0) == "CREATE" && w(1) == "INDEX" && w(2) == "CONCURRENTLY")
+            || (w(0) == "REINDEX" && matches!(w(1), "DATABASE" | "SYSTEM"))
+            || (w(0) == "ALTER" && w(1) == "SYSTEM")
     }
 
     /// Feed text (an edited buffer, a script) through the line handler.
@@ -939,50 +1353,53 @@ impl Psql {
                 s.connection,
                 if s.readonly { ", read-only" } else { "" }
             ),
-            "l" | "list" => {
-                let cond = if arg.is_empty() { "TRUE".into() } else { pattern_sql(arg, "''", "d.datname", "TRUE") };
-                let sql = format!(
-                    "SELECT d.datname AS \"Name\", pg_catalog.pg_get_userbyid(d.datdba) AS \"Owner\", \
-                     pg_catalog.pg_encoding_to_char(d.encoding) AS \"Encoding\", d.datcollate AS \"Collate\", \
-                     d.datctype AS \"Ctype\" FROM pg_catalog.pg_database d WHERE NOT d.datistemplate AND {cond} ORDER BY 1"
-                );
-                self.listing(s, "List of databases", &sql, "")?;
+            "errverbose" => match &self.last_error {
+                None => outln!("There is no previous error."),
+                Some((info, stmt)) => {
+                    let mut t = format_error_with(info, stmt, "verbose", "always");
+                    if let Some(r) = info["routine"].as_str() {
+                        t.push_str(&format!("\nLOCATION:  {r}, {}:{}", info["file"].as_str().unwrap_or(""), info["line"]));
+                    }
+                    out::flush();
+                    eprintln!("{t}");
+                }
+            },
+            "sf" | "sf+" | "sv" | "sv+" => {
+                let what = if cmd.starts_with("sf") { "function" } else { "view" };
+                if let Some(def) = self.definition(s, what, arg.trim())? {
+                    let text = if cmd.ends_with('+') { catalog::number_lines(&def, what == "function") } else { def };
+                    outln!("{}", text.trim_end());
+                }
             }
-            "dn" => {
-                let cond = pattern_sql(arg, "''", "n.nspname", "n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'");
-                let sql = format!(
-                    "SELECT n.nspname AS \"Name\", pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\" \
-                     FROM pg_catalog.pg_namespace n WHERE {cond} ORDER BY 1"
-                );
-                self.listing(s, "List of schemas", &sql, "")?;
+            "ef" | "ev" => {
+                let what = if cmd == "ef" { "function" } else { "view" };
+                let def = if arg.trim().is_empty() {
+                    if what == "function" {
+                        "CREATE FUNCTION ( )\n RETURNS \n LANGUAGE \n -- common options:  IMMUTABLE  STABLE  STRICT  SECURITY DEFINER\nAS $function$\n\n$function$\n".into()
+                    } else {
+                        "CREATE VIEW  AS\n SELECT \n  -- something...\n".into()
+                    }
+                } else {
+                    self.definition(s, what, arg.trim())?.unwrap_or_default()
+                };
+                let text = super::edit::edit_text(&def, "sql")?;
+                self.buf.clear();
+                return self.feed(&text, s);
             }
-            "df" => {
-                let cond = pattern_sql(arg, "n.nspname", "p.proname", "pg_catalog.pg_function_is_visible(p.oid)");
-                let sql = format!(
-                    "SELECT n.nspname AS \"Schema\", p.proname AS \"Name\", \
-                     pg_catalog.pg_get_function_result(p.oid) AS \"Result data type\", \
-                     pg_catalog.pg_get_function_arguments(p.oid) AS \"Argument data types\", \
-                     CASE p.prokind WHEN 'a' THEN 'agg' WHEN 'w' THEN 'window' WHEN 'p' THEN 'proc' ELSE 'func' END AS \"Type\" \
-                     FROM pg_catalog.pg_proc p LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-                     WHERE n.nspname <> 'pg_catalog' AND n.nspname <> 'information_schema' AND {cond} ORDER BY 1, 2, 4"
-                );
-                self.listing(s, "List of functions", &sql, "")?;
-            }
-            "du" | "dg" => {
-                let cond = pattern_sql(arg, "''", "r.rolname", "r.rolname !~ '^pg_'");
-                let sql = format!(
-                    "SELECT r.rolname AS \"Role name\", concat_ws(', ', \
-                     CASE WHEN r.rolsuper THEN 'Superuser' END, CASE WHEN r.rolcreaterole THEN 'Create role' END, \
-                     CASE WHEN r.rolcreatedb THEN 'Create DB' END, CASE WHEN NOT r.rolcanlogin THEN 'Cannot login' END, \
-                     CASE WHEN r.rolreplication THEN 'Replication' END, CASE WHEN r.rolbypassrls THEN 'Bypass RLS' END) AS \"Attributes\" \
-                     FROM pg_catalog.pg_roles r WHERE {cond} ORDER BY 1"
-                );
-                self.listing(s, "List of roles", &sql, "")?;
-            }
-            "d" if !arg.is_empty() && !arg.contains(['*', '?']) => self.describe(s, arg)?,
-            d if d.starts_with('d') && relkinds(d.trim_start_matches('d').trim_end_matches(['S', '+'])).is_some() => {
-                let kind = d.trim_start_matches('d').trim_end_matches(['S', '+']);
-                self.list_relations(s, kind, arg)?;
+            c if c.starts_with('d') || c.starts_with('l') || c == "z" => {
+                let (base, mods) = catalog::parse_mods(c);
+                let ver = self.server_version_num();
+                if base == "d" && !args.is_empty() {
+                    self.describe_matching(s, &args[0], mods)?;
+                } else if base.starts_with('d') && base[1..].chars().all(|c| "tvmisE".contains(c)) {
+                    let l = catalog::relations(&base[1..], first, mods, ver);
+                    self.listing(s, &l, mods.expanded)?;
+                } else if let Some(l) = catalog::listing(base, &args, mods, ver) {
+                    let l = l?;
+                    self.listing(s, &l, mods.expanded)?;
+                } else {
+                    bail!("invalid command \\{c}\nTry \\? for help.");
+                }
             }
             other => bail!("invalid command \\{other}\nTry \\? for help."),
         }
@@ -1184,14 +1601,12 @@ mod tests {
         assert_eq!(command_tag("create table t (a int)", 0), "CREATE TABLE");
         assert_eq!(command_tag("create unique index i on t (a)", 0), "CREATE INDEX");
         assert_eq!(command_tag("begin", 0), "BEGIN");
+        assert_eq!(command_tag("create materialized view m as select 1", 1), "SELECT 1");
+        assert_eq!(command_tag("create table t2 as select * from t", 4), "SELECT 4");
+        assert_eq!(command_tag("create or replace view v as select 1", 0), "CREATE VIEW");
+        assert_eq!(command_tag("drop materialized view mv", 0), "DROP MATERIALIZED VIEW");
+        assert_eq!(command_tag("create text search configuration c (copy = english)", 0), "CREATE TEXT SEARCH CONFIGURATION");
+        assert_eq!(command_tag("create or replace function f() returns int as $$ select 1 $$ language sql", 0), "CREATE FUNCTION");
     }
 
-    #[test]
-    fn patterns() {
-        assert_eq!(pattern_sql("", "s", "n", "vis"), "vis");
-        assert_eq!(pattern_sql("us*", "s", "n", "vis"), "n ~ '^(us.*)$' AND vis");
-        assert_eq!(pattern_sql("app.u?", "s", "n", "vis"), "s ~ '^(app)$' AND n ~ '^(u.)$'");
-        assert_eq!(pattern_sql("a_b.c", "s", "n", "vis"), "s ~ '^(a_b)$' AND n ~ '^(c)$'");
-        assert_eq!(pattern_sql("it's", "s", "n", "vis"), "n ~ '^(it''s)$' AND vis");
-    }
 }

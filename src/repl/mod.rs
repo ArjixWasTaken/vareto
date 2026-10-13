@@ -7,6 +7,7 @@ mod mongo;
 mod mysql;
 mod out;
 mod psql;
+mod psql_catalog;
 mod psql_print;
 mod psql_vars;
 mod redis;

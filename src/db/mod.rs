@@ -34,11 +34,15 @@ impl DbError {
                 ("data_type", pg.data_type()),
                 ("constraint", pg.constraint()),
                 ("routine", pg.routine()),
+                ("file", pg.file()),
             ];
             for (k, v) in fields {
                 if let Some(v) = v {
                     info.insert(k.into(), json!(v));
                 }
+            }
+            if let Some(line) = pg.line() {
+                info.insert("line".into(), json!(line));
             }
             match pg.position() {
                 Some(sqlx::postgres::PgErrorPosition::Original(p)) => {
