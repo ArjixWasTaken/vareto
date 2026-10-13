@@ -57,13 +57,19 @@ os.chmod(ssh_dir / "id_ed25519", 0o600)
 [defaults]
 row_limit = 50
 
-[tunnels.pg]
+# An SSH hop shared by several databases: one SSH session, one forward per destination.
+[tunnels.dc]
 host = "e2e-bastion"
-remote = "postgres:5432"
+
+# Legacy style: a tunnel with a fixed remote.
+[tunnels.redis-fixed]
+host = "e2e-bastion"
+remote = "redis:6379"
 
 [connections.pg]
 kind = "postgres"
-tunnel = "pg"
+tunnel = "dc"
+host = "postgres"
 user = "postgres"
 password = "${env:E2E_PG_PW}"
 database = "shop"
@@ -74,7 +80,8 @@ detect = ["card"]
 
 [connections.pg-rw]
 kind = "postgres"
-tunnel = "pg"
+tunnel = "dc"
+host = "postgres"
 user = "postgres"
 password = "pgpass"
 database = "shop"
@@ -90,7 +97,7 @@ database = "shop"
 
 [connections.mongo]
 kind = "mongodb"
-ssh = "e2e-bastion"
+tunnel = "dc"
 host = "mongo"
 user = "root"
 password = "mongopass"
@@ -105,8 +112,13 @@ password = "redispass"
 
 [connections.redis]
 kind = "redis"
-ssh = "e2e-bastion"
+tunnel = "dc"
 host = "redis"
+password = "redispass"
+
+[connections.redis-fixed]
+kind = "redis"
+tunnel = "redis-fixed"
 password = "redispass"
 """)
 env["E2E_PG_PW"] = "pgpass"
@@ -182,6 +194,14 @@ try:
     r = v("redis", "redis", "SET", "k", "v", ok=False)
     check("redis readonly rejects SET", r.returncode != 0, r.stderr)
 
+    out = vj("redis", "redis-fixed", "PING")
+    check("legacy tunnel with fixed remote", out["result"] == "PONG", out)
+    st = vj("status")
+    fwd = {t["name"] for t in st["tunnels"] if t.get("local")}
+    check("one SSH session shared by all forwards to the bastion",
+          st["ssh_sessions"] == 1 and {"dc/postgres:5432", "dc/mongo:27017", "dc/redis:6379", "@maria", "redis-fixed"} <= fwd,
+          (st["ssh_sessions"], fwd))
+
     out = vj("redis", "redis-jump", "PING")
     check("ProxyJump (bastion -> inner sshd)", out["result"] == "PONG", out)
 
@@ -230,9 +250,11 @@ try:
         print("SKIP save_connection (OS keyring unavailable?):", res["result"]["content"][0]["text"])
     p.stdin.close(); p.wait(timeout=10)
 
-    v("close", "pg")
+    v("close", "dc/postgres:5432")
     st = vj("status")
-    check("close tunnel drops its connections", "pg" not in st["connected"], st)
+    check("close tunnel drops its connections", "pg" not in st["connected"] and "pg-rw" not in st["connected"], st)
+    r = v("open", "dc", ok=False)
+    check("SSH hop without remote can't be opened directly", r.returncode != 0 and "SSH hop" in r.stderr, r.stderr)
 finally:
     v("stop", ok=False)
     if not os.environ.get("KEEP"):

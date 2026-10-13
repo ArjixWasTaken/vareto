@@ -77,13 +77,35 @@ The repo is its own marketplace. `.claude-plugin/marketplace.json` lists one plu
 `plugin/`, which contains `.mcp.json` and `skills/vareto/` (`SKILL.md` and
 `reference.md`). After changing the skill, run `claude plugin marketplace update vareto`.
 
-See [`config.example.toml`](config.example.toml) for every option. There are two ways
-to route a connection through SSH:
+See [`config.example.toml`](config.example.toml) for every option. To reach a database
+through SSH:
 
-- **Named tunnel:** define `[tunnels.x]` with `host` and `remote`, then set
-  `tunnel = "x"` on the connection.
-- **Shorthand:** set `ssh = "bastion"` on the connection. `host` and `port` are then
-  resolved on the SSH server; `host` defaults to `127.0.0.1`.
+- **Shared SSH hop:** define `[tunnels.x]` with just `host`, the SSH server (a
+  `~/.ssh/config` alias or `[user@]host[:port]`). On each connection, set
+  `tunnel = "x"` and give the database address as seen from that server in `host` and
+  `port`.
+  - Every connection through the same SSH destination shares one SSH session; each
+    database gets its own forward over it.
+  - `tunnel_list` names these forwards `x/<host>:<port>`.
+- **Shorthand:** set `ssh = "bastion"` on the connection, with `host` and `port` as
+  above. `host` defaults to `127.0.0.1`. These share SSH sessions too.
+- **Fixed forward:** a tunnel with `remote = "host:port"`, and optionally
+  `local = "127.0.0.1:15432"`. It's useful for pointing a GUI client at a stable local
+  port with `vareto open x`.
+
+```toml
+[tunnels.dc]                 # the SSH hop
+host = "bastion"
+
+[connections.orders]
+kind = "mongodb"
+tunnel = "dc"
+host = "10.0.0.11"           # as seen from the bastion
+[connections.billing]
+kind = "postgres"
+tunnel = "dc"
+host = "10.0.0.12"           # same SSH session as `orders`
+```
 
 Passwords can be set in any of these ways:
 

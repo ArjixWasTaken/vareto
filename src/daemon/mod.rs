@@ -15,6 +15,7 @@ use crate::db::{mongo::Mongo, redis::Redis, sql::SqlPool};
 use crate::ipc::{self, Request, Response};
 use crate::mask::Masker;
 use crate::paths;
+use crate::ssh::pool::SessionPool;
 use crate::ssh::tunnel::Tunnel;
 
 pub enum Backend {
@@ -35,6 +36,8 @@ pub struct State {
     store: Mutex<ConfigStore>,
     pub tunnels: AsyncMutex<HashMap<String, Arc<Tunnel>>>,
     pub conns: AsyncMutex<HashMap<String, Arc<Live>>>,
+    /// SSH sessions shared by all forwards to the same SSH destination.
+    pub ssh: Arc<SessionPool>,
     last_activity: Mutex<Instant>,
     pub started: Instant,
     shutdown: Notify,
@@ -52,32 +55,42 @@ impl State {
     /// Get (or lazily open) a tunnel. `pin` marks it as explicitly opened.
     pub async fn tunnel(&self, name: &str, pin: bool) -> Result<Arc<Tunnel>> {
         let cfg = self.config()?;
-        let tcfg = cfg.tunnels.get(name).with_context(|| format!("unknown tunnel {name:?}"))?.clone();
+        let tcfg = cfg.forwards.get(name).cloned().with_context(|| match cfg.tunnels.get(name) {
+            Some(_) => format!(
+                "tunnel {name:?} has no fixed `remote`; it is an SSH hop for connections (open a forward listed by tunnel_list instead)"
+            ),
+            None => format!("unknown tunnel {name:?}"),
+        })?;
         let mut tunnels = self.tunnels.lock().await;
         if let Some(t) = tunnels.get(name) {
-            if t.cfg.host == tcfg.host && t.cfg.remote == tcfg.remote && (!pin || t.pinned) {
+            if t.cfg == tcfg && (!pin || t.pinned) {
                 t.touch();
                 return Ok(t.clone());
             }
             // Config changed, or a lazy tunnel is being pinned: reopen.
             let old = tunnels.remove(name).unwrap();
             self.drop_conns_for_tunnel(name).await;
-            old.close().await;
+            old.close();
+            self.release_unused_session(&tunnels, &old.target).await;
         }
-        let t = Tunnel::open(name, &tcfg, pin).await?;
+        let t = Tunnel::open(name, &tcfg, pin, self.ssh.clone()).await?;
         tunnels.insert(name.to_string(), t.clone());
         Ok(t)
     }
 
     pub async fn close_tunnel(&self, name: &str) -> Result<()> {
-        let t = self.tunnels.lock().await.remove(name);
-        match t {
-            Some(t) => {
-                self.drop_conns_for_tunnel(name).await;
-                t.close().await;
-                Ok(())
-            }
-            None => bail!("tunnel {name:?} is not open"),
+        let mut tunnels = self.tunnels.lock().await;
+        let Some(t) = tunnels.remove(name) else { bail!("tunnel {name:?} is not open") };
+        self.drop_conns_for_tunnel(name).await;
+        t.close();
+        self.release_unused_session(&tunnels, &t.target).await;
+        Ok(())
+    }
+
+    /// Disconnect a shared SSH session once no open forward uses it.
+    async fn release_unused_session(&self, open: &HashMap<String, Arc<Tunnel>>, target: &crate::ssh::Target) {
+        if !open.values().any(|t| &t.target == target) {
+            self.ssh.release(target).await;
         }
     }
 
@@ -187,7 +200,8 @@ impl State {
             close_live(&l).await;
         }
         for (_, t) in self.tunnels.lock().await.drain() {
-            t.close().await;
+            t.close();
+            self.ssh.release(&t.target).await;
         }
     }
 }
@@ -223,6 +237,7 @@ pub async fn run() -> Result<()> {
         store: Mutex::new(ConfigStore::new(false)),
         tunnels: Default::default(),
         conns: Default::default(),
+        ssh: Default::default(),
         last_activity: Mutex::new(Instant::now()),
         started: Instant::now(),
         shutdown: Notify::new(),

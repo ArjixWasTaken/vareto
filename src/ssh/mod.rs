@@ -1,5 +1,6 @@
 //! SSH sessions: `~/.ssh/config` resolution, host key TOFU, agent/key auth, ProxyJump.
 
+pub mod pool;
 pub mod tunnel;
 
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use crate::config::TunnelConfig;
 use crate::paths;
 
 /// A fully resolved SSH destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Target {
     pub hostname: String,
     pub port: u16,

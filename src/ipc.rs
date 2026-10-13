@@ -45,7 +45,8 @@ pub struct SaveConnection {
     /// New connection name (must not already exist).
     pub name: String,
     pub kind: crate::config::Kind,
-    /// Name of an existing tunnel to connect through.
+    /// Name of an existing tunnel (SSH hop) to connect through; `host`/`port` are then
+    /// the database address as seen from that SSH server.
     #[serde(default)]
     pub tunnel: Option<String>,
     /// SSH host to tunnel through (alternative to `tunnel`); host/port are then resolved on that server.

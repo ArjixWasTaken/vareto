@@ -164,10 +164,12 @@ Details and examples: [reference.md](reference.md). Short version:
 
 `save_connection` stores a new connection in `saved.toml`. Saved connections are
 **always read-only**; a password goes to the OS keyring, never to a file. Only save one
-when the user asks, and only with details the user gave you. For a database behind SSH
-where the DB listens on the server itself, use `ssh` (an `~/.ssh/config` alias or
-`user@host[:port]`) plus `host`/`port` as seen from that server (default `127.0.0.1` and
-the kind's default port). `delete_saved_connection` only removes connections created this
+when the user asks, and only with details the user gave you. For a database behind SSH,
+either use `tunnel` with the name of an existing tunnel (an SSH hop from the user's
+config; preferred when one already reaches the network, since it shares the SSH
+session) or `ssh` (an `~/.ssh/config` alias or `user@host[:port]`). In both cases
+`host`/`port` are the database address as seen from that SSH server (default
+`127.0.0.1` and the kind's default port). `delete_saved_connection` only removes connections created this
 way; connections from `config.toml` are the user's to edit.
 
 ## Troubleshooting errors

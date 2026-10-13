@@ -14,15 +14,27 @@ readonly = true            # default for connections that don't set `readonly`
 # columns = [{ match = "*password*" }, { match = "*token*" }, { match = "*secret*" }]
 # detect = ["email", "card"]
 
-# A named tunnel: host is a ~/.ssh/config alias or [user@]host[:port].
+# A tunnel is an SSH hop: host is a ~/.ssh/config alias or [user@]host[:port].
+# Connections using it give their own host/port, as seen from the SSH server, and
+# all of them share one SSH session.
 [tunnels.prod]
 host = "prod-bastion"
-remote = "10.0.0.5:5432"   # as seen from the SSH server; "/path/to.sock" also works
-# local = "127.0.0.1:15432" # fixed local port (default: ephemeral)
+# user = "ops"             # override ~/.ssh/config
+# port = 2222              # SSH port
+# identity = "~/.ssh/id_ed25519"
+
+# Optional: a tunnel with a fixed destination (and optionally a fixed local port),
+# handy for `vareto open legacy` + a GUI client.
+# [tunnels.legacy]
+# host = "prod-bastion"
+# remote = "10.0.0.9:5432"   # "/path/to.sock" also works
+# local = "127.0.0.1:15432"
 
 [connections.prod-pg]
 kind = "postgres"          # mysql | mariadb | postgres | mongodb | redis
 tunnel = "prod"
+host = "10.0.0.5"          # as seen from prod-bastion
+port = 5432
 user = "readonly"
 password = "${env:PROD_PG_PASSWORD}"   # or password_cmd = "pass show prod/pg", or keyring = true
 database = "app"

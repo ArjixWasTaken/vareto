@@ -57,14 +57,17 @@ impl Default for Defaults {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     /// `~/.ssh/config` alias or hostname, optionally `user@host:port`.
     pub host: String,
-    /// Address to forward to, as seen from the SSH server, e.g. `127.0.0.1:5432`.
-    pub remote: String,
-    /// Fixed local bind address; an ephemeral `127.0.0.1` port when omitted.
+    /// Optional fixed destination, as seen from the SSH server, e.g. `127.0.0.1:5432`.
+    /// Usually omitted: connections name their own `host`/`port`, and every
+    /// destination reached through the same SSH host shares one SSH session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Fixed local bind address (only with `remote`); an ephemeral `127.0.0.1` port when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,7 +114,8 @@ impl Kind {
 #[serde(deny_unknown_fields)]
 pub struct ConnectionConfig {
     pub kind: Kind,
-    /// Name of a `[tunnels.*]` entry to connect through.
+    /// Name of a `[tunnels.*]` entry (SSH hop) to connect through. `host`/`port` are
+    /// then the destination as seen from that SSH server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
     /// Shorthand: SSH host to tunnel through to `host:port` (an implicit tunnel).
@@ -161,6 +165,8 @@ pub struct Connection {
     pub cfg: ConnectionConfig,
     pub source: Source,
     pub readonly: bool,
+    /// The forward (key into [`Resolved::forwards`]) this connection goes through.
+    pub forward: Option<String>,
 }
 
 /// Where a connection's traffic goes.
@@ -172,10 +178,8 @@ pub enum Route {
 
 impl Connection {
     pub fn route(&self) -> Route {
-        if let Some(t) = &self.cfg.tunnel {
-            Route::Tunnel(t.clone())
-        } else if self.cfg.ssh.is_some() {
-            Route::Tunnel(implicit_tunnel_name(&self.name))
+        if let Some(f) = &self.forward {
+            Route::Tunnel(f.clone())
         } else {
             Route::Direct {
                 host: self.cfg.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
@@ -193,7 +197,11 @@ pub fn implicit_tunnel_name(conn: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct Resolved {
     pub defaults: Defaults,
+    /// Tunnels as configured (SSH hops, optionally with a fixed `remote`).
     pub tunnels: BTreeMap<String, TunnelConfig>,
+    /// Concrete port forwards (always with `remote`): configured tunnels that have a
+    /// `remote`, plus one per distinct (tunnel, destination) that connections use.
+    pub forwards: BTreeMap<String, TunnelConfig>,
     pub connections: BTreeMap<String, Connection>,
 }
 
@@ -224,6 +232,14 @@ pub fn resolve(main: Config, saved: Config, force_readonly: bool) -> Result<Reso
         tunnels.insert(name, t);
     }
 
+    let mut forwards: BTreeMap<String, TunnelConfig> =
+        tunnels.iter().filter(|(_, t)| t.remote.is_some()).map(|(n, t)| (n.clone(), t.clone())).collect();
+    for (name, t) in &tunnels {
+        if t.local.is_some() && t.remote.is_none() {
+            bail!("tunnel {name:?}: `local` needs `remote`");
+        }
+    }
+
     let mut connections = BTreeMap::new();
     let all = main
         .connections
@@ -237,34 +253,49 @@ pub fn resolve(main: Config, saved: Config, force_readonly: bool) -> Result<Reso
         if cfg.tunnel.is_some() && cfg.ssh.is_some() {
             bail!("connection {name:?}: set either `tunnel` or `ssh`, not both");
         }
-        if let Some(t) = &cfg.tunnel {
-            if !tunnels.contains_key(t) {
-                bail!("connection {name:?} references unknown tunnel {t:?}");
-            }
-        }
         // Readonly can only be relaxed by a human, in config.toml.
         let readonly = force_readonly
             || source == Source::Saved
             || cfg.readonly.unwrap_or(main.defaults.readonly);
-        if let Some(ssh) = &cfg.ssh {
-            let remote_host = cfg.host.clone().unwrap_or_else(|| "127.0.0.1".into());
-            let remote_port = cfg.port.unwrap_or(cfg.kind.default_port());
-            tunnels.insert(
-                implicit_tunnel_name(&name),
-                TunnelConfig {
-                    host: ssh.clone(),
-                    remote: join_host_port(&remote_host, remote_port),
+        let dest = || {
+            join_host_port(
+                cfg.host.as_deref().unwrap_or("127.0.0.1"),
+                cfg.port.unwrap_or(cfg.kind.default_port()),
+            )
+        };
+        let forward = if let Some(tname) = &cfg.tunnel {
+            let t = tunnels
+                .get(tname)
+                .with_context(|| format!("connection {name:?} references unknown tunnel {tname:?}"))?;
+            if cfg.host.is_some() || cfg.port.is_some() {
+                // Destination from the connection, reached through the tunnel's SSH host.
+                let remote = dest();
+                let key = format!("{tname}/{remote}");
+                forwards.entry(key.clone()).or_insert_with(|| TunnelConfig {
+                    remote: Some(remote),
                     local: None,
-                    user: None,
-                    port: None,
-                    identity: None,
-                },
+                    ..t.clone()
+                });
+                Some(key)
+            } else if t.remote.is_some() {
+                Some(tname.clone())
+            } else {
+                bail!("connection {name:?}: tunnel {tname:?} has no `remote`, so set `host`/`port` on the connection");
+            }
+        } else if let Some(ssh) = &cfg.ssh {
+            let key = implicit_tunnel_name(&name);
+            forwards.insert(
+                key.clone(),
+                TunnelConfig { host: ssh.clone(), remote: Some(dest()), local: None, user: None, port: None, identity: None },
             );
-        }
-        connections.insert(name.clone(), Connection { name, cfg, source, readonly });
+            Some(key)
+        } else {
+            None
+        };
+        connections.insert(name.clone(), Connection { name, cfg, source, readonly, forward });
     }
 
-    Ok(Resolved { defaults: main.defaults, tunnels, connections })
+    Ok(Resolved { defaults: main.defaults, tunnels, forwards, connections })
 }
 
 pub fn join_host_port(host: &str, port: u16) -> String {
@@ -450,8 +481,44 @@ mod tests {
         let r = resolve(main, Config::default(), false).unwrap();
         let c = &r.connections["prod"];
         assert_eq!(c.route(), Route::Tunnel("@prod".into()));
-        assert_eq!(r.tunnels["@prod"].remote, "127.0.0.1:5432");
-        assert_eq!(r.tunnels["@prod"].host, "bastion");
+        assert_eq!(r.forwards["@prod"].remote.as_deref(), Some("127.0.0.1:5432"));
+        assert_eq!(r.forwards["@prod"].host, "bastion");
+    }
+
+    #[test]
+    fn shared_tunnel_destinations() {
+        let main = parse(
+            r#"
+            [tunnels.dc]
+            host = "bastion"
+            user = "ops"
+            [tunnels.legacy]
+            host = "bastion"
+            remote = "10.0.0.9:6379"
+            [connections.a]
+            kind = "mongodb"
+            tunnel = "dc"
+            host = "10.0.0.1"
+            [connections.b]
+            kind = "mongodb"
+            tunnel = "dc"
+            host = "10.0.0.2"
+            port = 27018
+            [connections.c]
+            kind = "redis"
+            tunnel = "legacy"
+            "#,
+        );
+        let r = resolve(main, Config::default(), false).unwrap();
+        assert_eq!(r.connections["a"].route(), Route::Tunnel("dc/10.0.0.1:27017".into()));
+        assert_eq!(r.connections["b"].route(), Route::Tunnel("dc/10.0.0.2:27018".into()));
+        assert_eq!(r.connections["c"].route(), Route::Tunnel("legacy".into()));
+        let fa = &r.forwards["dc/10.0.0.1:27017"];
+        assert_eq!((fa.host.as_str(), fa.user.as_deref()), ("bastion", Some("ops")));
+        assert!(!r.forwards.contains_key("dc"), "remote-less tunnels are only SSH hops");
+
+        let bad = parse("[tunnels.dc]\nhost = \"b\"\n[connections.x]\nkind = \"redis\"\ntunnel = \"dc\"\n");
+        assert!(resolve(bad, Config::default(), false).is_err());
     }
 
     #[test]

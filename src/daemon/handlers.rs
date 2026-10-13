@@ -164,6 +164,7 @@ async fn status(state: &State) -> Result<Value> {
         "config": config,
         "config_files": [main, saved],
         "tunnels": tunnels,
+        "ssh_sessions": state.ssh.len(),
         "connected": conns,
     }))
 }
@@ -172,7 +173,7 @@ async fn tunnel_list(state: &State) -> Result<Value> {
     let cfg = state.config()?;
     let open = state.tunnels.lock().await.clone();
     let mut out = Vec::new();
-    for (name, t) in &cfg.tunnels {
+    for (name, t) in &cfg.forwards {
         match open.get(name) {
             Some(live) => out.push(serde_json::to_value(live.status().await)?),
             None => out.push(json!({ "name": name, "ssh": t.host, "remote": t.remote, "open": false })),
@@ -190,7 +191,7 @@ async fn list_connections(state: &State, force_readonly: bool) -> Result<Value> 
         .map(|c| {
             let route = match c.route() {
                 Route::Direct { host, port } => json!({ "direct": crate::config::join_host_port(&host, port) }),
-                Route::Tunnel(t) => json!({ "tunnel": t, "ssh": cfg.tunnels.get(&t).map(|t| t.host.clone()) }),
+                Route::Tunnel(t) => json!({ "tunnel": t, "ssh": cfg.forwards.get(&t).map(|t| t.host.clone()) }),
             };
             let mut v = json!({
                 "name": c.name,
@@ -227,8 +228,13 @@ async fn save_connection(state: &State, s: SaveConnection) -> Result<Value> {
     }
     if let Some(t) = &s.tunnel {
         // Only tunnels from config.toml: saved connections must survive on their own.
-        if t.starts_with('@') || !cfg.tunnels.contains_key(t) {
-            bail!("unknown tunnel {t:?}; use `ssh` to tunnel through a host directly");
+        match cfg.tunnels.get(t) {
+            Some(tc) if !t.starts_with('@') => {
+                if tc.remote.is_none() && s.host.is_none() && s.port.is_none() {
+                    bail!("tunnel {t:?} is an SSH hop without a fixed remote: set `host` (and `port`) to the database address as seen from that SSH server");
+                }
+            }
+            _ => bail!("unknown tunnel {t:?}; use `ssh` to tunnel through a host directly"),
         }
     }
     if s.tunnel.is_some() && s.ssh.is_some() {
