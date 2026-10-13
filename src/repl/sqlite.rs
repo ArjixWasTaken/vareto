@@ -1,6 +1,6 @@
 //! sqlite3.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
 use super::out::outln;
@@ -40,6 +40,10 @@ pub struct Sqlite {
     null: String,
     tables: Vec<String>,
     columns: Vec<(String, String)>,
+    /// `.once FILE`: where the next statement's output goes.
+    once: Option<String>,
+    /// `.headers` was given (`.mode column` then keeps that choice).
+    headers_set: bool,
 }
 
 const HELP: &str = "\
@@ -47,9 +51,12 @@ const HELP: &str = "\
 .exit, .quit             Exit this program
 .headers on|off          Turn display of headers on or off
 .help                    Show this message
+.import FILE TABLE       Import data from FILE into TABLE (--csv, --ascii, --skip N, --schema S, -v)
 .indexes ?TABLE?         Show names of indexes
 .mode MODE               Set output mode: box column csv json line list table
 .nullvalue STRING        Use STRING in place of NULL values
+.once FILE               Output for the next SQL command only to FILE ('|cmd' for a pipe)
+.output ?FILE?           Send output to FILE ('|cmd' for a pipe), or to stdout
 .read FILE               Read input from FILE
 .schema ?PATTERN?        Show the CREATE statements matching PATTERN
 .tables ?PATTERN?        List names of tables matching LIKE pattern
@@ -63,9 +70,73 @@ fn on_off(arg: &str) -> Result<bool> {
     }
 }
 
+/// A dot command's arguments: words, with '…' or "…" grouping.
+fn dot_args(arg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = arg.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut w = String::new();
+        if c == '\'' || c == '"' {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch == c {
+                    break;
+                }
+                w.push(ch);
+            }
+        } else {
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                w.push(ch);
+                chars.next();
+            }
+        }
+        out.push(w);
+    }
+    out
+}
+
+/// A string as sqlite3 shows it in messages: `\n`, `\t`, `\r`, other control
+/// characters in octal.
+fn c_string(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' => "\\n".to_string(),
+            '\t' => "\\t".to_string(),
+            '\r' => "\\r".to_string(),
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            c if (c as u32) < 0x20 => format!("\\{:03o}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+fn v_strings(v: &Value) -> Vec<String> {
+    v.as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)).collect()
+}
+
 impl Sqlite {
-    pub fn new() -> Self {
-        Self { buf: SqlBuf::new(Dialect::Sqlite), mode: Mode::Box, headers: true, timer: false, null: String::new(), tables: Vec::new(), columns: Vec::new() }
+    /// sqlite3 starts a terminal session in a table layout, and a script in `list`
+    /// mode without headers.
+    pub fn new(interactive: bool) -> Self {
+        Self {
+            buf: SqlBuf::new(Dialect::Sqlite),
+            mode: if interactive { Mode::Box } else { Mode::List },
+            headers: interactive,
+            timer: false,
+            null: String::new(),
+            tables: Vec::new(),
+            columns: Vec::new(),
+            once: None,
+            headers_set: false,
+        }
     }
 
     /// The current mode, when it can be written a row at a time.
@@ -97,6 +168,71 @@ impl Sqlite {
     }
 
     fn execute(&mut self, sql: &str, s: &mut Session) -> Result<()> {
+        match self.once.take() {
+            Some(to) => super::out::with_target(&to, || self.run(sql, s))?,
+            None => self.run(sql, s),
+        }
+    }
+
+    /// `.import [OPTIONS] FILE TABLE`, with sqlite3's options.
+    fn import(&mut self, arg: &str, s: &mut Session) -> Result<()> {
+        use crate::db::import::ImportMode;
+        let usage = "Usage: .import [--csv|--ascii] [--skip N] [--schema S] [-v] FILE TABLE";
+        let words = dot_args(arg);
+        let (mut mode, mut skip, mut schema, mut verbose) = (None, 0u64, None, false);
+        let mut rest = Vec::new();
+        let mut it = words.into_iter();
+        while let Some(w) = it.next() {
+            match w.as_str() {
+                "--csv" => mode = Some(ImportMode::Csv),
+                "--ascii" => mode = Some(ImportMode::Ascii),
+                "--skip" => skip = it.next().and_then(|n| n.parse().ok()).context(usage)?,
+                "--schema" => schema = Some(it.next().context(usage)?),
+                "-v" => verbose = true,
+                o if o.starts_with('-') && o.len() > 1 => bail!("ERROR: unknown option: \"{o}\".  {usage}"),
+                _ => rest.push(w),
+            }
+        }
+        let [file, table] = rest.as_slice() else { bail!("ERROR: missing FILE or TABLE argument.  {usage}") };
+        let mode = mode.unwrap_or(if self.mode == Mode::Csv { ImportMode::Csv } else { ImportMode::List { separator: "|".into() } });
+        let mode_shown = mode.clone();
+        let res = match file.strip_prefix('|') {
+            Some(cmd) => {
+                let mut child = super::shell_command(cmd).stdout(std::process::Stdio::piped()).spawn().with_context(|| format!("Error: cannot open \"{cmd}\""))?;
+                let stdout = child.stdout.take().expect("piped");
+                let res = s.import(table, schema, mode, skip, file, std::os::fd::AsFd::as_fd(&stdout));
+                drop(stdout);
+                child.wait().ok();
+                res
+            }
+            None => {
+                let f = std::fs::File::open(super::expand_home(file)).map_err(|_| anyhow::anyhow!("Error: cannot open \"{file}\""))?;
+                s.import(table, schema, mode, skip, file, std::os::fd::AsFd::as_fd(&f))
+            }
+        }?;
+        super::out::flush();
+        for m in v_strings(&res["messages"]) {
+            eprintln!("{m}");
+        }
+        if verbose {
+            let (col, row) = match &mode_shown {
+                ImportMode::Csv => (",".to_string(), "\n".to_string()),
+                ImportMode::Ascii => ("\x1f".to_string(), "\x1e".to_string()),
+                ImportMode::List { separator } => (separator.clone(), "\n".to_string()),
+            };
+            outln!("Column separator \"{}\", row separator \"{}\"", c_string(&col), c_string(&row));
+            outln!(
+                "Added {} rows with {} errors using {} lines of input",
+                res["rows"].as_u64().unwrap_or(0),
+                res["errors"].as_u64().unwrap_or(0),
+                res["lines"].as_u64().unwrap_or(0)
+            );
+        }
+        self.refresh(s);
+        Ok(())
+    }
+
+    fn run(&mut self, sql: &str, s: &mut Session) -> Result<()> {
         // Streamable modes going to a file or pipe: unlimited rows.
         if let Some(format) = self.stream_format() {
             if crate::readonly::returns_rows(crate::readonly::SqlDialect::Sqlite, sql) {
@@ -179,19 +315,41 @@ impl Sqlite {
                 }
             }
             "mode" => match MODES.iter().find(|(n, _)| *n == arg) {
-                Some((_, m)) => self.mode = *m,
+                Some((_, m)) => {
+                    self.mode = *m;
+                    // As in sqlite3: column mode shows titles unless `.headers off` was given.
+                    if self.mode == Mode::Column && !self.headers_set {
+                        self.headers = true;
+                    }
+                }
                 None if arg.is_empty() => {
                     let cur = MODES.iter().find(|(_, m)| *m == self.mode).map(|(n, _)| *n).unwrap_or("");
                     outln!("current output mode: {cur}");
                 }
                 None => bail!("Error: mode should be one of: box column csv json line list table"),
             },
-            "headers" | "header" => self.headers = on_off(arg)?,
+            "headers" | "header" => {
+                self.headers = on_off(arg)?;
+                self.headers_set = true;
+            }
             "timer" => self.timer = on_off(arg)?,
             "nullvalue" => self.null = arg.trim_matches('"').to_string(),
             "read" => {
                 let text = read_script(arg)?;
                 return run_script(self, s, &text);
+            }
+            "import" => self.import(arg, s)?,
+            "output" | "once" => {
+                let words = dot_args(arg);
+                if let Some(o) = words.iter().find(|w| w.starts_with('-')) {
+                    bail!("ERROR: option \"{o}\" is not available in the vareto shell");
+                }
+                let to = words.first().cloned();
+                if cmd == "once" {
+                    self.once = Some(to.context("ERROR: missing FILE argument on .once")?);
+                } else {
+                    super::out::redirect(to.as_deref().filter(|t| *t != "stdout"))?;
+                }
             }
             other => bail!("Error: unknown command or invalid arguments:  \"{other}\". Enter \".help\" for help"),
         }
@@ -263,7 +421,7 @@ impl Flavor for Sqlite {
     }
 
     fn completions(&self) -> Completions {
-        let dots = [".tables", ".schema", ".indexes", ".databases", ".mode", ".headers", ".timer", ".read", ".help", ".quit", ".exit", ".nullvalue"];
+        let dots = [".tables", ".schema", ".indexes", ".databases", ".mode", ".headers", ".timer", ".read", ".help", ".quit", ".exit", ".nullvalue", ".import", ".output", ".once"];
         Completions {
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: dots.iter().map(|w| w.to_string()).collect(),

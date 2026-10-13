@@ -194,6 +194,17 @@ pub enum Op {
         warnings: bool,
         peer: Option<OwnedFd>,
     },
+    /// sqlite3 `.import` from the client's descriptor.
+    Import {
+        table: String,
+        schema: Option<String>,
+        mode: crate::db::import::ImportMode,
+        skip: u64,
+        file: String,
+        in_transaction: bool,
+        fd: OwnedFd,
+        peer: Option<OwnedFd>,
+    },
     /// A query whose formatted rows go to the client's descriptor, unlimited.
     Stream { sql: String, format: crate::textfmt::StreamFormat, fd: OwnedFd, warnings: bool },
 }
@@ -211,6 +222,9 @@ fn check_op(conn: &Connection, op: &Op) -> Result<()> {
         Op::LoadData { .. } if kind != Kind::Mysql => bail!("LOAD DATA LOCAL INFILE is for MySQL and MariaDB"),
         Op::LoadData { .. } if conn.readonly => bail!("read-only connection: LOAD DATA writes to a table"),
         Op::LoadData { .. } => Ok(()),
+        Op::Import { .. } if kind != Kind::Sqlite => bail!(".import is for SQLite"),
+        Op::Import { .. } if conn.readonly => bail!("attempt to write a readonly database (the connection is read-only)"),
+        Op::Import { .. } => Ok(()),
         Op::Describe { .. } if !matches!(kind, Kind::Mysql | Kind::Postgres | Kind::Sqlite) => bail!("only SQL statements can be described"),
         Op::Describe { .. } => Ok(()),
     }
@@ -356,6 +370,12 @@ async fn special(inner: &mut Inner, conn: &Connection, op: Op, timeout: Duration
                 Ok(v)
             })
             .await;
+            (r, long)
+        }
+        Op::Import { table, schema, mode, skip, file, in_transaction, fd, peer } => {
+            let crate::db::sql::SqlConn::Sqlite(lite) = c else { bail!(".import is for SQLite") };
+            let req = crate::db::import::ImportRequest { table, schema, mode, skip, file, in_transaction, src: fd, cancelled, peer };
+            let r = tokio::time::timeout(long + grace, crate::db::import::import(lite, req)).await;
             (r, long)
         }
         Op::Stream { sql, format, fd, warnings } => {

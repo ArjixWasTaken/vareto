@@ -289,7 +289,7 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<i32> {
             Kind::Mysql => Box::new(mysql::Mysql::new(&mut s, opts.mysql())?),
             Kind::Postgres => Box::new(psql::Psql::new(&s, &opts, interactive)?),
             Kind::Redis => Box::new(redis::Redis::new()),
-            Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
+            Kind::Sqlite => Box::new(sqlite::Sqlite::new(interactive)),
             Kind::Mongodb => Box::new(mongo::Mongo::new(interactive)?),
         };
         if !opts.set.is_empty() && s.kind != Kind::Postgres {

@@ -479,7 +479,8 @@ try:
     check("mysql: LOAD DATA LOCAL refused on a read-only connection", "read-only connection" in r.stderr, r.stderr)
     r = shell("lite", ".mode csv\nwith recursive c(x) as (select 1 union all select x + 1 from c where x < 20000) select x from c;\n")
     lines = r.stdout.splitlines()
-    check("sqlite3: csv to a pipe streams every row", r.returncode == 0 and len(lines) == 20001 and lines[-1] == "20000",
+    # A script starts without headers, as in sqlite3.
+    check("sqlite3: csv to a pipe streams every row", r.returncode == 0 and len(lines) == 20000 and lines[-1] == "20000",
           (len(lines), r.stdout[:200] + r.stderr))
 
     r = shell("maria", "use information_schema\nselect database();\nselect id, email from shop.users order by id\\G\n")
@@ -554,6 +555,34 @@ try:
           r.stdout + r.stderr)
     r = shell("lite-rw", "begin;\ninsert into notes (body) values ('third');\nrollback;\n.mode list\n.headers off\nselect count(*) from notes;\n")
     check("sqlite3: transactions on a writable file", r.returncode == 0 and r.stdout.strip() == "2", r.stdout + r.stderr)
+    # .import / .output / .once: the same script through the real sqlite3 (on a copy
+    # of the file) and through vareto must print the same, messages included.
+    imp_csv = work / "imp.csv"
+    imp_csv.write_text('id,name,note\n1,"a, b",x\n2,"multi\nline",\n3,short\n4,extra,y,z\n5,"say ""hi""",\n')
+    (work / "imp-pipe.txt").write_text('x|y\n1|2\n"3|4"|5\n')
+    once = work / "once.txt"
+    imp_script = (f".import --csv {imp_csv} imp_people\n.schema imp_people\n"
+                  "create table imp_nums(a integer primary key, b text);\ninsert into imp_nums values (3, 'pre');\n"
+                  f".import --csv --skip 1 -v {imp_csv} imp_nums\n.mode csv\n.import {imp_csv} imp_people\n.mode list\n"
+                  f".import '|cat {work / 'imp-pipe.txt'}' imp_cmd\n.schema imp_cmd\n"
+                  "select * from imp_people;\nselect a, b, typeof(a) from imp_nums;\nselect * from imp_cmd;\n"
+                  f".once {once}\nselect count(*) from imp_people;\nselect 'after once';\n"
+                  "drop table imp_people;\ndrop table imp_nums;\ndrop table imp_cmd;\n")
+    if shutil.which("sqlite3"):
+        copy = work / "lite-copy.db"
+        shutil.copy(work / "lite.db", copy)
+        real = subprocess.run(["sqlite3", str(copy)], input=imp_script, text=True, capture_output=True)
+        real_once = once.read_text() if once.exists() else None
+        once.unlink(missing_ok=True)
+        r = shell("lite-rw", imp_script)
+        ours_once = once.read_text() if once.exists() else None
+        check("sqlite3: .import, .output/.once match the real sqlite3", r.stdout == real.stdout and r.stderr == real.stderr
+              and ours_once == real_once and "expected 3 columns but found 2" in r.stderr,
+              (real.stdout, r.stdout, real.stderr, r.stderr, real_once, ours_once))
+    else:
+        print("SKIP sqlite3 .import comparison (no sqlite3 binary)")
+    r = shell("lite", f".import --csv {imp_csv} imp_ro\n")
+    check("sqlite3: .import refused on a read-only file", r.returncode != 0 and "readonly" in r.stderr, r.stderr)
     out = vj("sql", "lite", "PRAGMA table_info(notes)")
     check("sqlite via sql_query (read-only pragma)", [row[1] for row in out["rows"]] == ["id", "body", "score"], out)
 

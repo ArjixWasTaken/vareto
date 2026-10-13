@@ -82,6 +82,21 @@ pub enum Request {
         #[serde(default)]
         warnings: bool,
     },
+    /// sqlite3 `.import`: the daemon reads the file from the descriptor sent with the
+    /// request and inserts its rows (see `db::import`). Returns
+    /// `{"rows", "errors", "lines", "messages"}`.
+    SessionImport {
+        session: u64,
+        table: String,
+        #[serde(default)]
+        schema: Option<String>,
+        mode: crate::db::import::ImportMode,
+        #[serde(default)]
+        skip: u64,
+        file: String,
+        #[serde(default)]
+        in_transaction: bool,
+    },
     /// The result columns of a statement without running it (psql `\gdesc`).
     SessionDescribe { session: u64, sql: String },
     SessionClose { session: u64 },
@@ -93,7 +108,7 @@ pub enum Request {
 impl Request {
     /// Requests sent with a file descriptor ([`send_with_fd`]).
     pub fn takes_fd(&self) -> bool {
-        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. } | Request::SessionLoadData { .. })
+        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. } | Request::SessionLoadData { .. } | Request::SessionImport { .. })
     }
 
     /// The request's `op` name, for messages.

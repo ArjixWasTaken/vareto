@@ -89,6 +89,11 @@ pub async fn handle(
             let op = session::Op::LoadData { sql, fd, client_allowed: client_local_infile, in_transaction, file_error, warnings, peer };
             session::query(state, client, session, op).await
         }
+        Request::SessionImport { session, table, schema, mode, skip, file, in_transaction } => {
+            let fd = fd.context("SessionImport needs a file descriptor")?;
+            let op = session::Op::Import { table, schema, mode, skip, file, in_transaction, fd, peer };
+            session::query(state, client, session, op).await
+        }
         Request::SessionCopyOut { session, sql } => {
             let fd = fd.context("SessionCopyOut needs a file descriptor")?;
             session::query(state, client, session, session::Op::CopyOut { sql, fd }).await

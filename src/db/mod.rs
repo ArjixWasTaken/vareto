@@ -1,5 +1,6 @@
 pub mod mongo;
 pub mod redis;
+pub mod import;
 pub mod load_data;
 pub mod sql;
 

@@ -207,6 +207,20 @@ impl Session {
         self.call_with_fd(req, src)
     }
 
+    /// sqlite3 `.import`, the daemon reading `src` into `table`.
+    pub fn import(&mut self, table: &str, schema: Option<String>, mode: crate::db::import::ImportMode, skip: u64, file: &str, src: BorrowedFd<'_>) -> Result<Value> {
+        let req = Request::SessionImport {
+            session: self.id,
+            table: table.into(),
+            schema,
+            mode,
+            skip,
+            file: file.into(),
+            in_transaction: self.tx != Tx::Idle,
+        };
+        self.call_with_fd(req, src)
+    }
+
     /// Update the transaction state after `sql` ran.
     pub fn track(&mut self, sql: &str, ok: bool) {
         self.tx = next_tx(self.kind, self.tx, sql, ok);
