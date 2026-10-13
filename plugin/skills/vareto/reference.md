@@ -11,7 +11,7 @@
 | `sql_query` | `connection`, `sql`, `limit?` | MySQL/MariaDB/Postgres. |
 | `mongo_query` | `connection`, `collection`, `op`, `database?`, op-specific fields, `limit?` | See below. |
 | `redis_command` | `connection`, `args` | `args[0]` is the command. |
-| `export_query` | `connection`, exactly one of `sql` / `mongo` / `redis`, `path`, `format` (`csv`\|`jsonl`) | Relative paths resolve against the MCP server's working directory. Returns `{path, records, truncated}`. Masking applies. |
+| `export_query` | `connection`, exactly one of `sql` / `mongo` / `redis`, `path`, `format` (`csv`\|`jsonl`) | Streams the whole result to the file; no row cap, bounded by `export_timeout` (default 10 min). Relative paths resolve against the MCP server's working directory. Returns `{path, records, elapsed_secs}`, plus `dropped_fields` when a MongoDB CSV export saw fields after the first 1000 documents (use `jsonl` to keep them). A failed export deletes its partial file. Masking applies. |
 | `tunnel_list` / `tunnel_open` / `tunnel_close` | `name` | Rarely needed: tunnels open on demand and close when idle. `tunnel_open` pins a tunnel open. |
 | `save_connection` | `name`, `kind`, `ssh?`/`tunnel?`, `host?`, `port?`, `user?`, `password?`, `database?`, `params?`, `description?` | Always read-only. |
 | `delete_saved_connection` | `name` | Only for saved connections. |

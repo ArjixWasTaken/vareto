@@ -10,6 +10,262 @@ use serde_json::{json, Value};
 use crate::ipc::ExportFormat;
 use crate::mask::Masker;
 
+/// Where a backend sends results as it reads them. `row`/`doc` return `false` to
+/// ask the backend to stop reading (the consumer has enough).
+pub trait Sink: Send {
+    fn columns(&mut self, columns: Vec<Column>) -> Result<()>;
+    fn row(&mut self, row: Vec<Value>) -> Result<bool>;
+    fn doc(&mut self, doc: Value) -> Result<bool>;
+    fn affected(&mut self, rows: u64, detail: Option<Value>) -> Result<()>;
+    fn value(&mut self, v: Value) -> Result<()>;
+}
+
+/// Collects up to `limit` rows/documents in memory for a query response.
+pub struct Collector {
+    limit: usize,
+    collection: Option<String>,
+    columns: Option<Vec<Column>>,
+    rows: Vec<Vec<Value>>,
+    docs: Option<Vec<Value>>,
+    affected: Option<(u64, Option<Value>)>,
+    value: Option<Value>,
+    truncated: bool,
+}
+
+impl Collector {
+    pub fn new(limit: usize, collection: Option<String>) -> Self {
+        Self { limit, collection, columns: None, rows: Vec::new(), docs: None, affected: None, value: None, truncated: false }
+    }
+
+    pub fn finish(self) -> Output {
+        if let Some(columns) = self.columns {
+            Output::Table { columns, rows: self.rows, truncated: self.truncated }
+        } else if let Some(docs) = self.docs {
+            Output::Documents { collection: self.collection, docs, truncated: self.truncated }
+        } else if let Some(v) = self.value {
+            Output::Value(v)
+        } else {
+            let (rows, detail) = self.affected.unwrap_or((0, None));
+            Output::Affected { rows, detail }
+        }
+    }
+}
+
+impl Sink for Collector {
+    fn columns(&mut self, columns: Vec<Column>) -> Result<()> {
+        self.columns = Some(columns);
+        Ok(())
+    }
+    fn row(&mut self, row: Vec<Value>) -> Result<bool> {
+        if self.rows.len() >= self.limit {
+            self.truncated = true;
+            return Ok(false);
+        }
+        self.rows.push(row);
+        Ok(true)
+    }
+    fn doc(&mut self, doc: Value) -> Result<bool> {
+        let docs = self.docs.get_or_insert_with(Vec::new);
+        if docs.len() >= self.limit {
+            self.truncated = true;
+            return Ok(false);
+        }
+        docs.push(doc);
+        Ok(true)
+    }
+    fn affected(&mut self, rows: u64, detail: Option<Value>) -> Result<()> {
+        let prev = self.affected.take().map(|(n, _)| n).unwrap_or(0);
+        self.affected = Some((prev + rows, detail));
+        Ok(())
+    }
+    fn value(&mut self, v: Value) -> Result<()> {
+        self.value = Some(v);
+        Ok(())
+    }
+}
+
+/// How many documents decide the CSV columns of a document export.
+const CSV_DOC_SAMPLE: usize = 1000;
+
+/// Streams an export to a file, masking each record on the way.
+pub struct ExportWriter<'m> {
+    format: ExportFormat,
+    masker: &'m Masker,
+    table: Option<String>,
+    collection: Option<String>,
+    out: Option<std::io::BufWriter<std::fs::File>>,
+    csv: Option<csv::Writer<std::io::BufWriter<std::fs::File>>>,
+    columns: Vec<Column>,
+    /// Document CSV: first documents, held back until the header is known.
+    pending: Vec<Value>,
+    doc_keys: Option<Vec<String>>,
+    dropped_keys: std::collections::BTreeSet<String>,
+    records: usize,
+    no_rows: bool,
+}
+
+impl<'m> ExportWriter<'m> {
+    /// `table`: source table for SQL `table.column` mask rules; `collection`: for Mongo.
+    pub fn create(path: &Path, format: ExportFormat, masker: &'m Masker, table: Option<String>, collection: Option<String>) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let file = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self {
+            format,
+            masker,
+            table,
+            collection,
+            out: Some(std::io::BufWriter::with_capacity(256 * 1024, file)),
+            csv: None,
+            columns: Vec::new(),
+            pending: Vec::new(),
+            doc_keys: None,
+            dropped_keys: Default::default(),
+            records: 0,
+            no_rows: false,
+        })
+    }
+
+    fn csv(&mut self) -> &mut csv::Writer<std::io::BufWriter<std::fs::File>> {
+        if self.csv.is_none() {
+            self.csv = Some(csv::Writer::from_writer(self.out.take().expect("writer")));
+        }
+        self.csv.as_mut().unwrap()
+    }
+
+    fn write_doc_csv(&mut self, d: &Value) -> Result<()> {
+        let keys = self.doc_keys.clone().unwrap_or_default();
+        if let Value::Object(m) = d {
+            for k in m.keys() {
+                if !keys.contains(k) {
+                    self.dropped_keys.insert(k.clone());
+                }
+            }
+        }
+        self.csv().write_record(keys.iter().map(|k| d.get(k).map(cell_text).unwrap_or_default()))?;
+        Ok(())
+    }
+
+    fn flush_pending_docs(&mut self) -> Result<()> {
+        if self.doc_keys.is_some() {
+            return Ok(());
+        }
+        // Columns = union of top-level keys of the first documents, in first-seen order.
+        let mut keys: Vec<String> = Vec::new();
+        for d in &self.pending {
+            if let Value::Object(m) = d {
+                for k in m.keys() {
+                    if !keys.contains(k) {
+                        keys.push(k.clone());
+                    }
+                }
+            }
+        }
+        self.csv().write_record(&keys)?;
+        self.doc_keys = Some(keys);
+        for d in std::mem::take(&mut self.pending) {
+            self.write_doc_csv(&d)?;
+        }
+        Ok(())
+    }
+
+    /// Flush and close the file. Returns a JSON summary.
+    pub fn finish(mut self) -> Result<Value> {
+        if matches!(self.format, ExportFormat::Csv) && (!self.pending.is_empty() || self.records > 0) && self.columns.is_empty() {
+            self.flush_pending_docs()?;
+        }
+        if self.no_rows && self.records == 0 {
+            anyhow::bail!("statement returned no rows to export");
+        }
+        if let Some(mut c) = self.csv.take() {
+            c.flush()?;
+        }
+        if let Some(mut w) = self.out.take() {
+            w.flush()?;
+        }
+        let mut v = json!({ "records": self.records });
+        if !self.dropped_keys.is_empty() {
+            v["dropped_fields"] = json!(self.dropped_keys);
+            v["note"] = json!(format!(
+                "CSV columns come from the first {CSV_DOC_SAMPLE} documents; these fields only appeared later and were left out (use jsonl to keep everything)"
+            ));
+        }
+        Ok(v)
+    }
+}
+
+impl Sink for ExportWriter<'_> {
+    fn columns(&mut self, mut columns: Vec<Column>) -> Result<()> {
+        for c in &mut columns {
+            c.table = self.table.clone();
+        }
+        if matches!(self.format, ExportFormat::Csv) {
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            self.csv().write_record(&names)?;
+        }
+        self.columns = columns;
+        Ok(())
+    }
+
+    fn row(&mut self, mut row: Vec<Value>) -> Result<bool> {
+        for (col, cell) in self.columns.iter().zip(row.iter_mut()) {
+            self.masker.mask_cell(col.table.as_deref(), &col.name, cell);
+        }
+        match self.format {
+            ExportFormat::Csv => {
+                self.csv().write_record(row.iter().map(cell_text))?;
+            }
+            ExportFormat::Jsonl => {
+                let obj: serde_json::Map<String, Value> =
+                    self.columns.iter().zip(row).map(|(c, v)| (c.name.clone(), v)).collect();
+                let w = self.out.as_mut().expect("writer");
+                serde_json::to_writer(&mut *w, &obj)?;
+                w.write_all(b"\n")?;
+            }
+        }
+        self.records += 1;
+        Ok(true)
+    }
+
+    fn doc(&mut self, mut doc: Value) -> Result<bool> {
+        self.masker.mask_document(self.collection.as_deref(), &mut doc);
+        match self.format {
+            ExportFormat::Jsonl => {
+                let w = self.out.as_mut().expect("writer");
+                serde_json::to_writer(&mut *w, &doc)?;
+                w.write_all(b"\n")?;
+            }
+            ExportFormat::Csv => {
+                if self.doc_keys.is_none() {
+                    self.pending.push(doc);
+                    if self.pending.len() >= CSV_DOC_SAMPLE {
+                        self.flush_pending_docs()?;
+                    }
+                } else {
+                    self.write_doc_csv(&doc)?;
+                }
+            }
+        }
+        self.records += 1;
+        Ok(true)
+    }
+
+    fn affected(&mut self, _rows: u64, _detail: Option<Value>) -> Result<()> {
+        self.no_rows = true;
+        Ok(())
+    }
+
+    fn value(&mut self, mut v: Value) -> Result<()> {
+        self.masker.mask_document(None, &mut v);
+        let w = self.out.as_mut().context("cannot export a single value as CSV")?;
+        serde_json::to_writer(&mut *w, &v)?;
+        w.write_all(b"\n")?;
+        self.records += 1;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Column {
     pub name: String,
@@ -88,69 +344,6 @@ impl Output {
             Output::Value(v) => json!({ "result": truncate_value(v, max_cell_chars) }),
         }
     }
-
-    /// Write the full result to `path`. Returns the number of records written.
-    pub fn export(&self, path: &Path, format: ExportFormat) -> Result<usize> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let file = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-        let mut w = std::io::BufWriter::new(file);
-        let n = match (self, format) {
-            (Output::Table { columns, rows, .. }, ExportFormat::Csv) => {
-                let mut csv = csv::Writer::from_writer(&mut w);
-                csv.write_record(columns.iter().map(|c| c.name.as_str()))?;
-                for r in rows {
-                    csv.write_record(r.iter().map(cell_text))?;
-                }
-                csv.flush()?;
-                rows.len()
-            }
-            (Output::Table { columns, rows, .. }, ExportFormat::Jsonl) => {
-                for r in rows {
-                    let obj: serde_json::Map<String, Value> =
-                        columns.iter().zip(r).map(|(c, v)| (c.name.clone(), v.clone())).collect();
-                    serde_json::to_writer(&mut w, &obj)?;
-                    w.write_all(b"\n")?;
-                }
-                rows.len()
-            }
-            (Output::Documents { docs, .. }, ExportFormat::Jsonl) => {
-                for d in docs {
-                    serde_json::to_writer(&mut w, d)?;
-                    w.write_all(b"\n")?;
-                }
-                docs.len()
-            }
-            (Output::Documents { docs, .. }, ExportFormat::Csv) => {
-                // Columns = union of top-level keys in first-seen order; nested values as JSON.
-                let mut keys: Vec<String> = Vec::new();
-                for d in docs {
-                    if let Value::Object(m) = d {
-                        for k in m.keys() {
-                            if !keys.contains(k) {
-                                keys.push(k.clone());
-                            }
-                        }
-                    }
-                }
-                let mut csv = csv::Writer::from_writer(&mut w);
-                csv.write_record(&keys)?;
-                for d in docs {
-                    csv.write_record(keys.iter().map(|k| d.get(k).map(cell_text).unwrap_or_default()))?;
-                }
-                csv.flush()?;
-                docs.len()
-            }
-            (Output::Value(v), _) => {
-                serde_json::to_writer_pretty(&mut w, v)?;
-                1
-            }
-            (Output::Affected { .. }, _) => anyhow::bail!("statement returned no rows to export"),
-        };
-        w.flush()?;
-        Ok(n)
-    }
 }
 
 fn cell_text(v: &Value) -> String {
@@ -186,22 +379,47 @@ mod tests {
     }
 
     #[test]
-    fn export_csv_and_jsonl() {
+    fn streaming_export() {
         let dir = std::env::temp_dir().join(format!("vareto-test-{}", std::process::id()));
-        let out = Output::Table {
-            columns: vec![
+        let masker = Masker::new(&[]).unwrap();
+        let cols = || {
+            vec![
                 Column { name: "id".into(), type_name: None, table: None },
                 Column { name: "name".into(), type_name: None, table: None },
-            ],
-            rows: vec![vec![json!(1), json!("a,b")], vec![json!(2), Value::Null]],
-            truncated: false,
+            ]
         };
         let csv_path = dir.join("o.csv");
-        assert_eq!(out.export(&csv_path, ExportFormat::Csv).unwrap(), 2);
+        let mut w = ExportWriter::create(&csv_path, ExportFormat::Csv, &masker, None, None).unwrap();
+        w.columns(cols()).unwrap();
+        w.row(vec![json!(1), json!("a,b")]).unwrap();
+        w.row(vec![json!(2), Value::Null]).unwrap();
+        assert_eq!(w.finish().unwrap()["records"], json!(2));
         assert_eq!(std::fs::read_to_string(&csv_path).unwrap(), "id,name\n1,\"a,b\"\n2,\n");
+
         let jl = dir.join("o.jsonl");
-        out.export(&jl, ExportFormat::Jsonl).unwrap();
-        assert_eq!(std::fs::read_to_string(&jl).unwrap(), "{\"id\":1,\"name\":\"a,b\"}\n{\"id\":2,\"name\":null}\n");
+        let mut w = ExportWriter::create(&jl, ExportFormat::Jsonl, &masker, None, None).unwrap();
+        w.columns(cols()).unwrap();
+        w.row(vec![json!(1), json!("x")]).unwrap();
+        w.finish().unwrap();
+        assert_eq!(std::fs::read_to_string(&jl).unwrap(), "{\"id\":1,\"name\":\"x\"}\n");
+
+        // Documents to CSV: header from the first documents, later new keys reported.
+        let dc = dir.join("d.csv");
+        let mut w = ExportWriter::create(&dc, ExportFormat::Csv, &masker, None, None).unwrap();
+        for i in 0..CSV_DOC_SAMPLE {
+            w.doc(json!({"a": i, "b": {"x": 1}})).unwrap();
+        }
+        w.doc(json!({"a": 1, "late": true})).unwrap();
+        let summary = w.finish().unwrap();
+        assert_eq!(summary["records"], json!(CSV_DOC_SAMPLE + 1));
+        assert_eq!(summary["dropped_fields"], json!(["late"]));
+        let text = std::fs::read_to_string(&dc).unwrap();
+        assert!(text.starts_with("a,b\n0,\"{\"\"x\"\":1}\"\n"), "{}", &text[..40]);
+
+        let empty = dir.join("e.csv");
+        let mut w = ExportWriter::create(&empty, ExportFormat::Csv, &masker, None, None).unwrap();
+        w.affected(3, None).unwrap();
+        assert!(w.finish().is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 }

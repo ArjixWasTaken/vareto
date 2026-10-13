@@ -225,8 +225,27 @@ Other kinds (names, cities, ...) can repeat, the way real names do.
 | `list_connections`, `tunnel_list`, `tunnel_open`, `tunnel_close` | Connections and tunnels |
 | `list_databases`, `list_tables`, `describe_table` | Schema introspection; for MongoDB, field types are inferred from a sample |
 | `sql_query`, `mongo_query`, `redis_command` | Queries. Results are capped by `row_limit`, and long cells are truncated |
-| `export_query` | Writes a full result (up to 1M rows) to CSV or JSONL |
+| `export_query` | Streams a full result to CSV or JSONL, with no row cap; bounded by `export_timeout` (default 10 minutes) |
 | `save_connection`, `delete_saved_connection` | Manage connections saved by the assistant |
+
+## Timeouts
+
+| Setting | Default | Applies to |
+|---|---|---|
+| `query_timeout` | 60 s | Each `sql_query`, `mongo_query` and `redis_command` |
+| `export_timeout` | 10 min | Each `export_query` |
+
+Each timeout is enforced by the database itself (Postgres `statement_timeout`, MySQL
+`max_execution_time` for SELECTs, MongoDB `maxTimeMS`), and vareto also stops waiting
+5 s later. Redis has no server-side limit, so only vareto's cutoff applies there.
+
+Exports stream rows straight to the file, so memory use stays flat however many rows a
+query returns. If an export fails, the partial file is deleted. In a CSV export of
+MongoDB documents, the columns are the top-level fields of the first 1000 documents;
+fields that only appear later are listed in the result as `dropped_fields`. Use JSONL
+to keep every field.
+
+The daemon log never contains query text: statement logging is disabled.
 
 ## CLI
 

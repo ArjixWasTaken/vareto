@@ -13,7 +13,7 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Either, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{Connection, Kind};
-use crate::render::{Column, Output};
+use crate::render::{Collector, Column, Output, Sink};
 
 pub enum SqlPool {
     Mysql(MySqlPool),
@@ -148,12 +148,12 @@ where
     Ok(Value::String(format!("base64:{}", base64::engine::general_purpose::STANDARD.encode(bytes))))
 }
 
-/// Collect a `fetch_many` stream into an [`Output`].
-async fn collect<'e, DB, R>(
+/// Feed a `fetch_many` stream into a sink, stopping early when it has enough.
+async fn drain<'e, DB, R>(
     mut stream: futures::stream::BoxStream<'e, Result<Either<DB::QueryResult, R>, sqlx::Error>>,
-    limit: usize,
+    sink: &mut dyn Sink,
     affected_of: fn(&DB::QueryResult) -> u64,
-) -> Result<Output>
+) -> Result<()>
 where
     DB: sqlx::Database,
     R: Row<Database = DB>,
@@ -161,76 +161,83 @@ where
     for<'r> &'r str: sqlx::Decode<'r, R::Database>,
     for<'r> Vec<u8>: sqlx::Decode<'r, R::Database>,
 {
-    let mut columns: Option<Vec<Column>> = None;
-    let mut rows = Vec::new();
+    let mut types: Option<Vec<String>> = None;
     let mut affected = 0u64;
-    let mut truncated = false;
     while let Some(item) = stream.try_next().await? {
         match item {
             Either::Left(res) => affected += affected_of(&res),
             Either::Right(row) => {
-                if columns.is_none() {
-                    columns = Some(
-                        row.columns()
-                            .iter()
-                            .map(|c| Column {
-                                name: c.name().to_string(),
-                                type_name: Some(c.type_info().name().to_string()),
-                                table: None,
-                            })
-                            .collect(),
-                    );
+                if types.is_none() {
+                    let cols: Vec<Column> = row
+                        .columns()
+                        .iter()
+                        .map(|c| Column {
+                            name: c.name().to_string(),
+                            type_name: Some(c.type_info().name().to_string()),
+                            table: None,
+                        })
+                        .collect();
+                    types = Some(cols.iter().map(|c| c.type_name.clone().unwrap_or_default()).collect());
+                    sink.columns(cols)?;
                 }
-                if rows.len() >= limit {
-                    truncated = true;
-                    break;
+                let types = types.as_ref().unwrap();
+                let mut out = Vec::with_capacity(types.len());
+                for (i, t) in types.iter().enumerate() {
+                    out.push(cell(&row, i, t)?);
                 }
-                let cols = columns.as_ref().unwrap();
-                let mut out = Vec::with_capacity(cols.len());
-                for (i, c) in cols.iter().enumerate() {
-                    out.push(cell(&row, i, c.type_name.as_deref().unwrap_or(""))?);
+                if !sink.row(out)? {
+                    return Ok(());
                 }
-                rows.push(out);
             }
         }
     }
-    Ok(match columns {
-        Some(columns) => Output::Table { columns, rows, truncated },
-        None => Output::Affected { rows: affected, detail: None },
-    })
+    if types.is_none() {
+        sink.affected(affected, None)?;
+    }
+    Ok(())
 }
 
 impl SqlPool {
-    /// Run user SQL. In read-only mode it runs inside a READ ONLY transaction that is
-    /// always rolled back.
+    /// Run user SQL, collecting up to `limit` rows.
     pub async fn run(&self, sql: &str, limit: usize, readonly: bool, timeout: Duration) -> Result<Output> {
+        let mut c = Collector::new(limit, None);
+        self.stream(sql, &mut c, readonly, timeout).await?;
+        Ok(c.finish())
+    }
+
+    /// Run user SQL, sending rows to `sink` as they arrive. `timeout` is enforced by
+    /// the server (statement_timeout / max_execution_time) and locally. In read-only
+    /// mode it runs inside a READ ONLY transaction that is always rolled back.
+    pub async fn stream(&self, sql: &str, sink: &mut dyn Sink, readonly: bool, timeout: Duration) -> Result<()> {
         let ms = timeout.as_millis();
         let fut = async {
             match self {
                 SqlPool::Postgres(pool) => {
+                    let affected = |r: &sqlx::postgres::PgQueryResult| r.rows_affected();
                     if readonly {
                         let mut tx = pool.begin_with("BEGIN READ ONLY").await?;
                         sqlx::raw_sql(AssertSqlSafe(format!("SET LOCAL statement_timeout = {ms}"))).execute(&mut *tx).await?;
-                        let out = collect(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), limit, |r: &sqlx::postgres::PgQueryResult| r.rows_affected()).await;
+                        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
                         tx.rollback().await.ok();
                         out
                     } else {
                         let mut c = pool.acquire().await?;
                         sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {ms}"))).execute(&mut *c).await?;
-                        collect(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), limit, |r: &sqlx::postgres::PgQueryResult| r.rows_affected()).await
+                        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
                     }
                 }
                 SqlPool::Mysql(pool) => {
+                    let affected = |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected();
                     if readonly {
                         let mut tx = pool.begin_with("START TRANSACTION READ ONLY").await?;
                         sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(&mut *tx).await.ok();
-                        let out = collect(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), limit, |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected()).await;
+                        let out = drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *tx), sink, affected).await;
                         tx.rollback().await.ok();
                         out
                     } else {
                         let mut c = pool.acquire().await?;
                         sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(&mut *c).await.ok();
-                        collect(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), limit, |r: &sqlx::mysql::MySqlQueryResult| r.rows_affected()).await
+                        drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, affected).await
                     }
                 }
             }

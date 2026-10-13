@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::config::Connection;
 use crate::ipc::{MongoOp, MongoQuery};
-use crate::render::Output;
+use crate::render::{Collector, Output, Sink};
 
 pub struct Mongo {
     client: mongodb::Client,
@@ -79,20 +79,33 @@ impl Mongo {
         Ok(self.client.database(name))
     }
 
+    /// Run an operation, collecting up to `limit` documents.
     pub async fn run(&self, q: &MongoQuery, limit: usize, timeout: Duration) -> Result<Output> {
-        let fut = self.run_inner(q, limit, timeout);
+        let mut c = Collector::new(limit, Some(q.collection.clone()));
+        self.stream(q, Some(limit), &mut c, timeout).await?;
+        Ok(c.finish())
+    }
+
+    /// Run an operation, sending documents to `sink` as the cursor yields them.
+    /// `limit` (if any) is also pushed to the server for `find`. `timeout` is sent as
+    /// `maxTimeMS` and enforced locally.
+    pub async fn stream(&self, q: &MongoQuery, limit: Option<usize>, sink: &mut dyn Sink, timeout: Duration) -> Result<()> {
+        let fut = self.stream_inner(q, limit, sink, timeout);
         tokio::time::timeout(timeout + Duration::from_secs(5), fut)
             .await
             .map_err(|_| anyhow::anyhow!("query timed out after {}s", timeout.as_secs()))?
     }
 
-    async fn run_inner(&self, q: &MongoQuery, limit: usize, timeout: Duration) -> Result<Output> {
+    async fn stream_inner(&self, q: &MongoQuery, limit: Option<usize>, sink: &mut dyn Sink, timeout: Duration) -> Result<()> {
         let coll = self.db(q.database.as_deref())?.collection::<Document>(&q.collection);
         let filter = opt_doc(&q.filter, "filter")?;
-        let collection = Some(q.collection.clone());
-        Ok(match q.op {
+        match q.op {
             MongoOp::Find => {
-                let mut find = coll.find(filter).limit((limit + 1) as i64).max_time(timeout);
+                let mut find = coll.find(filter).max_time(timeout);
+                if let Some(l) = limit {
+                    // One extra so the collector can tell the result was truncated.
+                    find = find.limit((l + 1) as i64);
+                }
                 if let Some(p) = &q.projection {
                     find = find.projection(to_doc(p, "projection")?);
                 }
@@ -102,10 +115,12 @@ impl Mongo {
                 if let Some(n) = q.skip {
                     find = find.skip(n);
                 }
-                let mut docs: Vec<Value> = find.await?.map_ok(to_json).try_collect().await?;
-                let truncated = docs.len() > limit;
-                docs.truncate(limit);
-                Output::Documents { collection, docs, truncated }
+                let mut cursor = find.await?;
+                while let Some(d) = cursor.try_next().await? {
+                    if !sink.doc(to_json(d))? {
+                        break;
+                    }
+                }
             }
             MongoOp::Aggregate => {
                 let pipeline = q
@@ -115,31 +130,26 @@ impl Mongo {
                     .iter()
                     .map(|s| to_doc(s, "pipeline stage"))
                     .collect::<Result<Vec<_>>>()?;
-                let cursor = coll.aggregate(pipeline).max_time(timeout).await?;
-                let mut docs = Vec::new();
-                let mut truncated = false;
-                let mut cursor = cursor;
+                let mut cursor = coll.aggregate(pipeline).max_time(timeout).await?;
                 while let Some(d) = cursor.try_next().await? {
-                    if docs.len() >= limit {
-                        truncated = true;
+                    if !sink.doc(to_json(d))? {
                         break;
                     }
-                    docs.push(to_json(d));
                 }
-                Output::Documents { collection, docs, truncated }
             }
-            MongoOp::Count => Output::Value(json!(coll.count_documents(filter).max_time(timeout).await?)),
+            MongoOp::Count => sink.value(json!(coll.count_documents(filter).max_time(timeout).await?))?,
             MongoOp::Distinct => {
                 let field = q.field.as_deref().context("distinct needs `field`")?;
-                let vals = coll.distinct(field, filter).max_time(timeout).await?;
-                let truncated = vals.len() > limit;
-                let docs: Vec<Value> = vals.into_iter().take(limit).map(Bson::into_relaxed_extjson).collect();
-                Output::Documents { collection, docs, truncated }
+                for v in coll.distinct(field, filter).max_time(timeout).await? {
+                    if !sink.doc(v.into_relaxed_extjson())? {
+                        break;
+                    }
+                }
             }
             MongoOp::InsertOne => {
                 let d = q.documents.as_ref().and_then(|d| d.first()).context("insert_one needs `documents`")?;
                 let r = coll.insert_one(to_doc(d, "document")?).await?;
-                Output::Affected { rows: 1, detail: Some(json!({ "inserted_id": r.inserted_id.into_relaxed_extjson() })) }
+                sink.affected(1, Some(json!({ "inserted_id": r.inserted_id.into_relaxed_extjson() })))?
             }
             MongoOp::InsertMany => {
                 let docs = q
@@ -150,7 +160,7 @@ impl Mongo {
                     .map(|d| to_doc(d, "document"))
                     .collect::<Result<Vec<_>>>()?;
                 let r = coll.insert_many(docs).await?;
-                Output::Affected { rows: r.inserted_ids.len() as u64, detail: None }
+                sink.affected(r.inserted_ids.len() as u64, None)?
             }
             MongoOp::UpdateOne | MongoOp::UpdateMany => {
                 let update = q.update.as_ref().context("update needs `update`")?;
@@ -165,14 +175,12 @@ impl Mongo {
                 } else {
                     coll.update_many(filter, update).await?
                 };
-                Output::Affected {
-                    rows: r.modified_count,
-                    detail: Some(json!({ "matched": r.matched_count, "modified": r.modified_count })),
-                }
+                sink.affected(r.modified_count, Some(json!({ "matched": r.matched_count, "modified": r.modified_count })))?
             }
-            MongoOp::DeleteOne => Output::Affected { rows: coll.delete_one(filter).await?.deleted_count, detail: None },
-            MongoOp::DeleteMany => Output::Affected { rows: coll.delete_many(filter).await?.deleted_count, detail: None },
-        })
+            MongoOp::DeleteOne => sink.affected(coll.delete_one(filter).await?.deleted_count, None)?,
+            MongoOp::DeleteMany => sink.affected(coll.delete_many(filter).await?.deleted_count, None)?,
+        }
+        Ok(())
     }
 
     pub async fn list_databases(&self) -> Result<Output> {

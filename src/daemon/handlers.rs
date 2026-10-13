@@ -10,12 +10,10 @@ use super::{Backend, State};
 use crate::config::{ConfigStore, Connection, ConnectionConfig, Kind, Route, Source};
 use crate::ipc::{ExportFormat, QuerySpec, Request, SaveConnection};
 use crate::readonly::{self, SqlDialect};
-use crate::render::Output;
+use crate::render::{ExportWriter, Output, Sink};
 
 /// Hard cap on rows returned to the model in one response.
 const MAX_ROW_LIMIT: usize = 5_000;
-/// Hard cap on rows written by an export.
-const MAX_EXPORT_ROWS: usize = 1_000_000;
 
 pub async fn handle(state: &State, req: Request, force_readonly: bool) -> Result<Value> {
     match req {
@@ -140,16 +138,49 @@ fn check(conn: &Connection, q: &QuerySpec) -> Result<()> {
     Ok(())
 }
 
+/// Stream a query's full result to a file. No row cap; bounded by `export_timeout`.
 async fn export(state: &State, name: &str, q: &QuerySpec, path: &str, format: ExportFormat, force_readonly: bool) -> Result<Value> {
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         bail!("export path must be absolute");
     }
-    let out = run_query(state, name, q, MAX_EXPORT_ROWS, force_readonly).await?;
-    let truncated = matches!(&out, Output::Table { truncated: true, .. } | Output::Documents { truncated: true, .. });
-    let p = path.clone();
-    let n = tokio::task::spawn_blocking(move || out.export(&p, format)).await??;
-    Ok(json!({ "path": path, "records": n, "truncated": truncated }))
+    let cfg = state.config()?;
+    let timeout = cfg.defaults.export_timeout;
+    let mut conn = cfg.connection(name)?.clone();
+    conn.readonly |= force_readonly;
+    check(&conn, q)?;
+    let live = state.live(&conn).await?;
+
+    let started = std::time::Instant::now();
+    let (table, collection) = match q {
+        QuerySpec::Sql { sql } => (readonly::single_table(dialect(conn.cfg.kind), sql), None),
+        QuerySpec::Mongo(mq) => (None, Some(mq.collection.clone())),
+        QuerySpec::Redis { .. } => (None, None),
+    };
+    let mut w = ExportWriter::create(&path, format, &live.masker, table, collection)?;
+    let res = match (&live.backend, q) {
+        (Backend::Sql(p), QuerySpec::Sql { sql }) => p.stream(sql, &mut w, conn.readonly, timeout).await,
+        (Backend::Mongo(m), QuerySpec::Mongo(mq)) => m.stream(mq, None, &mut w, timeout).await,
+        (Backend::Redis(r), QuerySpec::Redis { args }) => match r.command(args, timeout).await {
+            Ok(Output::Value(v)) => w.value(v),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        },
+        _ => unreachable!("checked above"),
+    };
+    let summary = res.and_then(|()| w.finish());
+    match summary {
+        Ok(mut v) => {
+            v["path"] = json!(path);
+            v["elapsed_secs"] = json!((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+            Ok(v)
+        }
+        Err(e) => {
+            // Don't leave a partial file that looks like a complete export.
+            std::fs::remove_file(&path).ok();
+            Err(e.context(format!("export to {} failed (export_timeout is {}s)", path.display(), timeout.as_secs())))
+        }
+    }
 }
 
 async fn status(state: &State) -> Result<Value> {

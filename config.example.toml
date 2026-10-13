@@ -6,7 +6,8 @@ row_limit = 200            # rows/documents returned per query (max 5000)
 max_cell_chars = 2000      # longer values are truncated in responses
 idle_timeout = "15m"       # close on-demand tunnels after this long unused
 daemon_idle_timeout = "30m"
-query_timeout = "60s"
+query_timeout = "60s"      # per query (sql_query, mongo_query, redis_command)
+export_timeout = "10m"     # per export_query, which streams the whole result to a file
 readonly = true            # default for connections that don't set `readonly`
 
 # Masking applied to every connection (merged with per-connection rules).

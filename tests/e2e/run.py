@@ -56,6 +56,8 @@ os.chmod(ssh_dir / "id_ed25519", 0o600)
 (cfg_dir / "config.toml").write_text("""
 [defaults]
 row_limit = 50
+query_timeout = "2s"
+export_timeout = "30s"
 
 # An SSH hop shared by several databases: one SSH session, one forward per destination.
 [tunnels.dc]
@@ -142,6 +144,9 @@ try:
     check("typed values (int/json/bool)", row[0] == 1 and row[3] == {"n": 1} and row[4] is True, row)
     check("mask partial email", row[1] == "u***@example.com", row[1])
     check("mask glob password", row[2] == "***", row[2])
+    r = v("sql", "pg", "SELECT pg_sleep(3)", ok=False)
+    check("query_timeout cancels slow queries", r.returncode != 0 and "timeout" in r.stderr.lower(), r.stderr)
+
     a = vj("sql", "pg", "SELECT id, name FROM users WHERE id IN (1, 2) ORDER BY id")["rows"]
     b = vj("sql", "pg", "SELECT name, id FROM users WHERE id IN (1, 2) ORDER BY id")["rows"]
     check("fake strategy replaces names", a[0][1] not in ("User 1", "") and a[0][1] != a[1][1], a)
@@ -238,6 +243,22 @@ try:
     body = json.loads(res["result"]["content"][0]["text"])
     lines = export.read_text().splitlines()
     check("mcp export_query (full result, masked)", body["records"] == 300 and len(lines) == 301 and "u***@example.com" in lines[1], body)
+    slow = work / "slow.csv"
+    res = rpc(51, "tools/call", {"name": "export_query", "arguments": {"connection": "pg", "sql": "SELECT pg_sleep(3), 42 AS answer", "path": str(slow), "format": "csv"}})
+    body = json.loads(res["result"]["content"][0]["text"])
+    check("export uses export_timeout, not query_timeout", not res["result"].get("isError") and slow.read_text().splitlines()[1].endswith(",42"), body)
+    mj = work / "customers.jsonl"
+    res = rpc(52, "tools/call", {"name": "export_query", "arguments": {"connection": "mongo", "mongo": {"collection": "customers", "op": "find", "filter": {}}, "path": str(mj), "format": "jsonl"}})
+    lines = mj.read_text().splitlines() if mj.exists() else []
+    check("mongo export streams documents (jsonl)", len(lines) == 2 and json.loads(lines[0])["name"] in ("Ann", "Ben"), res)
+    mc = work / "customers.csv"
+    res = rpc(53, "tools/call", {"name": "export_query", "arguments": {"connection": "mongo", "mongo": {"collection": "customers", "op": "find", "projection": {"_id": 0, "name": 1, "address": 1}}, "path": str(mc), "format": "csv"}})
+    rows = mc.read_text().splitlines() if mc.exists() else []
+    check("mongo export to csv", len(rows) == 3 and rows[0] == "name,address", rows)
+    bad = work / "bad.csv"
+    res = rpc(54, "tools/call", {"name": "export_query", "arguments": {"connection": "pg", "sql": "SELECT * FROM missing_table", "path": str(bad), "format": "csv"}})
+    check("failed export leaves no partial file", res["result"].get("isError") is True and not bad.exists(), res)
+
     res = rpc(6, "tools/call", {"name": "save_connection", "arguments": {"name": "saved-redis", "kind": "redis", "ssh": "e2e-bastion", "host": "redis", "password": "redispass"}})
     saved_ok = not res["result"].get("isError")
     if saved_ok:
@@ -255,6 +276,8 @@ try:
     check("close tunnel drops its connections", "pg" not in st["connected"] and "pg-rw" not in st["connected"], st)
     r = v("open", "dc", ok=False)
     check("SSH hop without remote can't be opened directly", r.returncode != 0 and "SSH hop" in r.stderr, r.stderr)
+    log = (work / "state" / "daemon.log").read_text()
+    check("daemon log contains no SQL text", "pg_sleep" not in log and "FROM users" not in log, [l for l in log.splitlines() if "SELECT" in l][:2])
 finally:
     v("stop", ok=False)
     if not os.environ.get("KEEP"):

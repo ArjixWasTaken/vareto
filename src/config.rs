@@ -39,6 +39,9 @@ pub struct Defaults {
     /// Statement timeout applied to queries.
     #[serde(with = "duration_str")]
     pub query_timeout: Duration,
+    /// Timeout for `export_query`, which streams whole results to a file.
+    #[serde(with = "duration_str")]
+    pub export_timeout: Duration,
     /// Masking applied to every connection (merged with per-connection rules).
     pub mask: MaskConfig,
 }
@@ -52,6 +55,7 @@ impl Default for Defaults {
             daemon_idle_timeout: Duration::from_secs(30 * 60),
             readonly: true,
             query_timeout: Duration::from_secs(60),
+            export_timeout: Duration::from_secs(10 * 60),
             mask: MaskConfig::default(),
         }
     }

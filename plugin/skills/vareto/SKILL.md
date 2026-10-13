@@ -77,7 +77,7 @@ the version changes.
      estimated count, field types inferred from a sample; Redis: type, TTL, size).
 3. **Query with the tool matching the kind**: `sql_query`, `mongo_query`,
    `redis_command`. Start narrow (filters, `LIMIT`, projections) and widen only if needed.
-4. **Large results → `export_query`** (CSV or JSONL, up to 1M rows) instead of paging
+4. **Large results → `export_query`** (CSV or JSONL, streamed, no row cap) instead of paging
    through them in context. Then read/analyse the file with normal tools.
 
 The first call on a tunnelled connection can take a few seconds (SSH handshake +
@@ -183,7 +183,7 @@ way; connections from `config.toml` are the user's to edit.
 | `tunnel "...": ... ConnectFailed` | SSH works, but the server can't reach the DB at the configured remote address. |
 | `unknown connection` / `config error` | Check names with `list_connections`; the user can run `vareto config check`. |
 | `read-only connection: ...` | See *Read-only connections* — report, don't bypass. |
-| `query timed out` | Add filters/indexes-friendly predicates, use `EXPLAIN`, or export a narrower set. |
+| `query timed out` / `operation exceeded time limit` | The query hit `query_timeout` (default 60 s). Narrow it, check `EXPLAIN`, or, if the full result is the goal, use `export_query`, which has its own longer `export_timeout` (default 10 min). Only the user can change either limit, in config.toml. |
 
 For deeper diagnosis the user can run `vareto status` or read the daemon log
 (`~/.local/state/vareto/daemon.log`). If the tools are missing entirely, see

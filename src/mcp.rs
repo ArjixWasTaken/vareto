@@ -181,7 +181,7 @@ impl Server {
         self.forward(Request::Query { connection: a.connection, query: QuerySpec::Redis { args: a.args }, limit: None }).await
     }
 
-    #[tool(description = "Run a query and write the full result (up to 1,000,000 rows) to a CSV or JSONL file instead of returning it. Give exactly one of sql, mongo, redis.")]
+    #[tool(description = "Run a query and stream its full result (no row cap) to a CSV or JSONL file instead of returning it. Bounded by the export timeout (default 10 minutes) rather than the query timeout. Give exactly one of sql, mongo, redis. MongoDB CSV columns come from the first 1000 documents; prefer jsonl for documents with varying fields.")]
     async fn export_query(&self, Parameters(a): Parameters<ExportArgs>) -> Result<CallToolResult, McpError> {
         let query = match (a.sql, a.mongo, a.redis) {
             (Some(sql), None, None) => QuerySpec::Sql { sql },
