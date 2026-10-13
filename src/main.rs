@@ -149,9 +149,15 @@ async fn run_cli(daemon: &Daemon, cmd: Cmd) -> Result<()> {
             println!("CONNECTIONS");
             for c in conns.as_array().into_iter().flatten() {
                 let route = &c["route"];
-                let via = route["direct"].as_str().map(str::to_string).unwrap_or_else(|| {
+                let via = if let Some(d) = route["direct"].as_str() {
+                    d.to_string()
+                } else if let Some(p) = route["socket"].as_str() {
+                    format!("socket {p}")
+                } else if let Some(p) = route["file"].as_str() {
+                    format!("file {p}")
+                } else {
                     format!("tunnel {} ({})", route["tunnel"].as_str().unwrap_or("?"), route["ssh"].as_str().unwrap_or("?"))
-                });
+                };
                 println!(
                     "  {:<20} {:<9} {:<3} {} {}",
                     c["name"].as_str().unwrap_or(""),

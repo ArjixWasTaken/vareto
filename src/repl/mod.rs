@@ -5,6 +5,7 @@ mod mysql;
 mod psql;
 mod redis;
 mod session;
+mod sqlite;
 mod sqlbuf;
 mod table;
 
@@ -125,6 +126,7 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<bool> {
             Kind::Mysql => Box::new(mysql::Mysql::new(&s)),
             Kind::Postgres => Box::new(psql::Psql::new()),
             Kind::Redis => Box::new(redis::Redis::new()),
+            Kind::Sqlite => Box::new(sqlite::Sqlite::new()),
             other => anyhow::bail!("no shell for {} connections yet", other.as_str()),
         };
         let ok = if let Some(cmds) = &opts.execute {

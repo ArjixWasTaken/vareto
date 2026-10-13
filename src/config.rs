@@ -92,6 +92,9 @@ pub enum Kind {
     #[serde(alias = "mongo")]
     Mongodb,
     Redis,
+    /// A local SQLite file (`path`); never tunneled.
+    #[serde(alias = "sqlite3")]
+    Sqlite,
 }
 
 impl Kind {
@@ -101,6 +104,7 @@ impl Kind {
             Kind::Postgres => 5432,
             Kind::Mongodb => 27017,
             Kind::Redis => 6379,
+            Kind::Sqlite => 0,
         }
     }
 
@@ -110,6 +114,7 @@ impl Kind {
             Kind::Postgres => "postgres",
             Kind::Mongodb => "mongodb",
             Kind::Redis => "redis",
+            Kind::Sqlite => "sqlite",
         }
     }
 }
@@ -130,6 +135,12 @@ pub struct ConnectionConfig {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Unix socket of a local server, instead of `host`/`port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    /// SQLite database file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Plaintext, or `${env:VAR}` references.
@@ -178,12 +189,32 @@ pub struct Connection {
 pub enum Route {
     Direct { host: String, port: u16 },
     Tunnel(String),
+    /// A local server's unix socket.
+    Socket(PathBuf),
+    /// A SQLite file.
+    File(PathBuf),
+}
+
+impl Route {
+    /// How `list` shows it.
+    pub fn describe(&self) -> String {
+        match self {
+            Route::Direct { host, port } => join_host_port(host, *port),
+            Route::Tunnel(t) => format!("tunnel {t}"),
+            Route::Socket(p) => format!("socket {}", p.display()),
+            Route::File(p) => format!("file {}", p.display()),
+        }
+    }
 }
 
 impl Connection {
     pub fn route(&self) -> Route {
         if let Some(f) = &self.forward {
             Route::Tunnel(f.clone())
+        } else if let Some(p) = &self.cfg.path {
+            Route::File(expand_home(p))
+        } else if let Some(s) = &self.cfg.socket {
+            Route::Socket(expand_home(s))
         } else {
             Route::Direct {
                 host: self.cfg.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
@@ -191,6 +222,40 @@ impl Connection {
             }
         }
     }
+}
+
+/// `~/x` to `$HOME/x`.
+pub fn expand_home(p: &str) -> PathBuf {
+    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(p),
+    }
+}
+
+/// Settings that only make sense for some connection kinds or routes.
+fn validate_target(name: &str, cfg: &ConnectionConfig) -> Result<()> {
+    let networked = cfg.tunnel.is_some() || cfg.ssh.is_some() || cfg.host.is_some() || cfg.port.is_some();
+    if cfg.kind == Kind::Sqlite {
+        let Some(path) = &cfg.path else { bail!("connection {name:?}: sqlite needs `path` (the database file)") };
+        if networked || cfg.socket.is_some() {
+            bail!("connection {name:?}: sqlite opens a local file; `tunnel`, `ssh`, `host`, `port` and `socket` don't apply");
+        }
+        if cfg.user.is_some() || cfg.password.is_some() || cfg.password_cmd.is_some() || cfg.keyring {
+            bail!("connection {name:?}: sqlite has no users or passwords");
+        }
+        if !expand_home(path).is_absolute() {
+            bail!("connection {name:?}: sqlite `path` must be absolute (or start with ~/)");
+        }
+        return Ok(());
+    }
+    if cfg.path.is_some() {
+        bail!("connection {name:?}: `path` is only for sqlite connections");
+    }
+    // `port` may stay: Postgres names its socket file after it.
+    if cfg.socket.is_some() && (cfg.tunnel.is_some() || cfg.ssh.is_some() || cfg.host.is_some()) {
+        bail!("connection {name:?}: `socket` is for local servers; drop `tunnel`, `ssh` and `host`");
+    }
+    Ok(())
 }
 
 pub fn implicit_tunnel_name(conn: &str) -> String {
@@ -257,6 +322,7 @@ pub fn resolve(main: Config, saved: Config, force_readonly: bool) -> Result<Reso
         if cfg.tunnel.is_some() && cfg.ssh.is_some() {
             bail!("connection {name:?}: set either `tunnel` or `ssh`, not both");
         }
+        validate_target(&name, &cfg)?;
         // Readonly can only be relaxed by a human, in config.toml.
         let readonly = force_readonly
             || source == Source::Saved
@@ -471,6 +537,39 @@ mod tests {
 
         let forced = resolve(main, saved, true).unwrap();
         assert!(forced.connections.values().all(|c| c.readonly));
+    }
+
+    #[test]
+    fn local_targets() {
+        let main = parse(
+            r#"
+            [connections.lite]
+            kind = "sqlite"
+            path = "/data/app.db"
+            [connections.sock]
+            kind = "postgres"
+            socket = "/run/postgresql"
+            [connections.tcp]
+            kind = "mysql"
+            "#,
+        );
+        let r = resolve(main, Config::default(), false).unwrap();
+        assert_eq!(r.connections["lite"].route(), Route::File("/data/app.db".into()));
+        assert_eq!(r.connections["sock"].route(), Route::Socket("/run/postgresql".into()));
+        assert_eq!(r.connections["tcp"].route(), Route::Direct { host: "127.0.0.1".into(), port: 3306 });
+
+        for bad in [
+            "kind = \"sqlite\"",
+            "kind = \"sqlite\"\npath = \"rel.db\"",
+            "kind = \"sqlite\"\npath = \"/a.db\"\nssh = \"h\"",
+            "kind = \"sqlite\"\npath = \"/a.db\"\npassword = \"x\"",
+            "kind = \"postgres\"\npath = \"/a.db\"",
+            "kind = \"postgres\"\nsocket = \"/s\"\nssh = \"h\"",
+            "kind = \"redis\"\nsocket = \"/s\"\nhost = \"h\"",
+        ] {
+            let cfg: Config = toml::from_str(&format!("[connections.x]\n{bad}")).unwrap();
+            assert!(resolve(cfg, Config::default(), false).is_err(), "should reject: {bad}");
+        }
     }
 
     #[test]

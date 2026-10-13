@@ -134,6 +134,7 @@ pub fn check_redis_session(args: &[String], readonly: bool) -> Result<()> {
 pub enum SqlDialect {
     Mysql,
     Postgres,
+    Sqlite,
 }
 
 /// Functions with side effects that a read-only transaction does not stop.
@@ -151,6 +152,9 @@ const SQL_DENIED_FUNCTIONS: &[&str] = &[
 
 /// Parse `sql` and reject anything that is not a single read statement.
 pub fn check_sql(dialect: SqlDialect, sql: &str) -> Result<()> {
+    if dialect == SqlDialect::Sqlite && read_pragma(sql) {
+        return Ok(());
+    }
     let stmts = parse(dialect, sql).map_err(|e| anyhow::anyhow!("read-only connection: could not parse SQL ({e}); only plain read statements are allowed"))?;
     let stmt = match stmts.as_slice() {
         [] => bail!("empty SQL"),
@@ -182,11 +186,12 @@ pub fn session_statement(dialect: SqlDialect, sql: &str) -> bool {
 }
 
 fn parse(dialect: SqlDialect, sql: &str) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
-    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
     use sqlparser::parser::Parser;
     match dialect {
         SqlDialect::Mysql => Parser::parse_sql(&MySqlDialect {}, sql),
         SqlDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+        SqlDialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, sql),
     }
 }
 
@@ -208,6 +213,24 @@ pub fn single_table(dialect: SqlDialect, sql: &str) -> Option<String> {
     if many { None } else { found }
 }
 
+/// SQLite pragmas that only read (in their query form, `PRAGMA name` or
+/// `PRAGMA name(arg)`; `PRAGMA name = value` sets and is never allowed).
+const SQLITE_READ_PRAGMAS: &[&str] = &[
+    "table_info", "table_xinfo", "table_list", "index_list", "index_info", "index_xinfo", "foreign_key_list",
+    "database_list", "collation_list", "function_list", "pragma_list", "compile_options", "user_version",
+    "schema_version", "page_count", "page_size", "encoding", "journal_mode", "foreign_keys", "integrity_check",
+    "quick_check", "foreign_key_check",
+];
+
+/// `PRAGMA [schema.]name[(arg)]` for a read-only pragma. Checked by hand, since
+/// sqlparser only accepts literals as the argument (not `table_info(users)`).
+fn read_pragma(sql: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)^\s*PRAGMA\s+(?:\w+\.)?(\w+)\s*(?:\(\s*(?:\w+|'[^']*'|"[^"]*")\s*\))?\s*;?\s*$"#).unwrap()
+    });
+    RE.captures(sql).is_some_and(|c| SQLITE_READ_PRAGMAS.contains(&c[1].to_ascii_lowercase().as_str()))
+}
+
 struct SqlGuard;
 
 impl sqlparser::ast::Visitor for SqlGuard {
@@ -217,6 +240,10 @@ impl sqlparser::ast::Visitor for SqlGuard {
         use sqlparser::ast::Statement as S;
         let ok = match s {
             S::Query(_) | S::ExplainTable { .. } => true,
+            S::Pragma { name, is_eq: false, .. } => {
+                let n = name.0.last().map(|p| p.to_string().to_ascii_lowercase()).unwrap_or_default();
+                SQLITE_READ_PRAGMAS.contains(&n.as_str())
+            }
             // EXPLAIN ANALYZE executes its statement; the nested statement is visited too.
             S::Explain { .. } => true,
             S::ShowTables { .. }
@@ -296,6 +323,18 @@ mod tests {
             (SqlDialect::Mysql, "SHOW DATABASES"),
         ] {
             check_sql(d, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[test]
+    fn sqlite() {
+        for ok in ["SELECT * FROM t", "PRAGMA table_info(users)", "PRAGMA main.index_list(users)", "PRAGMA user_version",
+                   "SELECT * FROM pragma_table_info('users')"] {
+            check_sql(SqlDialect::Sqlite, ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in ["INSERT INTO t VALUES (1)", "PRAGMA user_version = 3", "PRAGMA journal_mode = DELETE",
+                    "PRAGMA writable_schema", "ATTACH DATABASE '/tmp/x.db' AS x", "VACUUM", "DELETE FROM t"] {
+            assert!(check_sql(SqlDialect::Sqlite, bad).is_err(), "should reject: {bad}");
         }
     }
 

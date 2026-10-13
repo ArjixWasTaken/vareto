@@ -67,6 +67,12 @@ pub struct SaveConnection {
     pub host: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// Unix socket of a server on this machine (instead of host/port/tunnel).
+    #[serde(default)]
+    pub socket: Option<String>,
+    /// SQLite: absolute path of the database file.
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
     /// Stored in the OS keyring, never in the config file.

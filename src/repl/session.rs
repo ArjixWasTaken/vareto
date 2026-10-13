@@ -97,10 +97,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn list_databases(&mut self) -> Result<Value> {
-        self.call(Request::ListDatabases { connection: self.connection.clone() })
-    }
-
     pub fn list_tables(&mut self, database: Option<String>, pattern: Option<String>) -> Result<Value> {
         self.call(Request::ListTables { connection: self.connection.clone(), database, pattern })
     }

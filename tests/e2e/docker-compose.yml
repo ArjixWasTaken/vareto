@@ -10,7 +10,8 @@ services:
   postgres:
     image: postgres:18-alpine
     environment: { POSTGRES_PASSWORD: pgpass, POSTGRES_DB: shop }
-    volumes: ["./seed/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    # The socket directory is shared with the host to test `socket =` connections.
+    volumes: ["./seed/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro", "${SOCK_DIR}:/var/run/postgresql"]
     networks: [internal]
   mariadb:
     image: mariadb:10.11

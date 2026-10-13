@@ -1,4 +1,4 @@
-//! MySQL/MariaDB and PostgreSQL via sqlx.
+//! MySQL/MariaDB, PostgreSQL and SQLite via sqlx.
 //!
 //! Everything runs through `raw_sql` (simple/text protocol), so every value arrives
 //! as text and is converted to JSON based on the column type name.
@@ -10,6 +10,7 @@ use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Column as _, ConnectOptions, Connection as _, Either, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{Connection, Kind};
@@ -18,11 +19,14 @@ use crate::render::{Collector, Column, Output, Sink};
 pub enum SqlPool {
     Mysql(MySqlPool),
     Postgres(PgPool),
+    Sqlite(SqlitePool),
 }
 
 pub struct Endpoint<'a> {
     pub host: &'a str,
     pub port: u16,
+    /// A local server's unix socket, instead of host/port.
+    pub socket: Option<&'a std::path::Path>,
     pub password: Option<&'a str>,
 }
 
@@ -32,6 +36,9 @@ pub async fn connect(conn: &Connection, ep: &Endpoint<'_>) -> Result<SqlPool> {
     match cfg.kind {
         Kind::Postgres => {
             let mut o = PgConnectOptions::new_without_pgpass().host(ep.host).port(ep.port);
+            if let Some(sock) = ep.socket {
+                o = o.socket(sock);
+            }
             if let Some(u) = &cfg.user {
                 o = o.username(u);
             }
@@ -68,6 +75,9 @@ pub async fn connect(conn: &Connection, ep: &Endpoint<'_>) -> Result<SqlPool> {
         }
         Kind::Mysql => {
             let mut o = MySqlConnectOptions::new().host(ep.host).port(ep.port).disable_statement_logging();
+            if let Some(sock) = ep.socket {
+                o = o.socket(sock);
+            }
             if let Some(u) = &cfg.user {
                 o = o.username(u);
             }
@@ -105,6 +115,31 @@ pub async fn connect(conn: &Connection, ep: &Endpoint<'_>) -> Result<SqlPool> {
                 .context("connecting to MySQL")?;
             Ok(SqlPool::Mysql(pool))
         }
+        Kind::Sqlite => {
+            let path = match conn.route() {
+                crate::config::Route::File(p) => p,
+                _ => unreachable!("validated: sqlite has a path"),
+            };
+            if let Some(k) = cfg.params.keys().next() {
+                bail!("unsupported SQLite param {k:?}");
+            }
+            // Read-only connections open the file read-only (SQLITE_OPEN_READONLY),
+            // on top of the statement checks.
+            let o = SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(conn.readonly)
+                .create_if_missing(false)
+                .busy_timeout(Duration::from_secs(5))
+                .disable_statement_logging();
+            let pool = SqlitePoolOptions::new()
+                .max_connections(4)
+                .acquire_timeout(Duration::from_secs(15))
+                .idle_timeout(Duration::from_secs(300))
+                .connect_with(o)
+                .await
+                .with_context(|| format!("opening SQLite database {}", path.display()))?;
+            Ok(SqlPool::Sqlite(pool))
+        }
         _ => unreachable!("not a SQL connection"),
     }
 }
@@ -137,9 +172,13 @@ where
     for<'r> &'r str: sqlx::Decode<'r, R::Database>,
     for<'r> Vec<u8>: sqlx::Decode<'r, R::Database>,
 {
-    if row.try_get_raw(i)?.is_null() {
+    let raw = row.try_get_raw(i)?;
+    if raw.is_null() {
         return Ok(Value::Null);
     }
+    // SQLite expression columns have no declared type ("NULL"); use the value's.
+    let dynamic = (type_name == "NULL").then(|| raw.type_info().name().to_string());
+    let type_name = dynamic.as_deref().unwrap_or(type_name);
     if let Ok(s) = row.try_get_unchecked::<&str, _>(i) {
         return Ok(json_from_text(type_name, s));
     }
@@ -213,6 +252,7 @@ impl SqlPool {
             match self {
                 SqlPool::Postgres(pool) => pg_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout)).await,
                 SqlPool::Mysql(pool) => mysql_stream(&mut *pool.acquire().await?, sql, sink, readonly, Some(timeout)).await,
+                SqlPool::Sqlite(pool) => sqlite_stream(&mut *pool.acquire().await?, sql, sink).await,
             }
         };
         tokio::time::timeout(timeout + Duration::from_secs(5), fut)
@@ -226,6 +266,7 @@ impl SqlPool {
         let mut c = match self {
             SqlPool::Postgres(pool) => SqlConn::Postgres(pool.acquire().await?.detach()),
             SqlPool::Mysql(pool) => SqlConn::Mysql(pool.acquire().await?.detach()),
+            SqlPool::Sqlite(pool) => SqlConn::Sqlite(pool.acquire().await?.detach()),
         };
         c.set_timeout(timeout).await?;
         Ok(c)
@@ -239,6 +280,7 @@ impl SqlPool {
                 SqlConn::Postgres(sqlx::PgConnection::connect_with(&opts).await.with_context(|| format!("connecting to database {database:?}"))?)
             }
             SqlPool::Mysql(_) => bail!("MySQL switches databases with USE"),
+            SqlPool::Sqlite(_) => bail!("a SQLite connection is one database file"),
         };
         c.set_timeout(timeout).await?;
         Ok(c)
@@ -248,6 +290,7 @@ impl SqlPool {
         match self {
             SqlPool::Mysql(p) => p.close().await,
             SqlPool::Postgres(p) => p.close().await,
+            SqlPool::Sqlite(p) => p.close().await,
         }
     }
 
@@ -257,6 +300,7 @@ impl SqlPool {
         let sql = match self {
             SqlPool::Postgres(_) => "SELECT datname AS database FROM pg_database WHERE NOT datistemplate ORDER BY 1",
             SqlPool::Mysql(_) => "SELECT schema_name AS `database` FROM information_schema.schemata ORDER BY 1",
+            SqlPool::Sqlite(_) => "SELECT name AS database, file FROM pragma_database_list ORDER BY seq",
         };
         self.run(sql, 10_000, true, t).await
     }
@@ -278,6 +322,12 @@ impl SqlPool {
                 "SELECT table_name AS name, table_type AS type, table_rows AS approx_rows \
                  FROM information_schema.tables WHERE table_schema = {}{} ORDER BY 1",
                 schema.map(quote_lit).unwrap_or_else(|| "DATABASE()".into()),
+                like.unwrap_or_default()
+            ),
+            SqlPool::Sqlite(_) => format!(
+                "SELECT name, type FROM {}.sqlite_schema WHERE type IN ('table', 'view') \
+                 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'{} ORDER BY 1",
+                quote_ident(schema.unwrap_or("main")),
                 like.unwrap_or_default()
             ),
         };
@@ -323,6 +373,20 @@ impl SqlPool {
                         "SELECT constraint_name AS name, column_name AS `column`, referenced_table_name AS ref_table, \
                          referenced_column_name AS ref_column FROM information_schema.key_column_usage \
                          WHERE table_schema = {sl} AND table_name = {tl} AND referenced_table_name IS NOT NULL"
+                    ),
+                )
+            }
+            SqlPool::Sqlite(_) => {
+                let sl = quote_lit(schema.as_deref().unwrap_or("main"));
+                (
+                    format!(
+                        "SELECT name, type, CASE WHEN \"notnull\" THEN 'NO' ELSE 'YES' END AS nullable, \
+                         dflt_value AS \"default\", pk FROM pragma_table_info({tl}, {sl}) ORDER BY cid"
+                    ),
+                    format!("SELECT name, \"unique\", origin FROM pragma_index_list({tl}, {sl})"),
+                    format!(
+                        "SELECT \"from\" AS \"column\", \"table\" AS ref_table, \"to\" AS ref_column \
+                         FROM pragma_foreign_key_list({tl}, {sl})"
                     ),
                 )
             }
@@ -379,11 +443,16 @@ async fn mysql_stream(c: &mut sqlx::MySqlConnection, sql: &str, sink: &mut dyn S
     }
 }
 
+async fn sqlite_stream(c: &mut sqlx::SqliteConnection, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+    drain(sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&mut *c), sink, |r: &sqlx::sqlite::SqliteQueryResult| r.rows_affected()).await
+}
+
 /// A single connection pinned to an interactive session, so session state (USE,
 /// SET, transactions) carries over between statements.
 pub enum SqlConn {
     Mysql(sqlx::MySqlConnection),
     Postgres(sqlx::PgConnection),
+    Sqlite(sqlx::SqliteConnection),
 }
 
 impl SqlConn {
@@ -397,6 +466,8 @@ impl SqlConn {
                 // Not supported by MariaDB; the local timeout still applies.
                 sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION max_execution_time = {ms}"))).execute(c).await.ok();
             }
+            // No server-side statement timeout; the local one applies.
+            SqlConn::Sqlite(_) => {}
         }
         Ok(())
     }
@@ -407,6 +478,8 @@ impl SqlConn {
         match self {
             SqlConn::Postgres(c) => pg_stream(c, sql, sink, readonly, None).await,
             SqlConn::Mysql(c) => mysql_stream(c, sql, sink, readonly, None).await,
+            // Read-only connections open the file read-only.
+            SqlConn::Sqlite(c) => sqlite_stream(c, sql, sink).await,
         }
     }
 
@@ -429,6 +502,7 @@ impl SqlConn {
         match self {
             SqlConn::Postgres(c) => c.is_in_transaction(),
             SqlConn::Mysql(c) => c.is_in_transaction(),
+            SqlConn::Sqlite(c) => c.is_in_transaction(),
         }
     }
 
@@ -437,8 +511,14 @@ impl SqlConn {
         match self {
             SqlConn::Postgres(c) => c.close().await.ok(),
             SqlConn::Mysql(c) => c.close().await.ok(),
+            SqlConn::Sqlite(c) => c.close().await.ok(),
         };
     }
+}
+
+/// A double-quoted identifier.
+pub fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// Standard-SQL string literal (also valid for MySQL with default sql_mode when

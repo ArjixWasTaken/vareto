@@ -23,7 +23,8 @@ fn enc(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
-pub fn build_uri(conn: &Connection, host: &str, port: u16, password: Option<&str>, tunneled: bool) -> String {
+/// `socket`: a local server's unix socket, used instead of host/port.
+pub fn build_uri(conn: &Connection, host: &str, port: u16, socket: Option<&std::path::Path>, password: Option<&str>, tunneled: bool) -> String {
     let cfg = &conn.cfg;
     let auth = match (&cfg.user, password) {
         (Some(u), Some(p)) => format!("{}:{}@", enc(u), enc(p)),
@@ -39,7 +40,12 @@ pub fn build_uri(conn: &Connection, host: &str, port: u16, password: Option<&str
     params.entry("appName".into()).or_insert_with(|| "vareto".into());
     let query: Vec<String> = params.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect();
     let db = cfg.database.as_deref().map(enc).unwrap_or_default();
-    format!("mongodb://{auth}{}/{db}?{}", crate::config::join_host_port(host, port), query.join("&"))
+    let addr = match socket {
+        // The driver takes a percent-encoded socket path as the host.
+        Some(p) => enc(&p.to_string_lossy()),
+        None => crate::config::join_host_port(host, port),
+    };
+    format!("mongodb://{auth}{addr}/{db}?{}", query.join("&"))
 }
 
 fn to_doc(v: &Value, what: &str) -> Result<Document> {
@@ -281,10 +287,12 @@ mod tests {
         )
         .unwrap();
         let r = resolve(cfg, Config::default(), false).unwrap();
-        let uri = build_uri(&r.connections["m"], "127.0.0.1", 40000, Some("p@ss/w"), true);
+        let uri = build_uri(&r.connections["m"], "127.0.0.1", 40000, None, Some("p@ss/w"), true);
         assert_eq!(
             uri,
             "mongodb://app%20user:p%40ss%2Fw@127.0.0.1:40000/shop?appName=vareto&authSource=admin&directConnection=true"
         );
+        let sock = build_uri(&r.connections["m"], "", 0, Some(std::path::Path::new("/tmp/mongodb-27017.sock")), None, false);
+        assert_eq!(sock, "mongodb://app%20user@%2Ftmp%2Fmongodb%2D27017%2Esock/shop?appName=vareto&authSource=admin");
     }
 }

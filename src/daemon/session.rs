@@ -75,13 +75,12 @@ async fn pin(live: &Live, kind: Kind, cfg_db: Option<&str>, database: Option<&st
             if let (Kind::Mysql, Some(db)) = (kind, database) {
                 c.run(&format!("USE {}", mysql_ident(db)), 1, false).await?;
             }
-            let (db_sql, id_sql) = match kind {
-                Kind::Postgres => ("SELECT current_database()", "SELECT pg_backend_pid()"),
-                _ => ("SELECT DATABASE()", "SELECT CONNECTION_ID()"),
+            let (db, id) = match kind {
+                Kind::Postgres => (c.scalar("SELECT current_database()").await?, c.scalar("SELECT pg_backend_pid()").await?),
+                Kind::Mysql => (c.scalar("SELECT DATABASE()").await?, c.scalar("SELECT CONNECTION_ID()").await?),
+                _ => (Value::from("main"), Value::Null),
             };
-            let db = c.scalar(db_sql).await?.as_str().map(str::to_string);
-            let id = c.scalar(id_sql).await?.as_i64();
-            (Pinned::Sql(c), db, id)
+            (Pinned::Sql(c), db.as_str().map(str::to_string), id.as_i64())
         }
         Backend::Mongo(_) => (Pinned::Mongo, database.or(cfg_db).map(str::to_string), None),
         Backend::Redis(r) => {
@@ -103,6 +102,9 @@ async fn unpin(p: Pinned) {
 
 async fn server_version(live: &Live, pinned: &mut Pinned, timeout: Duration) -> Option<String> {
     match (pinned, &live.backend) {
+        (Pinned::Sql(c), Backend::Sql(crate::db::sql::SqlPool::Sqlite(_))) => {
+            c.scalar("SELECT sqlite_version()").await.ok()?.as_str().map(str::to_string)
+        }
         (Pinned::Sql(c), _) => c.scalar("SELECT version()").await.ok()?.as_str().map(str::to_string),
         (Pinned::Mongo, Backend::Mongo(m)) => m.server_version().await.ok(),
         (Pinned::Redis(con), _) => {
@@ -137,15 +139,8 @@ pub async fn open(state: &State, owner: u64, connection: &str, database: Option<
         "database": database,
         "server_version": version,
         "user": conn.cfg.user,
-        "host": session_host(&conn),
+        "host": conn.route().describe(),
     }))
-}
-
-fn session_host(conn: &Connection) -> String {
-    match conn.route() {
-        crate::config::Route::Direct { host, port } => crate::config::join_host_port(&host, port),
-        crate::config::Route::Tunnel(t) => format!("{t} (tunnel)"),
-    }
 }
 
 async fn get(state: &State, id: u64, owner: Option<u64>) -> Result<Arc<Session>> {
@@ -281,6 +276,7 @@ pub async fn use_db(state: &State, owner: u64, id: u64, database: &str) -> Resul
             inner.database = c.scalar("SELECT DATABASE()").await?.as_str().map(str::to_string);
         }
         Kind::Mongodb => inner.database = Some(database.to_string()),
+        Kind::Sqlite => bail!("a SQLite connection is one database file"),
         Kind::Redis => {
             let Pinned::Redis(con) = &mut inner.pinned else { unreachable!() };
             database.parse::<u32>().with_context(|| format!("redis database must be a number, got {database:?}"))?;
@@ -307,6 +303,7 @@ pub async fn cancel(state: &State, id: u64) -> Result<Value> {
             let sql = match p {
                 crate::db::sql::SqlPool::Postgres(_) => format!("SELECT pg_cancel_backend({pid})"),
                 crate::db::sql::SqlPool::Mysql(_) => format!("KILL QUERY {pid}"),
+                crate::db::sql::SqlPool::Sqlite(_) => unreachable!("no backend id"),
             };
             if p.run(&sql, 1, false, Duration::from_secs(10)).await.is_ok() {
                 return Ok(json!({ "cancelled": true }));

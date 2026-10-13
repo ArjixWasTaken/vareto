@@ -11,7 +11,7 @@ use crate::client::Daemon;
 use crate::ipc::{ExportFormat, MongoQuery, QuerySpec, Request, SaveConnection};
 
 const INSTRUCTIONS: &str = "\
-vareto gives access to databases (MySQL/MariaDB, PostgreSQL, MongoDB, Redis), opening SSH tunnels \
+vareto gives access to databases (MySQL/MariaDB, PostgreSQL, SQLite, MongoDB, Redis), opening SSH tunnels \
 automatically when a connection needs one. Start with `list_connections`. Explore with \
 `list_databases`, `list_tables`, `describe_table`, then query with `sql_query`, `mongo_query` or \
 `redis_command` depending on the connection kind. Connections marked readonly reject writes. \
@@ -34,7 +34,7 @@ pub struct ConnArg {
 pub struct ListTablesArgs {
     /// Connection name.
     pub connection: String,
-    /// MySQL: database. Postgres: schema (default: all non-system schemas). MongoDB: database. Redis: ignored.
+    /// MySQL: database. Postgres: schema (default: all non-system schemas). SQLite: attached database (default `main`). MongoDB: database. Redis: ignored.
     #[serde(default)]
     pub database: Option<String>,
     /// Name filter. SQL: LIKE pattern (`*` allowed). MongoDB: glob. Redis: SCAN MATCH pattern.
@@ -48,14 +48,14 @@ pub struct DescribeArgs {
     pub connection: String,
     /// Table (`schema.table` allowed for Postgres), collection, or Redis key.
     pub table: String,
-    /// MySQL database / Postgres schema / MongoDB database.
+    /// MySQL database / Postgres schema / SQLite attached database / MongoDB database.
     #[serde(default)]
     pub database: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SqlArgs {
-    /// Connection name (a mysql or postgres connection).
+    /// Connection name (a mysql, postgres or sqlite connection).
     pub connection: String,
     /// One SQL statement (several are allowed only on writable connections).
     pub sql: String,
@@ -87,7 +87,7 @@ pub struct RedisArgs {
 pub struct ExportArgs {
     /// Connection name.
     pub connection: String,
-    /// SQL query (mysql/postgres connections).
+    /// SQL query (mysql/postgres/sqlite connections).
     #[serde(default)]
     pub sql: Option<String>,
     /// MongoDB query (mongodb connections).
@@ -166,7 +166,7 @@ impl Server {
         self.forward(Request::DescribeTable { connection: a.connection, database: a.database, table: a.table }).await
     }
 
-    #[tool(description = "Run SQL on a MySQL/MariaDB or PostgreSQL connection. On readonly connections only a single read statement (SELECT/WITH/EXPLAIN/SHOW/DESCRIBE) is allowed and it runs in a READ ONLY transaction.")]
+    #[tool(description = "Run SQL on a MySQL/MariaDB, PostgreSQL or SQLite connection. On readonly connections only a single read statement (SELECT/WITH/EXPLAIN/SHOW/DESCRIBE, read-only SQLite PRAGMAs) is allowed; it runs in a READ ONLY transaction (SQLite: the file is opened read-only).")]
     async fn sql_query(&self, Parameters(a): Parameters<SqlArgs>) -> Result<CallToolResult, McpError> {
         self.forward(Request::Query { connection: a.connection, query: QuerySpec::Sql { sql: a.sql }, limit: a.limit }).await
     }

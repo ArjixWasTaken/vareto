@@ -113,7 +113,11 @@ async fn run_query(state: &State, name: &str, q: &QuerySpec, limit: usize, force
 }
 
 pub(super) fn dialect(kind: Kind) -> SqlDialect {
-    if kind == Kind::Postgres { SqlDialect::Postgres } else { SqlDialect::Mysql }
+    match kind {
+        Kind::Postgres => SqlDialect::Postgres,
+        Kind::Sqlite => SqlDialect::Sqlite,
+        _ => SqlDialect::Mysql,
+    }
 }
 
 /// Kind/query compatibility and read-only guards. `session`: an interactive
@@ -122,7 +126,7 @@ pub(super) fn check(conn: &Connection, q: &QuerySpec, session: bool) -> Result<(
     let kind = conn.cfg.kind;
     match q {
         QuerySpec::Sql { sql } => {
-            if !matches!(kind, Kind::Mysql | Kind::Postgres) {
+            if !matches!(kind, Kind::Mysql | Kind::Postgres | Kind::Sqlite) {
                 bail!("connection {:?} is {}, not SQL", conn.name, kind.as_str());
             }
             if conn.readonly && !(session && readonly::session_statement(dialect(kind), sql)) {
@@ -237,6 +241,8 @@ async fn list_connections(state: &State, force_readonly: bool) -> Result<Value> 
             let route = match c.route() {
                 Route::Direct { host, port } => json!({ "direct": crate::config::join_host_port(&host, port) }),
                 Route::Tunnel(t) => json!({ "tunnel": t, "ssh": cfg.forwards.get(&t).map(|t| t.host.clone()) }),
+                Route::Socket(p) => json!({ "socket": p }),
+                Route::File(p) => json!({ "file": p }),
             };
             let mut v = json!({
                 "name": c.name,
@@ -292,6 +298,8 @@ async fn save_connection(state: &State, s: SaveConnection) -> Result<Value> {
         ssh: s.ssh,
         host: s.host,
         port: s.port,
+        socket: s.socket,
+        path: s.path,
         user: s.user,
         password: None,
         password_cmd: None,

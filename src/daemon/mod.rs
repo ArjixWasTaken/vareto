@@ -123,7 +123,7 @@ impl State {
         let route = conn.route();
         let tunnel_name = match &route {
             Route::Tunnel(t) => Some(t.clone()),
-            Route::Direct { .. } => None,
+            Route::Direct { .. } | Route::Socket(_) | Route::File(_) => None,
         };
         let existing = self.conns.lock().await.get(&conn.name).cloned();
         if let Some(l) = existing {
@@ -143,6 +143,9 @@ impl State {
         let password = tokio::task::spawn_blocking(move || crate::secrets::password(&c2)).await??;
         let (host, port) = match &route {
             Route::Direct { host, port } => (host.clone(), *port),
+            // Local: the backend connects by path. Postgres also picks the socket
+            // file by port (`.s.PGSQL.<port>`).
+            Route::Socket(_) | Route::File(_) => (String::new(), conn.cfg.port.unwrap_or(conn.cfg.kind.default_port())),
             Route::Tunnel(t) => {
                 let t = self.tunnel(t, false).await?;
                 (t.local.ip().to_string(), t.local.port())
@@ -167,17 +170,21 @@ impl State {
     }
 
     async fn connect_backend(&self, conn: &Connection, host: &str, port: u16, password: Option<&str>, tunneled: bool) -> Result<Backend> {
+        let socket = match conn.route() {
+            Route::Socket(p) => Some(p),
+            _ => None,
+        };
         Ok(match conn.cfg.kind {
-            Kind::Mysql | Kind::Postgres => {
-                let ep = crate::db::sql::Endpoint { host, port, password };
+            Kind::Mysql | Kind::Postgres | Kind::Sqlite => {
+                let ep = crate::db::sql::Endpoint { host, port, socket: socket.as_deref(), password };
                 Backend::Sql(crate::db::sql::connect(conn, &ep).await?)
             }
             Kind::Mongodb => {
-                let uri = crate::db::mongo::build_uri(conn, host, port, password, tunneled);
+                let uri = crate::db::mongo::build_uri(conn, host, port, socket.as_deref(), password, tunneled);
                 Backend::Mongo(Mongo::connect(&uri, conn.cfg.database.clone()).await?)
             }
             Kind::Redis => {
-                let url = crate::db::redis::build_url(conn, host, port, password)?;
+                let url = crate::db::redis::build_url(conn, host, port, socket.as_deref(), password)?;
                 Backend::Redis(Redis::connect(&url).await?)
             }
         })

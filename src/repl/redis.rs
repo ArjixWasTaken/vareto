@@ -179,7 +179,7 @@ impl Flavor for Redis {
     }
 
     fn prompt(&self, s: &Session) -> String {
-        let host = s.host.trim_end_matches(" (tunnel)");
+        let host = s.host.strip_prefix("tunnel ").unwrap_or(&s.host);
         let db = match s.database.as_deref() {
             None | Some("0") => String::new(),
             Some(d) => format!("[{d}]"),

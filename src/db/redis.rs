@@ -19,7 +19,8 @@ fn enc(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-pub fn build_url(conn: &Connection, host: &str, port: u16, password: Option<&str>) -> Result<String> {
+/// `socket`: a local server's unix socket, used instead of host/port.
+pub fn build_url(conn: &Connection, host: &str, port: u16, socket: Option<&std::path::Path>, password: Option<&str>) -> Result<String> {
     let cfg = &conn.cfg;
     let auth = match (&cfg.user, password) {
         (Some(u), Some(p)) => format!("{}:{}@", enc(u), enc(p)),
@@ -33,6 +34,16 @@ pub fn build_url(conn: &Connection, host: &str, port: u16, password: Option<&str
     };
     if let Some(k) = cfg.params.keys().next() {
         anyhow::bail!("unsupported Redis param {k:?}");
+    }
+    if let Some(sock) = socket {
+        let mut q = vec![format!("db={db}")];
+        if let Some(u) = &cfg.user {
+            q.push(format!("user={}", enc(u)));
+        }
+        if let Some(p) = password {
+            q.push(format!("pass={}", enc(p)));
+        }
+        return Ok(format!("redis+unix://{}?{}", sock.display(), q.join("&")));
     }
     Ok(format!("redis://{auth}{}/{db}", crate::config::join_host_port(host, port)))
 }
