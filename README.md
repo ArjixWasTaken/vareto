@@ -345,8 +345,11 @@ edit the query buffer in `$EDITOR` (`\e`, `edit`).
     and `\gdesc`.
   - **COPY:** `COPY … FROM STDIN` reads the lines that follow it, up to `\.`, so
     `pg_dump` output loads, `\restrict` included. `COPY … TO STDOUT` prints. `\copy`
-    reads or writes a file, a program or stdin/stdout on your machine. A COPY moves
-    at most 200 MB at a time.
+    reads or writes a file, a program or stdin/stdout on your machine. The data
+    streams between your side and Postgres without passing through the daemon's
+    socket: the CLI hands the daemon its open file, pipe or terminal. So there is
+    no size limit, binary format works, and a shell that dies mid-COPY commits
+    nothing.
   - **Server messages:** `NOTICE`/`WARNING`/`INFO` messages print before the result.
   - **`\password`:** builds the SCRAM-SHA-256 verifier locally, so the password never
     leaves the CLI.

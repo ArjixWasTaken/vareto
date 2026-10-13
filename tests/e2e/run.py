@@ -369,6 +369,47 @@ try:
           and (cfile.read_text() if cfile.exists() else "") == "id,name\n1,one\n2,two\n" and " n\n---\n 4\n(1 row)" in r.stdout
           and " a      | integer" in r.stdout and " b      | text" in r.stdout and "NOTICE:  hello 42" in r.stderr
           and "restricted" in r.stderr and "blocked" not in r.stdout and "free" in r.stdout, r.stdout + r.stderr)
+    # COPY streams through file descriptors: no size cap, binary format, early
+    # failures and dying clients handled.
+    rows = 500_000
+    big = "".join(f"{i}\t{'x' * 90}\n" for i in range(rows))
+    r = subprocess.run([str(BIN), "shell", "pg-rw"], env=env, text=True, capture_output=True, timeout=300,
+                       input="create temp table big (a int, b text);\nCOPY big FROM stdin;\n" + big + "\\.\n"
+                             "select count(*) as n, sum(length(b)) as len from big;\n")
+    check(f"psql: inline COPY of {len(big) // 1_000_000} MB streams in", r.returncode == 0 and f"COPY {rows}" in r.stdout
+          and f" {rows} | {rows * 90}" in r.stdout, (r.stdout + r.stderr)[-2000:])
+    bfile = work / "copy.bin"
+    r = shell("pg-rw", "create temp table bt (a int, b text, c bytea);\n"
+                       "insert into bt values (1, 'one', '\\x00ff0a'), (2, null, null), (3, 'line\nbreak', '');\n"
+                       f"\\copy bt to '{bfile}' with (format binary)\n"
+                       "create temp table bt2 (like bt);\n"
+                       f"\\copy bt2 from '{bfile}' with (format binary)\n"
+                       "select count(*) as same from (select * from bt intersect select * from bt2) x;\n"
+                       "\\copy (select g from generate_series(1, 200000) g) to program 'head -1'\n"
+                       "\\copy bt2 (a) from program 'printf \"7\\n8\\n\"'\n"
+                       "select count(*) as after from bt2;\n")
+    check("psql: binary COPY round trip, COPY to a program that quits early, \\copy from a program",
+          r.returncode == 0 and r.stdout.count("COPY 3") == 2 and " same\n------\n    3" in r.stdout
+          and "\n1\nCOPY 200000" in r.stdout and " after\n-------\n     5" in r.stdout, r.stdout + r.stderr)
+    t0 = time.time()
+    r = subprocess.run([str(BIN), "shell", "pg-rw"], env=env, text=True, capture_output=True, timeout=120,
+                       input="COPY nope FROM stdin;\n" + big[: big.index("\n", 20_000_000) + 1] + "\\.\nselect 'after' as x;\n")
+    check("psql: COPY into a missing table fails at once, the session goes on", r.returncode == 0
+          and 'relation "nope" does not exist' in r.stderr and " after" in r.stdout and time.time() - t0 < 60,
+          (round(time.time() - t0), r.stdout[-500:] + r.stderr[-500:]))
+    v("sql", "pg-rw", "CREATE TABLE IF NOT EXISTS copy_kill (a int)")
+    for sig in (signal.SIGKILL, signal.SIGINT):
+        p = subprocess.Popen([str(BIN), "shell", "pg-rw"], env=env, text=True, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.stdin.write("select 1 as ready;\nCOPY copy_kill FROM stdin;\n" + "1\n" * 100_000); p.stdin.flush()
+        while "(1 row)" not in p.stdout.readline():
+            pass
+        time.sleep(1); p.send_signal(sig)
+        p.wait(timeout=10)
+        time.sleep(1)
+        n = vj("sql", "pg-rw", "SELECT count(*) AS n FROM copy_kill")["rows"][0][0]
+        check(f"psql: a shell killed ({sig.name}) during inline COPY commits nothing", n == 0, n)
+    v("sql", "pg-rw", "DROP TABLE copy_kill")
 
     r = shell("maria", "use information_schema\nselect database();\nselect id, email from shop.users order by id\\G\n")
     check("mysql: USE persists, \\G vertical output", r.returncode == 0 and "Database changed" in r.stdout

@@ -1,6 +1,7 @@
 //! psql.
 
 use std::io::Write as _;
+use std::os::fd::{AsFd as _, OwnedFd};
 
 use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
@@ -44,10 +45,19 @@ pub struct Psql {
     script_dirs: Vec<std::path::PathBuf>,
     tables: Vec<String>,
     columns: Vec<(String, String)>,
-    /// A `COPY … FROM STDIN` waiting for its data (the lines up to `\.`).
-    copy_in: Option<(String, String)>,
+    /// A `COPY … FROM STDIN` taking its data from the input lines, up to `\.`.
+    copy_in: Option<InlineCopy>,
     /// `\restrict KEY` (as pg_dump writes): meta-commands are refused until `\unrestrict KEY`.
     restricted: Option<String>,
+}
+
+/// An inline `COPY … FROM STDIN` in progress: the data lines go into `pipe`, which
+/// the daemon reads.
+struct InlineCopy {
+    sql: String,
+    /// `None` once the daemon stopped reading.
+    pipe: Option<std::io::BufWriter<std::fs::File>>,
+    savepoint: bool,
 }
 
 const HELP: &str = "\
@@ -380,6 +390,15 @@ impl Psql {
 
     /// [`Self::query`], with `run` sending the statement (COPY has its own requests).
     fn query_with(&mut self, sql: &str, s: &mut Session, run: &mut dyn FnMut(&mut Session) -> Result<Value>) -> Result<Value> {
+        let savepoint = self.before_query(sql, s)?;
+        let res = run(s);
+        self.after_query(sql, s, res, savepoint)
+    }
+
+    /// What psql does before sending a statement: ECHO, the implicit BEGIN of
+    /// `AUTOCOMMIT off`, the `ON_ERROR_ROLLBACK` savepoint. Returns whether it set
+    /// the savepoint.
+    fn before_query(&mut self, sql: &str, s: &mut Session) -> Result<bool> {
         self.last = sql.to_string();
         self.stmt = sql.to_string();
         if self.var("ECHO") == "queries" || (self.var("ECHO") == "all" && self.interactive) {
@@ -403,7 +422,12 @@ impl Psql {
         if savepoint {
             s.sql("SAVEPOINT pg_psql_temporary_savepoint")?;
         }
-        let res = run(s);
+        Ok(savepoint)
+    }
+
+    /// What psql does after a statement: release or roll back to the savepoint,
+    /// print notices, set `ROW_COUNT`, `ERROR`, `SQLSTATE` and friends.
+    fn after_query(&mut self, sql: &str, s: &mut Session, res: Result<Value>, savepoint: bool) -> Result<Value> {
         if savepoint {
             match &res {
                 Ok(_) => {
@@ -424,8 +448,6 @@ impl Psql {
                 }
                 let rows: u64 = if let Some(n) = v["rows"].as_u64() {
                     n
-                } else if let Some(data) = v["data"].as_str() {
-                    copy::count_rows(sql, data) as u64
                 } else {
                     QueryResult::from_json(&v)
                     .into_parts()
@@ -468,17 +490,8 @@ impl Psql {
 
     fn execute_with(&mut self, sql: &str, vertical: bool, opts: &PrintOpts, s: &mut Session) -> Result<()> {
         match copy::direction(sql) {
-            Some(Direction::In) => {
-                self.start_copy_in(sql);
-                return Ok(());
-            }
-            Some(Direction::Out) => {
-                let v = self.query_with(sql, s, &mut |s| s.copy_out(sql))?;
-                let data = v["data"].as_str().unwrap_or("");
-                out::text(data);
-                self.note(&format!("COPY {}", copy::count_rows(sql, data)));
-                return Ok(());
-            }
+            Some(Direction::In) => return self.start_copy_in(sql, s),
+            Some(Direction::Out) => return self.copy_to_output(sql, s),
             None => {}
         }
         let v = self.query(sql, s)?;
@@ -502,61 +515,127 @@ impl Psql {
         Ok(())
     }
 
-    /// Collect the data lines of a `COPY … FROM STDIN` (up to `\.` or the end of input).
-    fn start_copy_in(&mut self, sql: &str) {
+    /// Start a `COPY … FROM STDIN` whose data is the input lines that follow, up to
+    /// `\.` or the end of input. They stream to the daemon through a pipe as they
+    /// are read.
+    fn start_copy_in(&mut self, sql: &str, s: &mut Session) -> Result<()> {
+        let savepoint = self.before_query(sql, s)?;
+        let pipe = match s.start_copy_in(sql) {
+            Ok(p) => p,
+            Err(e) => return self.after_query(sql, s, Err(e), savepoint).map(drop),
+        };
         if self.interactive && !self.flag("QUIET") {
             eprintln!("Enter data to be copied followed by a newline.\nEnd with a backslash and a period on a line by itself, or an EOF signal.");
         }
-        self.copy_in = Some((sql.to_string(), String::new()));
+        self.copy_in = Some(InlineCopy { sql: sql.to_string(), pipe: Some(std::io::BufWriter::with_capacity(1 << 16, pipe)), savepoint });
+        Ok(())
     }
 
-    /// Send a COPY's data.
-    fn copy_data(&mut self, sql: &str, data: String, s: &mut Session) -> Result<()> {
-        let mut data = Some(data);
-        let v = self.query_with(sql, s, &mut |s| s.copy_in(sql, data.take().unwrap_or_default()))?;
+    /// One data line of an inline COPY.
+    fn copy_line(&mut self, line: &str) {
+        let Some(c) = self.copy_in.as_mut() else { return };
+        if let Some(pipe) = c.pipe.as_mut() {
+            // A broken pipe: the daemon stopped reading (the COPY failed). Keep
+            // swallowing data lines; its error is reported at the end.
+            let mut data = Vec::with_capacity(line.len() + 1);
+            data.extend_from_slice(line.as_bytes());
+            data.push(b'\n');
+            if pipe.write_all(&crate::ipc::copy_frame(&data)).is_err() {
+                c.pipe = None;
+            }
+        }
+    }
+
+    /// End an inline COPY's data and report the result.
+    fn end_copy_in(&mut self, s: &mut Session) -> Result<()> {
+        let Some(c) = self.copy_in.take() else { return Ok(()) };
+        if let Some(mut pipe) = c.pipe {
+            // The empty frame: the data is complete.
+            pipe.write_all(&crate::ipc::copy_frame(&[])).and_then(|()| pipe.flush()).ok();
+        }
+        let res = s.finish_streaming();
+        s.track(&c.sql, res.is_ok());
+        let v = self.after_query(&c.sql, s, res, c.savepoint)?;
         self.note(&format!("COPY {}", v["rows"].as_u64().unwrap_or(0)));
         Ok(())
     }
 
-    /// `\copy`: COPY with the file on this side.
+    /// Ctrl-C during an inline COPY: abort it.
+    fn cancel_copy_in(&mut self, s: &mut Session) {
+        if let Some(c) = self.copy_in.take() {
+            // Cancel before closing the pipe, so the daemon aborts instead of
+            // taking the end of the data as the end of the COPY.
+            s.cancel();
+            drop(c.pipe);
+            let res = s.finish_streaming();
+            s.track(&c.sql, res.is_ok());
+            if let Err(e) = self.after_query(&c.sql, s, res, c.savepoint) {
+                eprintln!("{}", self.error(&e));
+            }
+        }
+    }
+
+    /// `COPY … TO STDOUT` into the current output (the terminal, `\o`, `\g file`).
+    fn copy_to_output(&mut self, sql: &str, s: &mut Session) -> Result<()> {
+        let dst = match out::stream_fd()? {
+            Some(fd) => fd,
+            None => std::io::stdout().as_fd().try_clone_to_owned()?,
+        };
+        let v = self.query_with(sql, s, &mut |s| s.copy_out(sql, dst.as_fd()))?;
+        self.note(&format!("COPY {}", v["rows"].as_u64().unwrap_or(0)));
+        Ok(())
+    }
+
+    /// `\copy`: COPY with the file on this side. The daemon reads or writes the
+    /// file, program or output this process opened.
     fn meta_copy(&mut self, arg: &str, s: &mut Session) -> Result<()> {
+        use std::process::{Command, Stdio};
         let m = copy::parse_meta(arg)?;
-        match m.direction {
-            Direction::In => {
-                let data = match &m.endpoint {
-                    Endpoint::Std | Endpoint::PStd => {
-                        self.start_copy_in(&m.sql);
-                        return Ok(());
-                    }
-                    Endpoint::File(f) => std::fs::read_to_string(f).with_context(|| f.clone())?,
+        let sql = m.sql.clone();
+        match (m.direction, &m.endpoint) {
+            (Direction::In, Endpoint::Std | Endpoint::PStd) => self.start_copy_in(&sql, s),
+            (Direction::In, Endpoint::File(f)) => {
+                let file = std::fs::File::open(f).with_context(|| f.clone())?;
+                let v = self.query_with(&sql, s, &mut |s| s.copy_in(&sql, file.as_fd()))?;
+                self.note(&format!("COPY {}", v["rows"].as_u64().unwrap_or(0)));
+                Ok(())
+            }
+            (Direction::In, Endpoint::Program(cmd)) => {
+                let mut child = Command::new("sh").arg("-c").arg(cmd).stdout(Stdio::piped()).spawn()?;
+                let stdout = child.stdout.take().expect("piped");
+                let res = self.query_with(&sql, s, &mut |s| s.copy_in(&sql, stdout.as_fd()));
+                drop(stdout);
+                let status = child.wait()?;
+                let v = res?;
+                if !status.success() {
+                    bail!("program \"{cmd}\" failed: {status}");
+                }
+                self.note(&format!("COPY {}", v["rows"].as_u64().unwrap_or(0)));
+                Ok(())
+            }
+            (Direction::Out, Endpoint::Std) => self.copy_to_output(&sql, s),
+            (Direction::Out, endpoint) => {
+                let mut child = None;
+                let dst: OwnedFd = match endpoint {
+                    Endpoint::File(f) => std::fs::File::create(f).with_context(|| f.clone())?.into(),
                     Endpoint::Program(cmd) => {
-                        let o = std::process::Command::new("sh").arg("-c").arg(cmd).stderr(std::process::Stdio::inherit()).output()?;
-                        if !o.status.success() {
-                            bail!("program \"{cmd}\" failed: {}", o.status);
-                        }
-                        String::from_utf8(o.stdout).context("program output is not UTF-8")?
+                        let mut c = Command::new("sh").arg("-c").arg(cmd).stdin(Stdio::piped()).spawn()?;
+                        let stdin = c.stdin.take().expect("piped");
+                        child = Some(c);
+                        stdin.into()
+                    }
+                    _ => {
+                        out::flush();
+                        std::io::stdout().flush().ok();
+                        std::io::stdout().as_fd().try_clone_to_owned()?
                     }
                 };
-                self.copy_data(&m.sql, data, s)
-            }
-            Direction::Out => {
-                let v = self.query_with(&m.sql, s, &mut |s| s.copy_out(&m.sql))?;
-                let data = v["data"].as_str().unwrap_or("");
-                match &m.endpoint {
-                    Endpoint::Std => out::text(data),
-                    Endpoint::PStd => {
-                        out::flush();
-                        print!("{data}");
-                        std::io::stdout().flush().ok();
-                    }
-                    Endpoint::File(f) => std::fs::write(f, data).with_context(|| f.clone())?,
-                    Endpoint::Program(cmd) => {
-                        let mut child = std::process::Command::new("sh").arg("-c").arg(cmd).stdin(std::process::Stdio::piped()).spawn()?;
-                        child.stdin.take().expect("piped").write_all(data.as_bytes()).ok();
-                        child.wait()?;
-                    }
+                let res = self.query_with(&sql, s, &mut |s| s.copy_out(&sql, dst.as_fd()));
+                drop(dst);
+                if let Some(mut c) = child {
+                    c.wait()?;
                 }
-                self.note(&format!("COPY {}", copy::count_rows(&m.sql, data)));
+                self.note(&format!("COPY {}", res?["rows"].as_u64().unwrap_or(0)));
                 Ok(())
             }
         }
@@ -1651,14 +1730,12 @@ impl Flavor for Psql {
     }
 
     fn line(&mut self, line: &str, s: &mut Session) -> Result<Flow> {
-        if let Some((_, data)) = &mut self.copy_in {
-            if line != "\\." {
-                data.push_str(line);
-                data.push('\n');
-                return Ok(Flow::Continue);
+        if self.copy_in.is_some() {
+            if line == "\\." {
+                self.end_copy_in(s)?;
+            } else {
+                self.copy_line(line);
             }
-            let (sql, data) = self.copy_in.take().expect("checked");
-            self.copy_data(&sql, data, s)?;
             return Ok(Flow::Continue);
         }
         if self.var("ECHO") == "all" && !self.interactive {
@@ -1689,9 +1766,7 @@ impl Flavor for Psql {
             eprintln!("reached EOF without finding closing \\endif(s)");
         }
         // End of input ends a COPY's data.
-        if let Some((sql, data)) = self.copy_in.take() {
-            self.copy_data(&sql, data, s)?;
-        }
+        self.end_copy_in(s)?;
         let rest = self.buf.take();
         if !rest.is_empty() {
             self.execute(&rest, End::Normal, s)?;
@@ -1715,8 +1790,8 @@ impl Flavor for Psql {
         0
     }
 
-    fn reset(&mut self) {
-        self.copy_in = None;
+    fn reset(&mut self, s: &mut Session) {
+        self.cancel_copy_in(s);
         self.buf.clear();
     }
 

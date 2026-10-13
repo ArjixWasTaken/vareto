@@ -15,8 +15,14 @@ use crate::render::{ExportWriter, Output, Sink};
 /// Hard cap on rows returned to the model in one response.
 const MAX_ROW_LIMIT: usize = 5_000;
 
-pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bool, fd: Option<std::os::fd::OwnedFd>) -> Result<Value> {
-    let _ = &fd;
+pub async fn handle(
+    state: &State,
+    req: Request,
+    client: u64,
+    force_readonly: bool,
+    fd: Option<std::os::fd::OwnedFd>,
+    peer: Option<std::os::fd::OwnedFd>,
+) -> Result<Value> {
     match req {
         Request::Status => status(state).await,
         Request::ListConnections => list_connections(state, force_readonly).await,
@@ -70,8 +76,14 @@ pub async fn handle(state: &State, req: Request, client: u64, force_readonly: bo
             let limit = limit.unwrap_or(state.config()?.defaults.row_limit).clamp(1, MAX_ROW_LIMIT);
             session::query(state, client, session, session::Op::Query { query, limit, warnings }).await
         }
-        Request::SessionCopyIn { session, sql, data } => session::query(state, client, session, session::Op::CopyIn { sql, data }).await,
-        Request::SessionCopyOut { session, sql } => session::query(state, client, session, session::Op::CopyOut { sql }).await,
+        Request::SessionCopyIn { session, sql, framed } => {
+            let fd = fd.context("SessionCopyIn needs a file descriptor")?;
+            session::query(state, client, session, session::Op::CopyIn { sql, fd, framed, peer }).await
+        }
+        Request::SessionCopyOut { session, sql } => {
+            let fd = fd.context("SessionCopyOut needs a file descriptor")?;
+            session::query(state, client, session, session::Op::CopyOut { sql, fd }).await
+        }
         Request::SessionDescribe { session, sql } => session::query(state, client, session, session::Op::Describe { sql }).await,
         Request::SessionReset { session } => session::reset(state, client, session).await,
         Request::SessionUse { session, database } => session::use_db(state, client, session, &database).await,

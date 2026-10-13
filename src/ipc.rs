@@ -55,9 +55,14 @@ pub enum Request {
     /// Switch the session's database (Postgres reconnects, MySQL `USE`, Mongo's
     /// current db, Redis `SELECT`).
     SessionUse { session: u64, database: String },
-    /// Postgres `COPY … FROM STDIN`, with the data (text or CSV format).
-    SessionCopyIn { session: u64, sql: String, data: String },
-    /// Postgres `COPY … TO STDOUT`; the data comes back as text.
+    /// Postgres `COPY … FROM STDIN`; the data is read from the descriptor sent with
+    /// the request. `framed`: the data comes in [`copy_frame`]s ending with an empty
+    /// one, so a client that dies mid-stream aborts the COPY instead of committing
+    /// what it sent; otherwise the descriptor's end is the data's end (a file).
+    /// Returns `{"rows": n}`.
+    SessionCopyIn { session: u64, sql: String, #[serde(default)] framed: bool },
+    /// Postgres `COPY … TO STDOUT`; the data is written to the descriptor sent with
+    /// the request. Returns `{"rows": n}`.
     SessionCopyOut { session: u64, sql: String },
     /// The result columns of a statement without running it (psql `\gdesc`).
     SessionDescribe { session: u64, sql: String },
@@ -70,7 +75,7 @@ pub enum Request {
 impl Request {
     /// Requests sent with a file descriptor ([`send_with_fd`]).
     pub fn takes_fd(&self) -> bool {
-        false
+        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. })
     }
 
     /// The request's `op` name, for messages.
@@ -247,10 +252,33 @@ impl FdStream {
         self.fds.lock().unwrap().pop_front()
     }
 
+    /// A second descriptor for the socket itself (for [`peer_closed`]).
+    pub fn socket_fd(&self) -> io::Result<OwnedFd> {
+        use std::os::fd::AsFd as _;
+        self.inner.as_fd().try_clone_to_owned()
+    }
+
     /// Close descriptors nobody asked for.
     pub fn drop_fds(&self) {
         self.fds.lock().unwrap().clear();
     }
+}
+
+/// One chunk of framed COPY data (`SessionCopyIn { framed: true }`): a big-endian
+/// u32 length, then the bytes. An empty chunk ends the data.
+pub fn copy_frame(data: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(4 + data.len());
+    f.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    f.extend_from_slice(data);
+    f
+}
+
+/// Whether the other end of a connected socket has closed it (the client went
+/// away), without consuming anything it sent.
+pub fn peer_closed(fd: BorrowedFd<'_>) -> bool {
+    use nix::sys::socket::{recv, MsgFlags};
+    let mut b = [0u8; 1];
+    matches!(recv(fd.as_raw_fd(), &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT), Ok(0))
 }
 
 /// At most this many descriptors per message (requests send one).
@@ -384,11 +412,19 @@ impl Client {
 
     /// [`Self::call`] for a request that takes a file descriptor ([`Request::takes_fd`]).
     pub async fn call_with_fd(&mut self, req: &Request, fd: BorrowedFd<'_>) -> Result<Value> {
-        send_with_fd(&mut self.conn, req, fd).await?;
+        self.send_with_fd(req, fd).await?;
         self.response().await
     }
 
-    async fn response(&mut self) -> Result<Value> {
+    /// The first half of [`Self::call_with_fd`], for a request that streams from a
+    /// pipe the caller keeps feeding: the caller closes its copy of `fd` right after
+    /// this, so the pipe breaks if the daemon gives up early.
+    pub async fn send_with_fd(&mut self, req: &Request, fd: BorrowedFd<'_>) -> Result<()> {
+        send_with_fd(&mut self.conn, req, fd).await
+    }
+
+    /// The answer to the request sent last.
+    pub async fn response(&mut self) -> Result<Value> {
         match recv::<Response>(&mut self.conn).await? {
             Some(Response::Ok { result }) => Ok(result),
             Some(Response::Err { error, info }) => Err(ServerError { message: error, info }.into()),

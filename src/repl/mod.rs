@@ -144,7 +144,7 @@ pub trait Flavor {
     /// Unfinished input is buffered.
     fn pending(&self) -> bool;
     /// Drop buffered input (Ctrl-C).
-    fn reset(&mut self);
+    fn reset(&mut self, s: &mut Session);
     /// An error, worded the way the native client prints it.
     fn error(&self, e: &anyhow::Error) -> String;
     /// Reload completion words (table names, ...) after connecting or switching databases.
@@ -404,14 +404,14 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
                 *words.borrow_mut() = f.completions();
             }
             Err(ReadlineError::Interrupted) => {
-                f.reset();
+                f.reset(s);
                 entry.clear();
             }
             Err(ReadlineError::Eof) => {
                 if !f.pending() {
                     break;
                 }
-                f.reset();
+                f.reset(s);
                 entry.clear();
             }
             Err(e) => {

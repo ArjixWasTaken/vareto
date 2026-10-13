@@ -159,13 +159,6 @@ fn take_name(s: &str) -> Result<(String, bool, &str)> {
     Ok((s[..end].to_string(), false, &s[end..]))
 }
 
-/// The rows a COPY moved, from its text or CSV data (a CSV header isn't a row).
-pub fn count_rows(sql: &str, data: &str) -> usize {
-    let lines = data.lines().count();
-    let upper = sql.to_ascii_uppercase();
-    if upper.contains("HEADER") && upper.contains("CSV") { lines.saturating_sub(1) } else { lines }
-}
-
 /// A SCRAM-SHA-256 password verifier, in the form Postgres stores
 /// (`SCRAM-SHA-256$iterations:salt$StoredKey:ServerKey`), so `ALTER ROLE … PASSWORD`
 /// never carries the password itself.
@@ -220,12 +213,6 @@ mod tests {
         assert_eq!(m.endpoint, Endpoint::Program("gzip -dc x.gz".into()));
         assert!(parse_meta("users").is_err());
         assert!(parse_meta("to x").is_err());
-    }
-
-    #[test]
-    fn rows() {
-        assert_eq!(count_rows("COPY t TO STDOUT", "1\n2\n"), 2);
-        assert_eq!(count_rows("COPY t TO STDOUT (FORMAT CSV, HEADER)", "a\n1\n"), 1);
     }
 
     #[test]

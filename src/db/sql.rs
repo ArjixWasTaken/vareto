@@ -6,6 +6,9 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
@@ -557,6 +560,186 @@ async fn sqlite_stream(c: &mut sqlx::SqliteConnection, sql: &str, sink: &mut dyn
     Ok(())
 }
 
+/// Where a COPY FROM's data comes from (see `ipc::Request::SessionCopyIn`).
+pub struct CopySource {
+    pub fd: OwnedFd,
+    /// The data is in `ipc::copy_frame`s, ended by an empty one.
+    pub framed: bool,
+    /// The client's socket: a COPY whose client went away is aborted, not committed.
+    pub peer: Option<OwnedFd>,
+}
+
+/// Decodes `ipc::copy_frame`s from a byte stream.
+#[derive(Default)]
+struct Unframer {
+    /// Bytes of an unfinished length prefix.
+    len_buf: Vec<u8>,
+    /// Bytes still to come of the current chunk.
+    left: usize,
+    ended: bool,
+}
+
+impl Unframer {
+    /// The data bytes in `input` (which may hold several chunks, or parts of them).
+    fn feed(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(input.len());
+        while !input.is_empty() {
+            if self.ended {
+                anyhow::bail!("unexpected COPY data after its end");
+            }
+            if self.left > 0 {
+                let n = self.left.min(input.len());
+                out.extend_from_slice(&input[..n]);
+                self.left -= n;
+                input = &input[n..];
+                continue;
+            }
+            let n = (4 - self.len_buf.len()).min(input.len());
+            self.len_buf.extend_from_slice(&input[..n]);
+            input = &input[n..];
+            if self.len_buf.len() == 4 {
+                let len = u32::from_be_bytes([self.len_buf[0], self.len_buf[1], self.len_buf[2], self.len_buf[3]]) as usize;
+                self.len_buf.clear();
+                if len == 0 {
+                    self.ended = true;
+                } else {
+                    self.left = len;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// COPY data moves in chunks of this size.
+const COPY_CHUNK: usize = 1 << 20;
+
+/// Raise `statement_timeout` to `timeout` for a COPY (which may legitimately run as
+/// long as an export); returns the setting to restore.
+async fn pg_long_timeout(c: &mut sqlx::PgConnection, timeout: Duration) -> Result<String> {
+    let old: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')").fetch_one(&mut *c).await?;
+    sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {}", timeout.as_millis()))).execute(&mut *c).await?;
+    Ok(old)
+}
+
+async fn restore_timeout(c: &mut sqlx::PgConnection, old: String) {
+    sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {}", quote_lit(&old)))).execute(&mut *c).await.ok();
+}
+
+/// Counts the rows in COPY output as it streams by: lines for text and CSV (less
+/// a CSV header), tuples for the binary format (recognised by its signature).
+pub struct RowCounter {
+    csv_header: bool,
+    seen: u64,
+    /// The first bytes, until there are enough to tell the format.
+    head: Option<Vec<u8>>,
+    binary: Option<Binary>,
+}
+
+/// Where the binary-format parser is: the bytes it still needs, and what they are.
+struct Binary {
+    pending: Vec<u8>,
+    need: usize,
+    part: Part,
+    fields_left: u16,
+    done: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    /// Signature (11), flags (4), header extension length (4).
+    Header,
+    HeaderExt,
+    FieldCount,
+    FieldLen,
+    FieldData,
+}
+
+const PG_BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+
+impl RowCounter {
+    pub fn new(csv_header: bool) -> Self {
+        Self { csv_header, seen: 0, head: Some(Vec::new()), binary: None }
+    }
+
+    pub fn feed(&mut self, data: &[u8]) {
+        let Some(head) = self.head.as_mut() else { return self.count_in(data) };
+        head.extend_from_slice(data);
+        if head.len() < PG_BINARY_SIGNATURE.len() {
+            return;
+        }
+        let head = self.head.take().expect("checked");
+        if head.starts_with(PG_BINARY_SIGNATURE) {
+            self.binary = Some(Binary { pending: Vec::new(), need: 19, part: Part::Header, fields_left: 0, done: false });
+        }
+        self.count_in(&head);
+    }
+
+    fn count_in(&mut self, mut data: &[u8]) {
+        let Some(b) = self.binary.as_mut() else {
+            self.seen += data.iter().filter(|&&c| c == b'\n').count() as u64;
+            return;
+        };
+        while !data.is_empty() && !b.done {
+            let take = (b.need - b.pending.len()).min(data.len());
+            if b.part == Part::FieldData || b.part == Part::HeaderExt {
+                // Skipped bytes needn't be kept.
+                b.need -= take;
+            } else {
+                b.pending.extend_from_slice(&data[..take]);
+            }
+            data = &data[take..];
+            let complete = match b.part {
+                Part::FieldData | Part::HeaderExt => b.need == 0,
+                _ => b.pending.len() == b.need,
+            };
+            if !complete {
+                continue;
+            }
+            let p = std::mem::take(&mut b.pending);
+            match b.part {
+                Part::Header => {
+                    let ext = u32::from_be_bytes([p[15], p[16], p[17], p[18]]) as usize;
+                    (b.part, b.need) = if ext > 0 { (Part::HeaderExt, ext) } else { (Part::FieldCount, 2) };
+                }
+                Part::HeaderExt => (b.part, b.need) = (Part::FieldCount, 2),
+                Part::FieldCount => {
+                    let n = i16::from_be_bytes([p[0], p[1]]);
+                    if n < 0 {
+                        b.done = true;
+                    } else {
+                        self.seen += 1;
+                        b.fields_left = n as u16;
+                        (b.part, b.need) = if n > 0 { (Part::FieldLen, 4) } else { (Part::FieldCount, 2) };
+                    }
+                }
+                Part::FieldLen => {
+                    let len = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+                    b.fields_left -= 1;
+                    let next = if b.fields_left > 0 { (Part::FieldLen, 4) } else { (Part::FieldCount, 2) };
+                    (b.part, b.need) = if len > 0 { (Part::FieldData, len as usize) } else { next };
+                }
+                Part::FieldData => {
+                    (b.part, b.need) = if b.fields_left > 0 { (Part::FieldLen, 4) } else { (Part::FieldCount, 2) };
+                }
+            }
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        // Output shorter than the signature is text.
+        if let Some(head) = &self.head {
+            let lines = head.iter().filter(|&&c| c == b'\n').count() as u64;
+            return if self.csv_header { lines.saturating_sub(1) } else { lines };
+        }
+        match self.binary {
+            Some(_) => self.seen,
+            None if self.csv_header => self.seen.saturating_sub(1),
+            None => self.seen,
+        }
+    }
+}
+
 /// A single connection pinned to an interactive session, so session state (USE,
 /// SET, transactions) carries over between statements.
 pub enum SqlConn {
@@ -607,45 +790,118 @@ impl SqlConn {
         Ok(c.finish())
     }
 
-    /// Postgres `COPY … FROM STDIN`, fed with `data`. Returns the rows copied.
-    pub async fn copy_in(&mut self, sql: &str, data: &[u8]) -> Result<u64> {
+    /// Postgres `COPY … FROM STDIN`, fed from `src` (the client's file or pipe) until
+    /// it ends. `cancelled` aborts the copy instead of committing it, even when the
+    /// client closes its end first. `timeout` replaces the statement timeout for the
+    /// copy. Returns the rows copied.
+    pub async fn copy_in(&mut self, sql: &str, src: CopySource, cancelled: &AtomicBool, timeout: Duration) -> Result<u64> {
+        use tokio::io::AsyncReadExt as _;
         let SqlConn::Postgres(c) = self else { anyhow::bail!("COPY FROM STDIN is Postgres-only") };
+        let restore = pg_long_timeout(c, timeout).await?;
         let res = async {
             let mut w = c.copy_in_raw(sql).await?;
-            w.send(data).await?;
-            w.finish().await
+            let mut file = tokio::fs::File::from_std(std::fs::File::from(src.fd));
+            let mut buf = vec![0u8; COPY_CHUNK];
+            let mut frames = src.framed.then(Unframer::default);
+            // Why the data ended badly, if it did; the COPY is then aborted.
+            let failure = loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    break Some("canceling statement due to user request".to_string());
+                }
+                let n = match file.read(&mut buf).await {
+                    Ok(0) => {
+                        break match &frames {
+                            Some(f) if !f.ended => Some("the client went away during COPY".into()),
+                            _ => None,
+                        };
+                    }
+                    Ok(n) => n,
+                    Err(e) => break Some(format!("could not read COPY data: {e}")),
+                };
+                match frames.as_mut() {
+                    None => {
+                        w.send(&buf[..n]).await?;
+                    }
+                    Some(f) => {
+                        let data = match f.feed(&buf[..n]) {
+                            Ok(d) => d,
+                            Err(e) => break Some(e.to_string()),
+                        };
+                        if !data.is_empty() {
+                            w.send(data.as_slice()).await?;
+                        }
+                        if f.ended {
+                            break None;
+                        }
+                    }
+                }
+            };
+            let failure = failure
+                .or_else(|| cancelled.load(Ordering::SeqCst).then(|| "canceling statement due to user request".to_string()))
+                .or_else(|| {
+                    src.peer
+                        .as_ref()
+                        .is_some_and(|p| crate::ipc::peer_closed(std::os::fd::AsFd::as_fd(p)))
+                        .then(|| "the client went away during COPY".to_string())
+                });
+            if let Some(why) = failure {
+                w.abort(why.clone()).await.ok();
+                anyhow::bail!(why);
+            }
+            Ok(w.finish().await?)
         }
         .await;
-        res.map_err(|e| server_message(e.into()))
+        restore_timeout(c, restore).await;
+        res.map_err(server_message)
     }
 
-    /// Postgres `COPY … TO STDOUT`. `readonly` runs it in a READ ONLY transaction.
-    /// More than `max` bytes is an error (the rest is still read, so the connection
-    /// stays usable).
-    pub async fn copy_out(&mut self, sql: &str, readonly: bool, max: usize) -> Result<Vec<u8>> {
+    /// Postgres `COPY … TO STDOUT`, written to `dst` (the client's file, pipe or
+    /// terminal) as it arrives. `readonly` runs it in a READ ONLY transaction.
+    /// Returns the rows copied.
+    pub async fn copy_out(&mut self, sql: &str, readonly: bool, dst: OwnedFd, timeout: Duration) -> Result<u64> {
         let SqlConn::Postgres(c) = self else { anyhow::bail!("COPY TO STDOUT is Postgres-only") };
-        async fn read(c: &mut sqlx::PgConnection, sql: &str, max: usize) -> Result<Vec<u8>> {
+        async fn write(c: &mut sqlx::PgConnection, sql: &str, dst: OwnedFd, csv_header: bool) -> Result<u64> {
+            use tokio::io::AsyncWriteExt as _;
+            let mut dst = tokio::fs::File::from_std(std::fs::File::from(dst));
             let mut stream = c.copy_out_raw(sql).await?;
-            let (mut buf, mut total) = (Vec::new(), 0usize);
+            let mut rows = RowCounter::new(csv_header);
+            let mut failed = None;
             while let Some(chunk) = stream.try_next().await? {
-                total += chunk.len();
-                if total <= max {
-                    buf.extend_from_slice(&chunk);
+                rows.feed(&chunk);
+                // On a write error (the reader went away) keep draining, so the
+                // connection stays usable.
+                if failed.is_none() {
+                    if let Err(e) = dst.write_all(&chunk).await {
+                        failed = Some(e);
+                    }
                 }
             }
-            if total > max {
-                anyhow::bail!("COPY output is {total} bytes, more than the {max} a shell can receive");
+            if failed.is_none() {
+                if let Err(e) = dst.flush().await {
+                    failed = Some(e);
+                }
             }
-            Ok(buf)
+            match failed {
+                Some(e) if e.kind() != std::io::ErrorKind::BrokenPipe => anyhow::bail!("could not write COPY data: {e}"),
+                _ => Ok(rows.count()),
+            }
         }
+        let upper = sql.to_ascii_uppercase();
+        let csv_header = upper.contains("CSV") && upper.contains("HEADER");
+        let restore = pg_long_timeout(c, timeout).await?;
         let res = if readonly {
-            let mut tx = c.begin_with("BEGIN READ ONLY").await?;
-            let r = read(&mut tx, sql, max).await;
-            tx.rollback().await.ok();
-            r
+            match c.begin_with("BEGIN READ ONLY").await {
+                Ok(mut tx) => {
+                    let r = write(&mut tx, sql, dst, csv_header).await;
+                    tx.rollback().await.ok();
+                    r
+                }
+                Err(e) => Err(e.into()),
+            }
         } else {
-            read(c, sql, max).await
+            write(c, sql, dst, csv_header).await
         };
+        restore_timeout(c, restore).await;
         res.map_err(server_message)
     }
 
@@ -709,6 +965,59 @@ pub fn quote_lit(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn copy_frames() {
+        let mut stream = crate::ipc::copy_frame(b"1\tone\n");
+        stream.extend(crate::ipc::copy_frame(b"2\ttwo\n"));
+        stream.extend(crate::ipc::copy_frame(b""));
+        // Any split of the stream decodes the same.
+        for size in [1, 3, 5, 64] {
+            let mut u = Unframer::default();
+            let data: Vec<u8> = stream.chunks(size).flat_map(|c| u.feed(c).unwrap()).collect();
+            assert_eq!(data, b"1\tone\n2\ttwo\n");
+            assert!(u.ended);
+        }
+        // Without the empty frame the data hasn't ended (the client went away).
+        let mut u = Unframer::default();
+        u.feed(&crate::ipc::copy_frame(b"x")).unwrap();
+        assert!(!u.ended);
+    }
+
+    #[test]
+    fn copy_row_counts() {
+        let mut c = RowCounter::new(false);
+        c.feed(b"1\tone\n2\t");
+        c.feed(b"two\n");
+        assert_eq!(c.count(), 2);
+        let mut c = RowCounter::new(true);
+        c.feed(b"id,name\n1,one\n");
+        assert_eq!(c.count(), 1);
+
+        // Binary format: header, then (int2 fields, [int4 len, bytes]...) per tuple,
+        // then -1. Three tuples: (int4 7, NULL), (text "hi", text "") and ().
+        let mut data = PG_BINARY_SIGNATURE.to_vec();
+        data.extend_from_slice(&0u32.to_be_bytes()); // flags
+        data.extend_from_slice(&0u32.to_be_bytes()); // no header extension
+        data.extend_from_slice(&2i16.to_be_bytes());
+        data.extend_from_slice(&4i32.to_be_bytes());
+        data.extend_from_slice(&7i32.to_be_bytes());
+        data.extend_from_slice(&(-1i32).to_be_bytes());
+        data.extend_from_slice(&2i16.to_be_bytes());
+        data.extend_from_slice(&2i32.to_be_bytes());
+        data.extend_from_slice(b"hi");
+        data.extend_from_slice(&0i32.to_be_bytes());
+        data.extend_from_slice(&0i16.to_be_bytes()); // a tuple with no columns
+        data.extend_from_slice(&(-1i16).to_be_bytes());
+        // Fed byte by byte, so every state crosses a chunk boundary; a `\n` byte
+        // inside the binary data must not count.
+        let mut c = RowCounter::new(false);
+        data.chunks(1).for_each(|b| c.feed(b));
+        assert_eq!(c.count(), 3);
+        let mut c = RowCounter::new(false);
+        c.feed(&data);
+        assert_eq!(c.count(), 3);
+    }
 
     #[test]
     fn text_conversion() {

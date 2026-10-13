@@ -418,7 +418,7 @@ impl Flavor for Mongo {
         !self.buf.is_empty()
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, _s: &mut Session) {
         self.buf.clear();
     }
 

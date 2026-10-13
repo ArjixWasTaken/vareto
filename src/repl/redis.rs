@@ -217,7 +217,7 @@ impl Flavor for Redis {
         false
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self, _s: &mut Session) {}
 
     fn error(&self, e: &anyhow::Error) -> String {
         let t = error_text(e);

@@ -7,6 +7,7 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::process::{Child, Stdio};
 use std::sync::{LazyLock, Mutex};
 
@@ -205,6 +206,22 @@ pub fn flush() {
             }
         }
     }
+}
+
+/// The current output target as a descriptor the daemon can write to directly
+/// (COPY TO STDOUT), after writing out what's queued. `None` while `tee` is on:
+/// the output then has to reach two places.
+pub fn stream_fd() -> Result<Option<OwnedFd>> {
+    flush();
+    let s = state();
+    if s.tee.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(match &s.target {
+        Target::Stdout => std::io::stdout().as_fd().try_clone_to_owned()?,
+        Target::File(f) => f.as_fd().try_clone_to_owned()?,
+        Target::Pipe(child) => child.stdin.as_ref().context("the output pipe is closed")?.as_fd().try_clone_to_owned()?,
+    }))
 }
 
 fn page(cmd: &str, text: &str) -> Result<()> {

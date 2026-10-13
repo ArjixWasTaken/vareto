@@ -342,6 +342,8 @@ async fn serve_client_inner(state: &State, client: u64, stream: tokio::net::Unix
         // A descriptor arrives with its request's frame; any other is stray.
         let fd = if req.takes_fd() { conn.get_ref().take_fd() } else { None };
         conn.get_ref().drop_fds();
+        // Streaming requests check, before committing, that the client is still there.
+        let peer = if req.takes_fd() { conn.get_ref().socket_fd().ok() } else { None };
         let resp = match req {
             Request::Hello { version, force_readonly: f } => {
                 greeted = true;
@@ -360,7 +362,7 @@ async fn serve_client_inner(state: &State, client: u64, stream: tokio::net::Unix
                 return Ok(());
             }
             req if req.takes_fd() && fd.is_none() => Err(anyhow::anyhow!("protocol error: {} needs a file descriptor", req.op())),
-            req => handlers::handle(state, req, client, force_readonly, fd).await,
+            req => handlers::handle(state, req, client, force_readonly, fd, peer).await,
         };
         let resp = match resp {
             Ok(result) => Response::Ok { result },
