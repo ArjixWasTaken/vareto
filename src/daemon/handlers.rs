@@ -80,6 +80,10 @@ pub async fn handle(
             let fd = fd.context("SessionCopyIn needs a file descriptor")?;
             session::query(state, client, session, session::Op::CopyIn { sql, fd, framed, peer }).await
         }
+        Request::SessionStream { session, sql, format, warnings } => {
+            let fd = fd.context("SessionStream needs a file descriptor")?;
+            session::query(state, client, session, session::Op::Stream { sql, format, fd, warnings }).await
+        }
         Request::SessionCopyOut { session, sql } => {
             let fd = fd.context("SessionCopyOut needs a file descriptor")?;
             session::query(state, client, session, session::Op::CopyOut { sql, fd }).await

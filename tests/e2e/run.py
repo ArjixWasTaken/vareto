@@ -410,6 +410,26 @@ try:
         n = vj("sql", "pg-rw", "SELECT count(*) AS n FROM copy_kill")["rows"][0][0]
         check(f"psql: a shell killed ({sig.name}) during inline COPY commits nothing", n == 0, n)
     v("sql", "pg-rw", "DROP TABLE copy_kill")
+    # Results going to a file or pipe stream with no row limit (streamable layouts).
+    sfile = work / "stream.csv"
+    r = shell("pg-rw", f"\\pset format csv\n\\o {sfile}\nselect g, 'x' as t from generate_series(1, 20000) g;\n\\o\n"
+                       "\\o |head -2\nselect g from generate_series(1, 200000) g;\n\\o\n\\pset format aligned\nselect 'alive' as a;\n")
+    lines = sfile.read_text().splitlines() if sfile.exists() else []
+    check("psql: csv to \\o streams every row; a pipe that quits early is fine", r.returncode == 0 and len(lines) == 20001
+          and lines[:2] == ["g,t", "1,x"] and lines[-1] == "20000,x" and " alive" in r.stdout, (len(lines), r.stdout[-300:] + r.stderr))
+    r = shell("pg", "\\pset format unaligned\nselect email from users order by id;\n")
+    out_lines = r.stdout.splitlines()[1:]  # after "Output format is unaligned."
+    check("psql: streamed rows are masked", r.returncode == 0 and len(out_lines) == 302 and out_lines[-1] == "(300 rows)"
+          and all("***@" in l for l in out_lines[1:-1]), r.stdout[:300] + r.stderr)
+    r = shell("mysql8", "set cte_max_recursion_depth = 30000;\n"
+                        "with recursive s(n) as (select 1 union all select n + 1 from s where n < 20000) select n, 'a\\tb' as t from s;\n", "-B")
+    lines = r.stdout.splitlines()
+    check("mysql: --batch to a pipe streams every row", r.returncode == 0 and len(lines) == 20001 and lines[0] == "n\tt"
+          and lines[1] == "1\ta\\tb" and lines[-1] == "20000\ta\\tb", (len(lines), r.stdout[:200] + r.stderr))
+    r = shell("lite", ".mode csv\nwith recursive c(x) as (select 1 union all select x + 1 from c where x < 20000) select x from c;\n")
+    lines = r.stdout.splitlines()
+    check("sqlite3: csv to a pipe streams every row", r.returncode == 0 and len(lines) == 20001 and lines[-1] == "20000",
+          (len(lines), r.stdout[:200] + r.stderr))
 
     r = shell("maria", "use information_schema\nselect database();\nselect id, email from shop.users order by id\\G\n")
     check("mysql: USE persists, \\G vertical output", r.returncode == 0 and "Database changed" in r.stdout

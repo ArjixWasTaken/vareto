@@ -231,6 +231,25 @@ impl PrintOpts {
         }
     }
 
+    /// The format as the daemon streams it, for `unaligned` and `csv`. `vertical`:
+    /// `\gx`.
+    pub fn stream_format(&self, vertical: bool) -> Option<crate::textfmt::StreamFormat> {
+        use crate::textfmt::StreamFormat;
+        Some(match self.format {
+            Format::Unaligned => StreamFormat::PsqlUnaligned {
+                fieldsep: self.fieldsep.clone(),
+                recordsep: self.recordsep.clone(),
+                null: self.null.clone(),
+                header: !self.tuples_only,
+                footer: self.footer,
+                title: self.title.clone(),
+                expanded: vertical || self.expanded == Expanded::On,
+            },
+            Format::Csv => StreamFormat::PsqlCsv { delimiter: self.csv_fieldsep, null: self.null.clone(), header: !self.tuples_only },
+            _ => return None,
+        })
+    }
+
     fn footer_line(&self, n: usize) -> Option<String> {
         (self.footer && !self.tuples_only).then(|| format!("({n} row{})", if n == 1 { "" } else { "s" }))
     }
@@ -247,8 +266,13 @@ impl PrintOpts {
             Format::Aligned | Format::Wrapped if expanded => self.expanded_aligned(columns, rows),
             Format::Aligned => self.with_title_footer(self.aligned(columns, rows, None), rows.len(), true),
             Format::Wrapped => self.with_title_footer(self.aligned(columns, rows, Some(width)), rows.len(), true),
-            Format::Unaligned => self.unaligned(columns, rows, expanded),
-            Format::Csv => self.csv(columns, rows),
+            Format::Unaligned | Format::Csv => {
+                let f = self.stream_format(vertical).expect("streamable");
+                let mut text = crate::textfmt::render(&f, columns, &[], rows);
+                // The caller adds the final newline.
+                text.pop();
+                text
+            }
             Format::Html => self.html(columns, rows),
             Format::Asciidoc => self.asciidoc(columns, rows),
         }
@@ -358,44 +382,6 @@ impl PrintOpts {
             }
         }
         out.join("\n")
-    }
-
-    fn unaligned(&self, columns: &[String], rows: &[Vec<Value>], expanded: bool) -> String {
-        let mut out = String::new();
-        if let (Some(t), false) = (&self.title, self.tuples_only) {
-            out.push_str(t);
-            out.push_str(&self.recordsep);
-        }
-        if expanded {
-            let recs: Vec<String> = rows
-                .iter()
-                .map(|r| columns.iter().zip(r).map(|(c, v)| format!("{c}{}{}", self.fieldsep, self.cell(v))).collect::<Vec<_>>().join(&self.recordsep))
-                .collect();
-            out.push_str(&recs.join(&format!("{0}{0}", self.recordsep)));
-        } else {
-            let mut lines = Vec::new();
-            if !self.tuples_only {
-                lines.push(columns.join(&self.fieldsep));
-            }
-            lines.extend(rows.iter().map(|r| r.iter().map(|v| self.cell(v)).collect::<Vec<_>>().join(&self.fieldsep)));
-            out.push_str(&lines.join(&self.recordsep));
-        }
-        if let Some(f) = self.footer_line(rows.len()) {
-            out.push_str(&self.recordsep);
-            out.push_str(&f);
-        }
-        out
-    }
-
-    fn csv(&self, columns: &[String], rows: &[Vec<Value>]) -> String {
-        let mut w = csv::WriterBuilder::new().delimiter(self.csv_fieldsep as u8).terminator(csv::Terminator::Any(b'\n')).from_writer(Vec::new());
-        if !self.tuples_only {
-            w.write_record(columns).ok();
-        }
-        for r in rows {
-            w.write_record(r.iter().map(|v| self.cell(v))).ok();
-        }
-        String::from_utf8_lossy(&w.into_inner().unwrap_or_default()).trim_end_matches('\n').to_string()
     }
 
     fn html(&self, columns: &[String], rows: &[Vec<Value>]) -> String {

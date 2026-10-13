@@ -64,6 +64,10 @@ pub enum Request {
     /// Postgres `COPY … TO STDOUT`; the data is written to the descriptor sent with
     /// the request. Returns `{"rows": n}`.
     SessionCopyOut { session: u64, sql: String },
+    /// Run a query and write its rows, formatted, to the descriptor sent with the
+    /// request (a shell's `\o` file or pipe, or redirected stdout), with no row
+    /// limit. Returns `{"rows": n}` (and MySQL `warnings`).
+    SessionStream { session: u64, sql: String, format: crate::textfmt::StreamFormat, #[serde(default)] warnings: bool },
     /// The result columns of a statement without running it (psql `\gdesc`).
     SessionDescribe { session: u64, sql: String },
     SessionClose { session: u64 },
@@ -75,7 +79,7 @@ pub enum Request {
 impl Request {
     /// Requests sent with a file descriptor ([`send_with_fd`]).
     pub fn takes_fd(&self) -> bool {
-        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. })
+        matches!(self, Request::SessionCopyIn { .. } | Request::SessionCopyOut { .. } | Request::SessionStream { .. })
     }
 
     /// The request's `op` name, for messages.

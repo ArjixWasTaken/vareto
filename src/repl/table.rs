@@ -78,49 +78,11 @@ impl QueryResult {
     }
 }
 
-/// MySQL's binary column types.
-pub fn is_binary_type(t: &str) -> bool {
-    let t = t.to_ascii_uppercase();
-    matches!(t.as_str(), "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT" | "GEOMETRY")
-}
-
-/// The bytes of a binary value as it arrives: `base64:…` when it isn't UTF-8, else
-/// the text itself.
-pub fn value_bytes(v: &Value) -> Option<Vec<u8>> {
-    use base64::Engine;
-    let s = v.as_str()?;
-    match s.strip_prefix("base64:") {
-        Some(b) => base64::engine::general_purpose::STANDARD.decode(b).ok(),
-        None => Some(s.as_bytes().to_vec()),
-    }
-}
-
-/// `0x…` hex, as the mysql client shows binary values.
-pub fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 + bytes.len() * 2);
-    out.push_str("0x");
-    for b in bytes {
-        out.push_str(&format!("{b:02X}"));
-    }
-    out
-}
-
-/// Cell text. `null` is how NULL prints (`NULL` in mysql, empty in psql).
-pub fn cell(v: &Value, null: &str) -> String {
-    match v {
-        Value::Null => null.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        other => other.to_string(),
-    }
-}
+pub use crate::textfmt::{cell, is_binary_type};
 
 /// psql prints booleans as `t`/`f`.
 pub fn psql_cell(v: &Value) -> String {
-    match v {
-        Value::Bool(b) => if *b { "t" } else { "f" }.into(),
-        v => cell(v, ""),
-    }
+    crate::textfmt::psql_cell(v, "")
 }
 
 fn numeric(rows: &[Vec<Value>], i: usize) -> bool {
@@ -201,38 +163,8 @@ pub fn vertical_mysql(columns: &[String], rows: &[Vec<Value>]) -> String {
     out.trim_end().to_string()
 }
 
-/// sqlite3 `.mode line`.
-pub fn line_sqlite(columns: &[String], rows: &[Vec<Value>]) -> String {
-    let w = columns.iter().map(|c| c.chars().count()).max().unwrap_or(0);
-    rows.iter()
-        .map(|r| columns.iter().zip(r).map(|(c, v)| format!("{c:>w$} = {}", cell(v, ""))).collect::<Vec<_>>().join("\n"))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
 
-/// sqlite3 `.mode csv`.
-pub fn csv(columns: &[String], rows: &[Vec<Value>], headers: bool) -> String {
-    let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::Any(b'\n')).from_writer(Vec::new());
-    if headers {
-        w.write_record(columns).ok();
-    }
-    for r in rows {
-        w.write_record(r.iter().map(|v| cell(v, ""))).ok();
-    }
-    String::from_utf8_lossy(&w.into_inner().unwrap_or_default()).trim_end().to_string()
-}
 
-/// sqlite3 `.mode json`.
-pub fn json(columns: &[String], rows: &[Vec<Value>]) -> String {
-    let objs: Vec<String> = rows
-        .iter()
-        .map(|r| {
-            let m: serde_json::Map<String, Value> = columns.iter().cloned().zip(r.iter().cloned()).collect();
-            serde_json::to_string(&m).unwrap_or_default()
-        })
-        .collect();
-    format!("[{}]", objs.join(",\n"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -268,8 +200,5 @@ mod tests {
     fn sqlite_modes() {
         let (c, r) = data();
         assert_eq!(table(&c, &r, Style::Column, true, &|v| cell(v, "")), "id  name\n--  ----\n 1  ann\n10");
-        assert_eq!(line_sqlite(&c, &r[..1]), "  id = 1\nname = ann");
-        assert_eq!(csv(&c, &r, true), "id,name\n1,ann\n10,");
-        assert_eq!(json(&c, &r[..1]), r#"[{"id":1,"name":"ann"}]"#);
     }
 }

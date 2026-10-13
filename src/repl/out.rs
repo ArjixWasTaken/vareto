@@ -224,6 +224,17 @@ pub fn stream_fd() -> Result<Option<OwnedFd>> {
     }))
 }
 
+/// [`stream_fd`], but only when the output goes to a file or pipe (`\o`, `\g
+/// file`, redirected stdout): results can then stream there with no row limit, as
+/// native clients write them. The terminal keeps the row limit.
+pub fn bulk_fd() -> Result<Option<OwnedFd>> {
+    let to_stdout = matches!(state().target, Target::Stdout);
+    if to_stdout && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Ok(None);
+    }
+    stream_fd()
+}
+
 fn page(cmd: &str, text: &str) -> Result<()> {
     let mut child = super::shell_command(cmd).stdin(Stdio::piped()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {

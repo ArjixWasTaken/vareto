@@ -4,6 +4,7 @@ use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
 use super::out::{self, outln};
+use crate::textfmt::StreamFormat;
 use super::session::{Session, Tx};
 use super::sqlbuf::{Dialect, End, Mode, Open, SqlBuf};
 use super::table::{self, QueryResult, Style};
@@ -135,13 +136,6 @@ fn find_command(line: &str, start: &Mode) -> Option<usize> {
 }
 
 /// Batch mode escaping: `\n`, `\t`, `\0` and `\` as escapes (unless `--raw`).
-fn batch_cell(v: &Value, raw: bool) -> String {
-    let text = table::cell(v, "NULL");
-    if raw {
-        return text;
-    }
-    text.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t").replace('\0', "\\0")
-}
 
 impl Mysql {
     pub fn new(s: &mut Session, opts: MysqlOptions) -> Result<Self> {
@@ -443,6 +437,11 @@ impl Mysql {
     fn execute(&mut self, sql: &str, shape: Shape, s: &mut Session) -> Result<()> {
         self.last = sql.to_string();
         self.statements += 1;
+        if let Some(v) = self.stream_to_output(sql, shape, s)? {
+            // The rows went straight to the output.
+            self.print_warning_list(&v);
+            return Ok(());
+        }
         let v = s.sql(sql)?;
         let secs = elapsed(&v);
         let warnings = v["warnings"]["count"].as_u64().unwrap_or(0);
@@ -453,13 +452,31 @@ impl Mysql {
         for (i, part) in parts.into_iter().enumerate() {
             self.print_result(part, shape, secs, if i + 1 == n { warnings } else { 0 })?;
         }
+        self.print_warning_list(&v);
+        Ok(())
+    }
+
+    fn print_warning_list(&self, v: &Value) {
         if let Some(list) = v["warnings"]["list"].as_array().filter(|l| !l.is_empty()) {
             for w in list {
                 outln!("{} (Code {}): {}", w["level"].as_str().unwrap_or("Warning"), w["code"], w["message"].as_str().unwrap_or(""));
             }
             outln!();
         }
-        Ok(())
+    }
+
+    /// `--batch` output to a file or pipe: the daemon writes the rows there, with no
+    /// row limit, as `mysql -B` does. `None` when the statement or the settings
+    /// don't allow it.
+    fn stream_to_output(&self, sql: &str, shape: Shape, s: &mut Session) -> Result<Option<Value>> {
+        let o = &self.opts;
+        let batch = o.batch && !o.table && !o.vertical && !o.auto_vertical && !o.column_type_info;
+        if !batch || shape != Shape::Table || !crate::readonly::returns_rows(crate::readonly::SqlDialect::Mysql, sql) {
+            return Ok(None);
+        }
+        let Some(dst) = out::bulk_fd()? else { return Ok(None) };
+        let format = StreamFormat::MysqlBatch { raw: o.raw, header: !o.skip_column_names, mariadb: self.mariadb };
+        s.stream(sql, format, std::os::fd::AsFd::as_fd(&dst)).map(Some)
     }
 
     /// Binary values as `0x…` hex. MariaDB's client prints the raw bytes; text that
@@ -471,11 +488,8 @@ impl Mysql {
             }
             for row in rows.iter_mut() {
                 let Some(cell) = row.get_mut(i) else { continue };
-                if self.mariadb && cell.as_str().is_some_and(|s| !s.starts_with("base64:")) {
-                    continue;
-                }
-                if let Some(bytes) = table::value_bytes(cell) {
-                    *cell = Value::String(table::hex_bytes(&bytes));
+                if let Some(hex) = crate::textfmt::mysql_binary(cell, self.mariadb) {
+                    *cell = hex;
                 }
             }
         }
@@ -509,12 +523,11 @@ impl Mysql {
                 let text = if vertical {
                     table::vertical_mysql(&columns, &rows)
                 } else if batch || shape == Shape::Silent {
-                    let mut lines = Vec::new();
-                    if headers && shape != Shape::Silent {
-                        lines.push(columns.join("\t"));
-                    }
-                    lines.extend(rows.iter().map(|r| r.iter().map(|v| batch_cell(v, self.opts.raw)).collect::<Vec<_>>().join("\t")));
-                    lines.join("\n")
+                    // Binary cells are hex already.
+                    let f = StreamFormat::MysqlBatch { raw: self.opts.raw, header: headers && shape != Shape::Silent, mariadb: self.mariadb };
+                    let mut text = crate::textfmt::render(&f, &columns, &[], &rows);
+                    text.pop();
+                    text
                 } else {
                     table::table(&columns, &rows, Style::Mysql, headers, &|v| table::cell(v, "NULL"))
                 };
@@ -675,6 +688,7 @@ mod tests {
 
     #[test]
     fn batch_escaping() {
+        use crate::textfmt::batch_cell;
         assert_eq!(batch_cell(&Value::String("a\tb\nc\\".into()), false), "a\\tb\\nc\\\\");
         assert_eq!(batch_cell(&Value::String("a\tb".into()), true), "a\tb");
         assert_eq!(batch_cell(&Value::Null, false), "NULL");

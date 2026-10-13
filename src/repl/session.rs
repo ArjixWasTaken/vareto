@@ -179,6 +179,15 @@ impl Session {
         res
     }
 
+    /// Run `sql`, the daemon writing its rows in `format` to `dst` with no row
+    /// limit. Returns `{"rows": n}` (and MySQL `warnings`).
+    pub fn stream(&mut self, sql: &str, format: crate::textfmt::StreamFormat, dst: BorrowedFd<'_>) -> Result<Value> {
+        let req = Request::SessionStream { session: self.id, sql: sql.into(), format, warnings: self.show_warnings };
+        let res = self.call_with_fd(req, dst);
+        self.track(sql, res.is_ok());
+        res
+    }
+
     /// Update the transaction state after `sql` ran.
     pub fn track(&mut self, sql: &str, ok: bool) {
         self.tx = next_tx(self.kind, self.tx, sql, ok);

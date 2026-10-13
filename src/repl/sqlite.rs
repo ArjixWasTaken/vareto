@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::out::outln;
+use crate::textfmt::StreamFormat;
 use super::session::Session;
 use super::sqlbuf::{Dialect, SqlBuf};
 use super::table::{self, QueryResult, Style};
@@ -67,24 +68,28 @@ impl Sqlite {
         Self { buf: SqlBuf::new(Dialect::Sqlite), mode: Mode::Box, headers: true, timer: false, null: String::new(), tables: Vec::new(), columns: Vec::new() }
     }
 
+    /// The current mode, when it can be written a row at a time.
+    fn stream_format(&self) -> Option<StreamFormat> {
+        Some(match self.mode {
+            Mode::List => StreamFormat::SqliteList { separator: "|".into(), null: self.null.clone(), header: self.headers },
+            Mode::Csv => StreamFormat::SqliteCsv { header: self.headers },
+            Mode::Line => StreamFormat::SqliteLine,
+            Mode::Json => StreamFormat::SqliteJson,
+            Mode::Column | Mode::Box | Mode::Table => return None,
+        })
+    }
+
     fn print(&self, columns: &[String], rows: &[Vec<Value>]) {
+        if let Some(f) = self.stream_format() {
+            super::out::text(&crate::textfmt::render(&f, columns, &[], rows));
+            return;
+        }
         let null = self.null.as_str();
         let fmt = |v: &Value| table::cell(v, null);
         let out = match self.mode {
-            Mode::List => {
-                let mut lines = Vec::new();
-                if self.headers {
-                    lines.push(columns.join("|"));
-                }
-                lines.extend(rows.iter().map(|r| r.iter().map(fmt).collect::<Vec<_>>().join("|")));
-                lines.join("\n")
-            }
-            Mode::Csv => table::csv(columns, rows, self.headers),
-            Mode::Column => table::table(columns, rows, Style::Column, self.headers, &fmt),
-            Mode::Line => table::line_sqlite(columns, rows),
             Mode::Box => table::table(columns, rows, Style::Box, true, &fmt),
             Mode::Table => table::table(columns, rows, Style::Mysql, true, &fmt),
-            Mode::Json => table::json(columns, rows),
+            _ => table::table(columns, rows, Style::Column, self.headers, &fmt),
         };
         if !out.is_empty() {
             outln!("{out}");
@@ -92,6 +97,18 @@ impl Sqlite {
     }
 
     fn execute(&mut self, sql: &str, s: &mut Session) -> Result<()> {
+        // Streamable modes going to a file or pipe: unlimited rows.
+        if let Some(format) = self.stream_format() {
+            if crate::readonly::returns_rows(crate::readonly::SqlDialect::Sqlite, sql) {
+                if let Some(dst) = super::out::bulk_fd()? {
+                    let v = s.stream(sql, format, std::os::fd::AsFd::as_fd(&dst))?;
+                    if self.timer {
+                        outln!("Run Time: real {:.3}", elapsed(&v));
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let v = s.sql(sql)?;
         for part in QueryResult::from_json(&v).into_parts() {
             match part {

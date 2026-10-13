@@ -184,6 +184,8 @@ pub enum Op {
     CopyOut { sql: String, fd: OwnedFd },
     /// The result columns of a statement, without running it.
     Describe { sql: String },
+    /// A query whose formatted rows go to the client's descriptor, unlimited.
+    Stream { sql: String, format: crate::textfmt::StreamFormat, fd: OwnedFd, warnings: bool },
 }
 
 fn check_op(conn: &Connection, op: &Op) -> Result<()> {
@@ -195,6 +197,7 @@ fn check_op(conn: &Connection, op: &Op) -> Result<()> {
         Op::CopyIn { .. } => Ok(()),
         Op::CopyOut { sql, .. } if conn.readonly => readonly::check_copy_out(sql),
         Op::CopyOut { .. } => Ok(()),
+        Op::Stream { sql, .. } => check(conn, &QuerySpec::Sql { sql: sql.clone() }, true),
         Op::Describe { .. } if !matches!(kind, Kind::Mysql | Kind::Postgres | Kind::Sqlite) => bail!("only SQL statements can be described"),
         Op::Describe { .. } => Ok(()),
     }
@@ -321,6 +324,33 @@ async fn special(inner: &mut Inner, conn: &Connection, op: Op, timeout: Duration
             (r.map(|r| r.map(|n| json!({ "rows": n }))), long)
         }
         Op::Describe { sql } => (tokio::time::timeout(timeout + grace, c.describe(&sql)).await.map(|r| r.map(|cols| json!({ "columns": cols }))), timeout),
+        Op::Stream { sql, format, fd, warnings } => {
+            let started = Instant::now();
+            let kind = conn.cfg.kind;
+            let d = dialect(kind);
+            let wrap = conn.readonly && !readonly::session_statement(d, &sql);
+            let table = readonly::single_table(d, &sql);
+            let masker = &inner.live.masker;
+            // As long as an export may run.
+            c.set_timeout(long).await.ok();
+            let r = tokio::time::timeout(long + grace, async {
+                let mut w = crate::render::StreamWriter::new(format, fd, masker, table);
+                let mut found = crate::db::sql::Warnings { list: warnings, found: None };
+                let want = (kind == Kind::Mysql).then_some(&mut found);
+                c.stream(&sql, &mut w, wrap, want).await?;
+                let rows = w.finish()?;
+                let mut v = json!({ "rows": rows, "elapsed_ms": started.elapsed().as_millis() as u64 });
+                if let Some(found) = found.found {
+                    v["warnings"] = found;
+                }
+                Ok(v)
+            })
+            .await;
+            if r.is_ok() {
+                c.set_timeout(timeout).await.ok();
+            }
+            (r, long)
+        }
         Op::Query { .. } => unreachable!(),
     };
     match res {

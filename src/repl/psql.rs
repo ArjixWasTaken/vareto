@@ -494,6 +494,18 @@ impl Psql {
             Some(Direction::Out) => return self.copy_to_output(sql, s),
             None => {}
         }
+        // csv / unaligned output to a file or pipe streams, unlimited.
+        if let Some(format) = opts.stream_format(vertical) {
+            if crate::readonly::returns_rows(crate::readonly::SqlDialect::Postgres, sql) {
+                if let Some(dst) = out::bulk_fd()? {
+                    let v = self.query_with(sql, s, &mut |s| s.stream(sql, format.clone(), dst.as_fd()))?;
+                    if self.timing {
+                        outln!("Time: {:.3} ms", elapsed(&v) * 1000.0);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let v = self.query(sql, s)?;
         for part in QueryResult::from_json(&v).into_parts() {
             match part {

@@ -749,7 +749,7 @@ pub enum SqlConn {
 }
 
 impl SqlConn {
-    async fn set_timeout(&mut self, t: Duration) -> Result<()> {
+    pub async fn set_timeout(&mut self, t: Duration) -> Result<()> {
         let ms = t.as_millis();
         match self {
             SqlConn::Postgres(c) => {

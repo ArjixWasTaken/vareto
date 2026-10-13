@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::ipc::ExportFormat;
 use crate::mask::Masker;
+use crate::textfmt::{RecordFormatter, StreamFormat};
 
 /// Where a backend sends results as it reads them. `row`/`doc` return `false` to
 /// ask the backend to stop reading (the consumer has enough).
@@ -154,6 +155,104 @@ impl std::io::Write for BlockingFile {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         tokio_blocking(|| self.0.flush())
+    }
+}
+
+/// Streams a query's rows to a client's file or pipe in a shell layout
+/// ([`StreamFormat`]), masking each row, with no row limit.
+pub struct StreamWriter<'m> {
+    format: StreamFormat,
+    masker: &'m Masker,
+    table: Option<String>,
+    out: std::io::BufWriter<BlockingFile>,
+    current: Option<(RecordFormatter, Vec<Column>)>,
+    rows: u64,
+    /// The reader went away (`\o |head`): stop quietly.
+    broken: bool,
+}
+
+impl<'m> StreamWriter<'m> {
+    /// `table`: source table for SQL `table.column` mask rules.
+    pub fn new(format: StreamFormat, dst: std::os::fd::OwnedFd, masker: &'m Masker, table: Option<String>) -> Self {
+        let out = std::io::BufWriter::with_capacity(256 * 1024, BlockingFile(std::fs::File::from(dst)));
+        Self { format, masker, table, out, current: None, rows: 0, broken: false }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.broken || bytes.is_empty() {
+            return Ok(());
+        }
+        match self.out.write_all(bytes) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.broken = true;
+                Ok(())
+            }
+            r => Ok(r.context("writing the result")?),
+        }
+    }
+
+    fn end_result(&mut self) -> Result<()> {
+        if let Some((mut f, _)) = self.current.take() {
+            self.rows += f.rows();
+            let end = f.end();
+            self.write(&end)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the output. Returns the rows written.
+    pub fn finish(mut self) -> Result<u64> {
+        self.end_result()?;
+        match self.out.flush() {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e).context("writing the result"),
+            _ => Ok(self.rows),
+        }
+    }
+}
+
+impl Sink for StreamWriter<'_> {
+    fn columns(&mut self, mut columns: Vec<Column>) -> Result<()> {
+        self.end_result()?;
+        for c in &mut columns {
+            c.table = self.table.clone();
+        }
+        let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let types: Vec<Option<String>> = columns.iter().map(|c| c.type_name.clone()).collect();
+        let mut f = RecordFormatter::new(self.format.clone(), names, &types);
+        let start = f.start();
+        self.current = Some((f, columns));
+        self.write(&start)
+    }
+
+    fn row(&mut self, mut row: Vec<Value>) -> Result<bool> {
+        let Some((f, columns)) = self.current.as_mut() else { anyhow::bail!("rows before columns") };
+        for (col, cell) in columns.iter().zip(row.iter_mut()) {
+            self.masker.mask_cell(col.table.as_deref(), &col.name, cell);
+        }
+        let bytes = f.row(&row);
+        self.write(&bytes)?;
+        Ok(!self.broken)
+    }
+
+    fn doc(&mut self, _doc: Value) -> Result<bool> {
+        anyhow::bail!("documents can't be written in this layout")
+    }
+
+    fn affected(&mut self, _rows: u64, _detail: Option<Value>) -> Result<()> {
+        Ok(())
+    }
+
+    fn value(&mut self, _v: Value) -> Result<()> {
+        anyhow::bail!("a single value can't be written in this layout")
+    }
+
+    fn end_statement(&mut self, _affected: u64) -> Result<()> {
+        self.end_result()
+    }
+
+    fn empty_result(&mut self, columns: Vec<Column>) -> Result<()> {
+        self.columns(columns)?;
+        self.end_result()
     }
 }
 
