@@ -46,7 +46,12 @@ pub async fn session_command(con: &mut redis::aio::MultiplexedConnection, args: 
     }
     let v: RV = tokio::time::timeout(timeout, cmd.query_async(con))
         .await
-        .map_err(|_| anyhow::anyhow!("command timed out"))??;
+        .map_err(|_| anyhow::anyhow!("command timed out"))?
+        // The server's own wording (`WRONGTYPE Operation against ...`), as redis-cli shows it.
+        .map_err(|e| match (e.code(), e.detail()) {
+            (Some(code), Some(detail)) => anyhow::anyhow!("{code} {detail}"),
+            _ => anyhow::anyhow!("{e}"),
+        })?;
     let kinds = kinds(&v);
     Ok((to_json(v), kinds))
 }

@@ -3,6 +3,7 @@
 
 mod mysql;
 mod psql;
+mod redis;
 mod session;
 mod sqlbuf;
 mod table;
@@ -123,6 +124,7 @@ pub async fn run(daemon: &Daemon, opts: Options) -> Result<bool> {
         let mut f: Box<dyn Flavor> = match s.kind {
             Kind::Mysql => Box::new(mysql::Mysql::new(&s)),
             Kind::Postgres => Box::new(psql::Psql::new()),
+            Kind::Redis => Box::new(redis::Redis::new()),
             other => anyhow::bail!("no shell for {} connections yet", other.as_str()),
         };
         let ok = if let Some(cmds) = &opts.execute {
