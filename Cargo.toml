@@ -55,6 +55,9 @@ getrandom = { version = "0.3.4", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 csv-core = { version = "0.1.13", default-features = false }
+hex = "0.4.3"
+uuid = "1.28.0"
+backon = "1.6.0"
 
 [profile.release]
 strip = true

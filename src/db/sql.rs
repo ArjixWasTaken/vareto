@@ -596,48 +596,6 @@ pub struct CopySource {
     pub peer: Option<OwnedFd>,
 }
 
-/// Decodes `ipc::copy_frame`s from a byte stream.
-#[derive(Default)]
-struct Unframer {
-    /// Bytes of an unfinished length prefix.
-    len_buf: Vec<u8>,
-    /// Bytes still to come of the current chunk.
-    left: usize,
-    ended: bool,
-}
-
-impl Unframer {
-    /// The data bytes in `input` (which may hold several chunks, or parts of them).
-    fn feed(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(input.len());
-        while !input.is_empty() {
-            if self.ended {
-                anyhow::bail!("unexpected COPY data after its end");
-            }
-            if self.left > 0 {
-                let n = self.left.min(input.len());
-                out.extend_from_slice(&input[..n]);
-                self.left -= n;
-                input = &input[n..];
-                continue;
-            }
-            let n = (4 - self.len_buf.len()).min(input.len());
-            self.len_buf.extend_from_slice(&input[..n]);
-            input = &input[n..];
-            if self.len_buf.len() == 4 {
-                let len = u32::from_be_bytes([self.len_buf[0], self.len_buf[1], self.len_buf[2], self.len_buf[3]]) as usize;
-                self.len_buf.clear();
-                if len == 0 {
-                    self.ended = true;
-                } else {
-                    self.left = len;
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
 /// COPY data moves in chunks of this size.
 const COPY_CHUNK: usize = 1 << 20;
 
@@ -879,39 +837,37 @@ impl SqlConn {
         let restore = pg_long_timeout(c, timeout).await?;
         let res = async {
             let mut w = c.copy_in_raw(sql).await?;
-            let mut file = tokio::fs::File::from_std(std::fs::File::from(src.fd));
-            let mut buf = vec![0u8; COPY_CHUNK];
-            let mut frames = src.framed.then(Unframer::default);
+            let file = tokio::fs::File::from_std(std::fs::File::from(src.fd));
             // Why the data ended badly, if it did; the COPY is then aborted.
-            let failure = loop {
-                if cancelled.load(Ordering::SeqCst) {
-                    break Some("canceling statement due to user request".to_string());
+            let failure = if src.framed {
+                let mut frames = tokio_util::codec::FramedRead::new(file, crate::ipc::copy_codec());
+                loop {
+                    if cancelled.load(Ordering::SeqCst) {
+                        break Some("canceling statement due to user request".to_string());
+                    }
+                    match frames.try_next().await {
+                        // The end of the pipe before the empty frame: the client died.
+                        Ok(None) => break Some("the client went away during COPY".into()),
+                        Ok(Some(f)) if f.is_empty() => break None,
+                        Ok(Some(f)) => {
+                            w.send(f.as_ref()).await?;
+                        }
+                        Err(e) => break Some(format!("could not read COPY data: {e}")),
+                    }
                 }
-                let n = match file.read(&mut buf).await {
-                    Ok(0) => {
-                        break match &frames {
-                            Some(f) if !f.ended => Some("the client went away during COPY".into()),
-                            _ => None,
-                        };
+            } else {
+                let mut file = file;
+                let mut buf = vec![0u8; COPY_CHUNK];
+                loop {
+                    if cancelled.load(Ordering::SeqCst) {
+                        break Some("canceling statement due to user request".to_string());
                     }
-                    Ok(n) => n,
-                    Err(e) => break Some(format!("could not read COPY data: {e}")),
-                };
-                match frames.as_mut() {
-                    None => {
-                        w.send(&buf[..n]).await?;
-                    }
-                    Some(f) => {
-                        let data = match f.feed(&buf[..n]) {
-                            Ok(d) => d,
-                            Err(e) => break Some(e.to_string()),
-                        };
-                        if !data.is_empty() {
-                            w.send(data.as_slice()).await?;
+                    match file.read(&mut buf).await {
+                        Ok(0) => break None,
+                        Ok(n) => {
+                            w.send(&buf[..n]).await?;
                         }
-                        if f.ended {
-                            break None;
-                        }
+                        Err(e) => break Some(format!("could not read COPY data: {e}")),
                     }
                 }
             };
@@ -1065,22 +1021,24 @@ mod tests {
         assert!(format!("{:?}", sqlx::mysql::MySqlTypeInfo::__enum()).contains("Collation("));
     }
 
-    #[test]
-    fn copy_frames() {
+    #[tokio::test]
+    async fn copy_frames() {
         let mut stream = crate::ipc::copy_frame(b"1\tone\n");
         stream.extend(crate::ipc::copy_frame(b"2\ttwo\n"));
         stream.extend(crate::ipc::copy_frame(b""));
-        // Any split of the stream decodes the same.
-        for size in [1, 3, 5, 64] {
-            let mut u = Unframer::default();
-            let data: Vec<u8> = stream.chunks(size).flat_map(|c| u.feed(c).unwrap()).collect();
-            assert_eq!(data, b"1\tone\n2\ttwo\n");
-            assert!(u.ended);
+        let mut frames = tokio_util::codec::FramedRead::new(&stream[..], crate::ipc::copy_codec());
+        let mut data = Vec::new();
+        while let Some(f) = frames.try_next().await.unwrap() {
+            if f.is_empty() {
+                break;
+            }
+            data.extend_from_slice(&f);
         }
-        // Without the empty frame the data hasn't ended (the client went away).
-        let mut u = Unframer::default();
-        u.feed(&crate::ipc::copy_frame(b"x")).unwrap();
-        assert!(!u.ended);
+        assert_eq!(data, b"1\tone\n2\ttwo\n");
+        // A stream cut inside a frame is an error, not a clean end.
+        let cut = crate::ipc::copy_frame(b"xyz");
+        let mut frames = tokio_util::codec::FramedRead::new(&cut[..cut.len() - 1], crate::ipc::copy_codec());
+        assert!(frames.try_next().await.is_err());
     }
 
     #[test]

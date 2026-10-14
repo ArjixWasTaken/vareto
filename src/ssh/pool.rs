@@ -31,30 +31,25 @@ impl SessionPool {
             }
             tracing::warn!(host = %target.hostname, "ssh session dropped; reconnecting");
         }
-        let mut delay = std::time::Duration::from_millis(250);
-        let mut last_err = None;
-        for attempt in 0..4 {
-            match connect(target).await {
-                Ok(s) => {
-                    tracing::info!(host = %target.hostname, user = %target.user, "ssh session established");
-                    let s = Arc::new(s);
-                    *guard = Some(s.clone());
-                    return Ok(s);
-                }
-                // Host key / auth problems won't fix themselves; only retry the first time.
-                Err(e) if attempt == 0 && guard.is_none() => {
-                    *guard = None;
-                    return Err(e);
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
+        // A first connection isn't retried: host key and auth problems won't fix
+        // themselves. A dropped session is retried with backoff.
+        let retries = if guard.is_none() { 0 } else { 3 };
+        let backoff = backon::ExponentialBuilder::default()
+            .with_min_delay(std::time::Duration::from_millis(250))
+            .with_factor(2.0)
+            .with_max_times(retries);
+        match backon::Retryable::retry(|| connect(target), backoff).await {
+            Ok(s) => {
+                tracing::info!(host = %target.hostname, user = %target.user, "ssh session established");
+                let s = Arc::new(s);
+                *guard = Some(s.clone());
+                Ok(s)
+            }
+            Err(e) => {
+                *guard = None;
+                Err(e)
             }
         }
-        *guard = None;
-        Err(last_err.unwrap())
     }
 
     pub async fn is_connected(&self, target: &Target) -> bool {

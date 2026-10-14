@@ -224,12 +224,9 @@ impl Connection {
     }
 }
 
-/// `~/x` to `$HOME/x`.
+/// `~` and `~/x` to the home directory.
 pub fn expand_home(p: &str) -> PathBuf {
-    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(p),
-    }
+    crate::paths::expand_tilde(p)
 }
 
 /// Settings that only make sense for some connection kinds or routes.

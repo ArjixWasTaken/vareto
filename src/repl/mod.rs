@@ -225,10 +225,7 @@ pub fn read_script(path: &str) -> Result<String> {
 }
 
 pub fn expand_home(p: &str) -> String {
-    match (p.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
-        _ => p.to_string(),
-    }
+    crate::paths::expand_tilde(p).to_string_lossy().into_owned()
 }
 
 /// Feed a whole script through a flavor, line by line. An error ends it, or is

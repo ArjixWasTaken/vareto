@@ -255,7 +255,7 @@ fn hash(text: &str, seed: &str) -> String {
         h.update([0]);
     }
     h.update(text.as_bytes());
-    let hex: String = h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(&h.finalize()[..6]);
     format!("h:{hex}")
 }
 
@@ -282,18 +282,22 @@ static PHONE: LazyLock<Regex> =
 static IBAN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b").unwrap());
 
+/// The Luhn sum of `digits` (check digit last): every second digit from the
+/// right doubled, digits of the products added.
+pub(crate) fn luhn_sum(digits: &[u32]) -> u32 {
+    digits.iter().rev().enumerate().map(|(i, &d)| if i % 2 == 1 { let x = d * 2; if x > 9 { x - 9 } else { x } } else { d }).sum()
+}
+
+/// The Luhn check digit that completes `payload`.
+pub(crate) fn luhn_check_digit(payload: &[u32]) -> u32 {
+    let with_zero: Vec<u32> = payload.iter().copied().chain([0]).collect();
+    (10 - luhn_sum(&with_zero) % 10) % 10
+}
+
+/// A card-number-length digit string with a valid Luhn check digit.
 fn luhn(digits: &str) -> bool {
     let ds: Vec<u32> = digits.chars().filter_map(|c| c.to_digit(10)).collect();
-    if !(13..=19).contains(&ds.len()) {
-        return false;
-    }
-    let sum: u32 = ds
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(i, &d)| if i % 2 == 1 { let x = d * 2; if x > 9 { x - 9 } else { x } } else { d })
-        .sum();
-    sum % 10 == 0
+    (13..=19).contains(&ds.len()) && luhn_sum(&ds) % 10 == 0
 }
 
 impl Masker {

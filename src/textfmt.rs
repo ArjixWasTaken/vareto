@@ -70,12 +70,7 @@ pub fn value_bytes(v: &Value) -> Option<Vec<u8>> {
 
 /// `0x…` hex, as the mysql client shows binary values.
 pub fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 + bytes.len() * 2);
-    out.push_str("0x");
-    for b in bytes {
-        out.push_str(&format!("{b:02X}"));
-    }
-    out
+    format!("0x{}", hex::encode_upper(bytes))
 }
 
 /// A binary column's value as the mysql client shows it: `0x…` hex. MariaDB's

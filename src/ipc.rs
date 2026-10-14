@@ -299,13 +299,19 @@ impl FdStream {
     }
 }
 
-/// One chunk of framed COPY data (`SessionCopyIn { framed: true }`): a big-endian
-/// u32 length, then the bytes. An empty chunk ends the data.
+/// The framing of COPY data sent with `SessionCopyIn { framed: true }`: length
+/// prefixed chunks, as on the socket, ending with an empty one. A frame holds one
+/// line of COPY data.
+pub fn copy_codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder().max_frame_length(1 << 30).new_codec()
+}
+
+/// One frame of COPY data ([`copy_codec`]); `&[]` is the end of the data.
 pub fn copy_frame(data: &[u8]) -> Vec<u8> {
-    let mut f = Vec::with_capacity(4 + data.len());
-    f.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    f.extend_from_slice(data);
-    f
+    use tokio_util::codec::Encoder as _;
+    let mut buf = bytes::BytesMut::with_capacity(4 + data.len());
+    copy_codec().encode(bytes::Bytes::copy_from_slice(data), &mut buf).expect("a COPY line fits in a frame");
+    buf.to_vec()
 }
 
 /// Whether the other end of a connected socket has closed it (the client went

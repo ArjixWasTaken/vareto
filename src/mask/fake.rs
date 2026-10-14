@@ -241,12 +241,8 @@ impl Faker {
             FakeKind::Mac => MACAddress().fake_with_rng(r),
             FakeKind::Card => card(r, s),
             FakeKind::Iban => iban(r, s),
-            FakeKind::Uuid => {
-                let b: [u8; 16] = r.random();
-                let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-                // RFC 4122 version 4 layout.
-                format!("{}-{}-4{}-{:x}{}-{}", &h[0..8], &h[8..12], &h[13..16], 8 + (b[8] & 3), &h[17..20], &h[20..32])
-            }
+            // A version 4 UUID from the seeded generator.
+            FakeKind::Uuid => uuid::Builder::from_random_bytes(r.random()).into_uuid().to_string(),
             FakeKind::Date => match parse_date_prefix(s) {
                 Some((date, rest)) => {
                     let shifted = date + chrono::Duration::days(r.random_range(-365..=365));
@@ -335,14 +331,7 @@ fn card(r: &mut Xoshiro256PlusPlus, s: &str) -> String {
     let n = s.chars().filter(char::is_ascii_digit).count();
     let n = if (12..=19).contains(&n) { n } else { 16 };
     let mut digits: Vec<u32> = (0..n - 1).map(|i| if i == 0 { r.random_range(3..7) } else { r.random_range(0..10) }).collect();
-    // Luhn check digit for the payload.
-    let sum: u32 = digits
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(i, &d)| if i % 2 == 0 { let x = d * 2; if x > 9 { x - 9 } else { x } } else { d })
-        .sum();
-    digits.push((10 - sum % 10) % 10);
+    digits.push(super::luhn_check_digit(&digits));
     let mut it = digits.into_iter();
     if s.chars().filter(char::is_ascii_digit).count() == n {
         s.chars().map(|c| if c.is_ascii_digit() { char::from_digit(it.next().unwrap(), 10).unwrap() } else { c }).collect()
@@ -379,13 +368,7 @@ mod tests {
 
     fn luhn_ok(s: &str) -> bool {
         let ds: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
-        let sum: u32 = ds
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(i, &d)| if i % 2 == 1 { let x = d * 2; if x > 9 { x - 9 } else { x } } else { d })
-            .sum();
-        sum % 10 == 0
+        super::super::luhn_sum(&ds) % 10 == 0
     }
 
     fn iban_ok(s: &str) -> bool {
