@@ -8,6 +8,7 @@ mod mcp;
 mod paths;
 mod readonly;
 mod render;
+mod sqltok;
 mod textfmt;
 mod repl;
 mod secrets;

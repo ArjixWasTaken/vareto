@@ -228,58 +228,20 @@ fn js_main(tx: Sender<FromJs>, rx: Receiver<ToJs>, interactive: bool) {
 /// Whether `code` is a complete input: brackets closed, no open string, template
 /// or comment, and not ending in an operator that needs more.
 pub fn complete(code: &str) -> bool {
-    #[derive(PartialEq)]
-    enum St {
-        Code,
-        Str(char),
-        LineComment,
-        BlockComment,
+    use boa_engine::parser::{lexer, Error, Parser};
+    let scope = boa_engine::ast::scope::Scope::new_global();
+    let mut interner = boa_engine::interner::Interner::default();
+    match Parser::new(boa_engine::Source::from_bytes(code)).parse_script(&scope, &mut interner) {
+        Ok(_) => true,
+        // The input stops mid-statement (an open bracket, an operator waiting for
+        // its operand), or mid-token (a template literal or comment): more is coming.
+        Err(Error::AbruptEnd) => false,
+        Err(Error::Lex { err: lexer::Error::IO(e) }) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        // boa reports an open block comment as a syntax error at the end.
+        Err(Error::Lex { err: lexer::Error::Syntax(msg, _) }) if msg.starts_with("unterminated multiline comment") => false,
+        // Any other syntax error is complete: running it shows the error.
+        Err(_) => true,
     }
-    let mut st = St::Code;
-    let mut depth = 0i32;
-    let mut chars = code.chars().peekable();
-    while let Some(c) = chars.next() {
-        match st {
-            St::Code => match c {
-                '\'' | '"' | '`' => st = St::Str(c),
-                '/' if chars.peek() == Some(&'/') => st = St::LineComment,
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    st = St::BlockComment;
-                }
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
-                _ => {}
-            },
-            St::Str(q) => {
-                if c == '\\' {
-                    chars.next();
-                } else if c == q {
-                    st = St::Code;
-                } else if c == '\n' && q != '`' {
-                    // An unterminated ordinary string is a syntax error; let it surface.
-                    st = St::Code;
-                }
-            }
-            St::LineComment => {
-                if c == '\n' {
-                    st = St::Code;
-                }
-            }
-            St::BlockComment => {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    st = St::Code;
-                }
-            }
-        }
-    }
-    if depth > 0 || matches!(st, St::Str('`') | St::BlockComment) {
-        return false;
-    }
-    // An operator still waiting for its right-hand side (`=`, `==`, `=>` all end in `=`).
-    let t = code.trim_end();
-    ![".", ",", "=", "&&", "||", "?", ":"].iter().any(|d| t.ends_with(d))
 }
 
 /// Completion rules of mongosh: `use <db>`, `show <what>`, a collection's name in quotes.
@@ -765,6 +727,13 @@ mod tests {
         assert!(!complete("x ="));
         assert!(!complete("/* comment"));
         assert!(complete("// a { comment"));
+        // What the hand-written scanner got wrong: regex literals and template
+        // substitutions with brackets in them.
+        assert!(complete("db.users.find({name: /a{2}[(]/})"));
+        assert!(!complete("const s = `${ {a: 1}"));
+        assert!(complete("const s = `${ {a: 1}.a }`"));
+        // A plain syntax error is complete (it runs and reports the error).
+        assert!(complete("db.users.find({a: 1}))"));
     }
 
     #[test]

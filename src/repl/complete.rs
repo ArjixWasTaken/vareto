@@ -109,6 +109,9 @@ pub struct Completions {
     /// An SQL shell: [`SQL_RULES`] apply, and where no rule does, tables, columns
     /// and keywords are offered. Otherwise only `other` is.
     pub sql: bool,
+    /// The SQL dialect, for reading statements with sqlparser's tokenizer (quotes,
+    /// comments, quoted identifiers).
+    pub dialect: Option<crate::readonly::SqlDialect>,
     /// The flavor's own rules (on top of [`SQL_RULES`] for SQL shells).
     pub rules: Vec<Rule>,
     /// Keywords; completed in the case being typed.
@@ -224,6 +227,73 @@ fn tokens(text: &str) -> Vec<String> {
     out
 }
 
+/// A token of an SQL statement, as completion reads it.
+#[derive(Debug, Clone, PartialEq)]
+enum SqlTok {
+    /// A name; a dotted one (`shop.users`) is one word. `last` is its last part,
+    /// without quotes.
+    Word { text: String, last: String, quoted: bool },
+    Comma,
+    /// Anything else: an operator, a literal.
+    Other(String),
+}
+
+/// The tokens of `text` with sqlparser's tokenizer for `dialect`: quotes,
+/// comments and quoted identifiers are handled the database's way. Whitespace,
+/// comments and parentheses are left out. `None` when the tokenizer rejects the
+/// text (an unclosed quote at the cursor).
+fn sql_tokens(dialect: crate::readonly::SqlDialect, text: &str) -> Option<Vec<SqlTok>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let d = crate::readonly::sqlparser_dialect(dialect);
+    // Whitespace stays in for now: `u.` followed by a space isn't joined to the
+    // next word.
+    let toks: Vec<Token> = Tokenizer::new(d.as_ref(), text).tokenize().ok()?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Token::Whitespace(_) => {}
+            Token::Word(w) => {
+                let mut parts = vec![w.clone()];
+                while let (Some(Token::Period), Some(Token::Word(next))) = (toks.get(i + 1), toks.get(i + 2)) {
+                    parts.push(next.clone());
+                    i += 2;
+                }
+                let last = parts.last().expect("one part");
+                out.push(SqlTok::Word {
+                    text: parts.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join("."),
+                    last: last.value.clone(),
+                    quoted: last.quote_style.is_some(),
+                });
+            }
+            Token::Comma => out.push(SqlTok::Comma),
+            Token::LParen | Token::RParen => {}
+            t => out.push(SqlTok::Other(t.to_string())),
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// The words before the cursor, for matching rules: through sqlparser's tokenizer
+/// for SQL (so `'from'` in a string isn't a keyword), else split at whitespace
+/// (client commands, mongosh, or text the tokenizer rejects).
+fn rule_tokens(c: &Completions, before: &str) -> Vec<String> {
+    let sql_text = !matches!(before.trim_start().chars().next(), Some('\\' | '.'));
+    if let Some(toks) = c.dialect.filter(|_| sql_text).and_then(|d| sql_tokens(d, before)) {
+        return toks
+            .into_iter()
+            .map(|t| match t {
+                SqlTok::Word { text, quoted: false, .. } => text.to_uppercase(),
+                SqlTok::Word { text, quoted: true, .. } => format!("\"{text}\""),
+                SqlTok::Comma => ",".into(),
+                SqlTok::Other(s) => s,
+            })
+            .collect();
+    }
+    tokens(before)
+}
+
 fn ends_with(tokens: &[String], after: &[&str]) -> bool {
     tokens.len() >= after.len() && tokens[tokens.len() - after.len()..].iter().zip(after).all(|(t, a)| *a == "*" || t == a)
 }
@@ -264,7 +334,48 @@ const CLAUSE_WORDS: &[&str] = &[
 
 /// The tables a statement names (after FROM, JOIN, UPDATE, INTO), with their
 /// aliases: `select … from users u join orders as o` gives (users, u), (orders, o).
-pub fn statement_tables(line: &str) -> Vec<(String, Option<String>)> {
+pub fn statement_tables(dialect: Option<crate::readonly::SqlDialect>, line: &str) -> Vec<(String, Option<String>)> {
+    if let Some(toks) = dialect.and_then(|d| sql_tokens(d, line)) {
+        return tables_in(&toks);
+    }
+    statement_tables_split(line)
+}
+
+/// [`statement_tables`] over sqlparser's tokens.
+fn tables_in(toks: &[SqlTok]) -> Vec<(String, Option<String>)> {
+    let keyword = |t: &SqlTok, words: &[&str]| matches!(t, SqlTok::Word { text, quoted: false, .. } if words.contains(&text.to_uppercase().as_str()));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if !keyword(&toks[i], &["FROM", "JOIN", "UPDATE", "INTO"]) {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while let Some(SqlTok::Word { last, .. }) = toks.get(i).filter(|t| !keyword(t, CLAUSE_WORDS)) {
+            let name = last.clone();
+            i += 1;
+            if toks.get(i).is_some_and(|t| keyword(t, &["AS"])) {
+                i += 1;
+            }
+            let mut alias = None;
+            if let Some(SqlTok::Word { last, .. }) = toks.get(i).filter(|t| !keyword(t, CLAUSE_WORDS)) {
+                alias = Some(last.clone());
+                i += 1;
+            }
+            out.push((name, alias));
+            if toks.get(i) == Some(&SqlTok::Comma) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// [`statement_tables`] by splitting at whitespace, for text the tokenizer rejects.
+fn statement_tables_split(line: &str) -> Vec<(String, Option<String>)> {
     let raw: Vec<&str> = line.split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')').filter(|t| !t.is_empty()).collect();
     let mut toks: Vec<String> = Vec::new();
     for t in raw {
@@ -318,7 +429,7 @@ pub fn statement_tables(line: &str) -> Vec<(String, Option<String>)> {
 /// Columns for the statement on `line`: those of the tables it names, or every
 /// column when it names none.
 fn columns_for(c: &Completions, line: &str) -> Vec<Word> {
-    let named = statement_tables(line);
+    let named = statement_tables(c.dialect, line);
     let column = |(t, col): &(String, String)| Word { text: col.clone(), kind: Kind::Column, owner: Some(t.clone()) };
     if named.is_empty() {
         return c.columns.iter().map(column).collect();
@@ -331,7 +442,7 @@ fn table_of(c: &Completions, line: &str, prefix: &str) -> Option<String> {
     if let Some(t) = c.tables.iter().find(|t| t.eq_ignore_ascii_case(prefix)) {
         return Some(t.clone());
     }
-    statement_tables(line)
+    statement_tables(c.dialect, line)
         .into_iter()
         .find(|(_, a)| a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(prefix)))
         .map(|(t, _)| t)
@@ -354,7 +465,7 @@ fn others(c: &Completions, word: &str) -> Vec<Word> {
 pub fn candidates(c: &Completions, line: &str, pos: usize) -> (usize, Vec<Word>) {
     let (start, word) = word_at(line, pos);
     let before_text = &line[..start];
-    let before = tokens(before_text);
+    let before = rule_tokens(c, before_text);
     let typed_upper = word.chars().next().is_some_and(char::is_uppercase);
     let at_start = before_text.trim().is_empty();
     let mut out: Vec<Word> = Vec::new();
@@ -477,6 +588,7 @@ mod tests {
     fn sql() -> Completions {
         Completions {
             sql: true,
+            dialect: Some(crate::readonly::SqlDialect::Postgres),
             rules: vec![
                 rule(&["USE"], Offer::Databases),
                 rule(&["SHOW", "TABLES", "FROM"], Offer::Databases),
@@ -595,13 +707,22 @@ mod tests {
 
     #[test]
     fn statement_table_parsing() {
-        assert_eq!(statement_tables("select * from users"), vec![("users".into(), None)]);
-        assert_eq!(
-            statement_tables("select * from shop.users as u join orders o on o.user_id = u.id, items"),
-            vec![("users".into(), Some("u".into())), ("orders".into(), Some("o".into()))]
-        );
-        assert_eq!(statement_tables("select * from a x, b where 1"), vec![("a".into(), Some("x".into())), ("b".into(), None)]);
-        assert_eq!(statement_tables("update users set a = 1"), vec![("users".into(), None)]);
+        use crate::readonly::SqlDialect::{Mysql, Postgres};
+        // The tokenizer and the whitespace fallback agree on plain statements.
+        for d in [Some(Postgres), None] {
+            assert_eq!(statement_tables(d, "select * from users"), vec![("users".into(), None)]);
+            assert_eq!(
+                statement_tables(d, "select * from shop.users as u join orders o on o.user_id = u.id, items"),
+                vec![("users".into(), Some("u".into())), ("orders".into(), Some("o".into()))]
+            );
+            assert_eq!(statement_tables(d, "select * from a x, b where 1"), vec![("a".into(), Some("x".into())), ("b".into(), None)]);
+            assert_eq!(statement_tables(d, "update users set a = 1"), vec![("users".into(), None)]);
+        }
+        // What only the tokenizer gets right: quoted names with dots or spaces,
+        // keywords inside strings and comments, the dialect's quotes.
+        assert_eq!(statement_tables(Some(Postgres), r#"select * from "a.b"."my t" x"#), vec![("my t".into(), Some("x".into()))]);
+        assert_eq!(statement_tables(Some(Postgres), "select 'from nope' from users -- from other"), vec![("users".into(), None)]);
+        assert_eq!(statement_tables(Some(Mysql), "select * from `odd name` o"), vec![("odd name".into(), Some("o".into()))]);
     }
 
     #[test]
@@ -622,6 +743,16 @@ mod tests {
         assert_eq!(texts("GET user:1 "), Vec::<String>::new());
         assert_eq!(texts("DEL user:1 "), vec!["user:1", "user:2"]);
         assert_eq!(texts("INFO "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokenizer_contexts() {
+        // `from` inside a string isn't a keyword.
+        assert!(ranked("select 'from ' as x, e").iter().all(|c| c.kind != Kind::Table));
+        // A comment doesn't change the context.
+        assert_eq!(first("select * from /* the users */ us"), "users");
+        // An open quote at the cursor: the tokenizer gives up, the fallback works.
+        assert!(complete(&sql(), "select * from users where email = 'a", 36).0 > 0);
     }
 
     #[test]

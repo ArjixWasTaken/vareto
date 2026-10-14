@@ -1930,6 +1930,7 @@ impl Flavor for Psql {
         ];
         Completions {
             sql: true,
+            dialect: Some(crate::readonly::SqlDialect::Postgres),
             rules: PSQL_RULES.to_vec(),
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: metas.iter().map(|w| w.to_string()).collect(),

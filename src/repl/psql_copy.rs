@@ -13,51 +13,34 @@ pub enum Direction {
 
 /// Whether `sql` is a COPY that exchanges data with the client.
 pub fn direction(sql: &str) -> Option<Direction> {
-    let words: Vec<String> = words(sql).into_iter().map(|w| w.trim_end_matches(';').to_ascii_uppercase()).collect();
-    if words.first().map(String::as_str) != Some("COPY") {
+    let words = top_level_words(sql)?;
+    if words.first().map(|w| w.0.as_str()) != Some("COPY") {
         return None;
     }
-    words.windows(2).find_map(|w| match (w[0].as_str(), w[1].as_str()) {
+    words.windows(2).find_map(|w| match (w[0].0.as_str(), w[1].0.as_str()) {
         ("FROM", "STDIN") => Some(Direction::In),
         ("TO", "STDOUT") => Some(Direction::Out),
         _ => None,
     })
 }
 
-/// Whitespace-separated words outside quotes and parentheses (a COPY's query is
-/// in parentheses and may contain `FROM`).
-fn words(sql: &str) -> Vec<String> {
-    let (mut out, mut cur, mut depth, mut quote) = (Vec::new(), String::new(), 0usize, None::<char>);
-    for c in sql.chars() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-                continue;
-            }
-            None if c == '\'' || c == '"' => {
-                quote = Some(c);
-                continue;
-            }
-            None => {}
-        }
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            c if depth == 0 => cur.push(c),
+/// The unquoted words outside parentheses (a COPY's query is in parentheses and
+/// may contain `FROM`), upper-case, with their byte spans. Postgres's tokenizer
+/// sees strings, dollar quotes and comments. `None` when it can't read the text.
+fn top_level_words(text: &str) -> Option<Vec<(String, usize, usize)>> {
+    use sqlparser::tokenizer::Token;
+    let toks = crate::sqltok::tokenize(crate::readonly::SqlDialect::Postgres, text).ok()?;
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for t in toks {
+        match &t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Word(w) if depth == 0 && w.quote_style.is_none() => out.push((w.value.to_ascii_uppercase(), t.start, t.end)),
             _ => {}
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+    Some(out)
 }
 
 /// Where `\copy` reads or writes on the client.
@@ -83,38 +66,17 @@ pub struct MetaCopy {
 /// `\copy { table [(cols)] | (query) } { from | to } { 'file' | program 'cmd' | stdin | stdout | pstdin | pstdout } [[with] (options)]`
 pub fn parse_meta(arg: &str) -> Result<MetaCopy> {
     let usage = "\\copy: arguments required: \\copy table [(columns)] from|to 'file'|program 'cmd'|stdin|stdout [with (options)]";
-    // Find the top-level FROM / TO.
-    let (mut depth, mut quote, mut at) = (0usize, None::<char>, None);
-    let bytes: Vec<(usize, char)> = arg.char_indices().collect();
-    for (i, &(pos, c)) in bytes.iter().enumerate() {
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            c if c.is_whitespace() && depth == 0 => {
-                let rest = &arg[pos + c.len_utf8()..];
-                let word: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-                if (word.eq_ignore_ascii_case("from") || word.eq_ignore_ascii_case("to")) && i > 0 {
-                    at = Some((pos, word));
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some((pos, word)) = at else { bail!(usage) };
+    // The first top-level FROM / TO after the target.
+    let words = top_level_words(arg).ok_or_else(|| anyhow::anyhow!("\\copy: parse error at \"{arg}\""))?;
+    let Some((word, pos, end)) = words.into_iter().find(|(w, at, _)| (w == "FROM" || w == "TO") && !arg[..*at].trim().is_empty()) else {
+        bail!(usage)
+    };
     let target = arg[..pos].trim();
     if target.is_empty() {
         bail!(usage);
     }
-    let direction = if word.eq_ignore_ascii_case("from") { Direction::In } else { Direction::Out };
-    let rest = arg[pos..].trim_start()[word.len()..].trim_start();
+    let direction = if word == "FROM" { Direction::In } else { Direction::Out };
+    let rest = arg[end..].trim_start();
     let (name, quoted, mut rest) = take_name(rest)?;
     let endpoint = match (name.to_ascii_lowercase().as_str(), quoted) {
         ("program", false) => {
@@ -207,6 +169,10 @@ mod tests {
         assert_eq!((m.sql.as_str(), m.direction), ("COPY users (id, email) FROM STDIN csv", Direction::In));
         let m = parse_meta("t from program 'gzip -dc x.gz'").unwrap();
         assert_eq!(m.endpoint, Endpoint::Program("gzip -dc x.gz".into()));
+        // FROM/TO inside strings, dollar quotes and comments of the query don't count.
+        let m = parse_meta("(select $$ to $$ /* from */ as x) to stdout").unwrap();
+        assert_eq!(m.sql, "COPY (select $$ to $$ /* from */ as x) TO STDOUT");
+        assert_eq!(direction("COPY (select 'from stdin') TO STDOUT"), Some(Direction::Out));
         assert!(parse_meta("users").is_err());
         assert!(parse_meta("to x").is_err());
     }

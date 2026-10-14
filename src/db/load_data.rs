@@ -66,114 +66,35 @@ enum Tok {
     Punct(char),
 }
 
-/// Tokens with their byte spans in the statement.
+/// Tokens with their byte spans in the statement, from sqlparser's MySQL tokenizer
+/// (escapes, doubled quotes, backquotes, `#` and `--` comments the MySQL way).
 fn tokenize(sql: &str) -> Result<Vec<(Tok, usize, usize)>> {
-    let b = sql.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        let start = i;
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == b'-' && b.get(i + 1) == Some(&b'-') || c == b'#' {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        let tok = match c {
-            b'\'' | b'"' => {
-                let mut v = Vec::new();
-                i += 1;
-                loop {
-                    let Some(&ch) = b.get(i) else { bail!("unterminated string in LOAD DATA") };
-                    if ch == b'\\' {
-                        let e = *b.get(i + 1).context("unterminated string in LOAD DATA")?;
-                        v.push(match e {
-                            b'0' => 0,
-                            b'b' => 8,
-                            b'n' => b'\n',
-                            b'r' => b'\r',
-                            b't' => b'\t',
-                            b'Z' => 26,
-                            other => other,
-                        });
-                        i += 2;
-                    } else if ch == c && b.get(i + 1) == Some(&c) {
-                        v.push(c);
-                        i += 2;
-                    } else if ch == c {
-                        i += 1;
-                        break;
-                    } else {
-                        v.push(ch);
-                        i += 1;
+    use sqlparser::tokenizer::Token;
+    let toks = crate::sqltok::tokenize(crate::readonly::SqlDialect::Mysql, sql)
+        .map_err(|e| anyhow::anyhow!("1064 (42000): You have an error in your SQL syntax ({e})"))?;
+    Ok(toks
+        .into_iter()
+        .map(|t| {
+            let raw = &sql[t.start..t.end];
+            let tok = match &t.token {
+                Token::Word(w) if w.quote_style == Some('`') => Tok::Ident(raw.to_string()),
+                Token::Word(w) if w.value.starts_with('@') => Tok::Var(raw.to_string()),
+                Token::Word(_) => Tok::Word(raw.to_string()),
+                Token::SingleQuotedString(v) | Token::DoubleQuotedString(v) => Tok::Str(v.as_bytes().to_vec()),
+                Token::Number(n, _) => n.parse().map(Tok::Number).unwrap_or_else(|_| Tok::Word(raw.to_string())),
+                // Punctuation; longer operators (`<=`, `||`) only matter inside SET
+                // expressions, which are taken as written.
+                _ => {
+                    let mut chars = raw.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Tok::Punct(c),
+                        _ => Tok::Word(raw.to_string()),
                     }
                 }
-                Tok::Str(v)
-            }
-            b'`' => {
-                i += 1;
-                while i < b.len() && !(b[i] == b'`' && b.get(i + 1) != Some(&b'`')) {
-                    i += if b[i] == b'`' { 2 } else { 1 };
-                }
-                i += 1;
-                Tok::Ident(sql[start..i.min(b.len())].to_string())
-            }
-            b'@' => {
-                i += 1;
-                if b.get(i) == Some(&b'`') {
-                    i += 1;
-                    while i < b.len() && b[i] != b'`' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else {
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'$' | b'.') || b[i] >= 0x80) {
-                        i += 1;
-                    }
-                }
-                Tok::Var(sql[start..i.min(b.len())].to_string())
-            }
-            c if c.is_ascii_digit() => {
-                while i < b.len() && b[i].is_ascii_digit() {
-                    i += 1;
-                }
-                // `1e3`, `12abc` identifiers are words.
-                if i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
-                        i += 1;
-                    }
-                    Tok::Word(sql[start..i].to_string())
-                } else {
-                    Tok::Number(sql[start..i].parse()?)
-                }
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c >= 0x80 => {
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80) {
-                    i += 1;
-                }
-                Tok::Word(sql[start..i].to_string())
-            }
-            other => {
-                i += 1;
-                Tok::Punct(other as char)
-            }
-        };
-        out.push((tok, start, i.min(b.len())));
-    }
-    Ok(out)
+            };
+            (tok, t.start, t.end)
+        })
+        .collect())
 }
 
 struct Parser<'a> {

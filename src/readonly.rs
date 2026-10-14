@@ -278,14 +278,18 @@ pub fn returns_rows(dialect: SqlDialect, sql: &str) -> bool {
     )
 }
 
-fn parse(dialect: SqlDialect, sql: &str) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+/// sqlparser's dialect for ours.
+pub fn sqlparser_dialect(dialect: SqlDialect) -> Box<dyn sqlparser::dialect::Dialect> {
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
-    use sqlparser::parser::Parser;
     match dialect {
-        SqlDialect::Mysql => Parser::parse_sql(&MySqlDialect {}, sql),
-        SqlDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
-        SqlDialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, sql),
+        SqlDialect::Mysql => Box::new(MySqlDialect {}),
+        SqlDialect::Postgres => Box::new(PostgreSqlDialect {}),
+        SqlDialect::Sqlite => Box::new(SQLiteDialect {}),
     }
+}
+
+fn parse(dialect: SqlDialect, sql: &str) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    sqlparser::parser::Parser::parse_sql(sqlparser_dialect(dialect).as_ref(), sql)
 }
 
 /// The table a query reads from, when it reads from exactly one (used to apply

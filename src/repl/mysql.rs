@@ -738,6 +738,7 @@ impl Flavor for Mysql {
         ];
         Completions {
             sql: true,
+            dialect: Some(crate::readonly::SqlDialect::Mysql),
             rules: MYSQL_RULES.to_vec(),
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: cmds.iter().map(|w| w.to_string()).collect(),

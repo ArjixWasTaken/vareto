@@ -445,6 +445,7 @@ impl Flavor for Sqlite {
         let dots = [".tables", ".schema", ".indexes", ".databases", ".mode", ".headers", ".timer", ".read", ".help", ".quit", ".exit", ".nullvalue", ".import", ".output", ".once"];
         Completions {
             sql: true,
+            dialect: Some(crate::readonly::SqlDialect::Sqlite),
             rules: SQLITE_RULES.to_vec(),
             keywords: SQL_KEYWORDS.iter().map(|w| w.to_string()).collect(),
             commands: dots.iter().map(|w| w.to_string()).collect(),
