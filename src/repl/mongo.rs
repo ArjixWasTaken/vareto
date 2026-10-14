@@ -123,6 +123,16 @@ fn native_helper(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     let fail = |e: String| -> boa_engine::JsError { JsNativeError::error().with_message(e).into() };
     let out = match op.as_str() {
         "cat" => std::fs::read_to_string(&arg).map_err(|e| fail(format!("{arg}: {e}")))?,
+        // `cls` / `console.clear()`: clear the visible screen (scrollback stays), as
+        // Ctrl+L does. Not when the output isn't a terminal: no escapes in files.
+        "clear" => {
+            use std::io::{IsTerminal as _, Write as _};
+            let mut out = std::io::stdout();
+            if out.is_terminal() {
+                out.write_all(b"\x1b[H\x1b[2J").and_then(|()| out.flush()).ok();
+            }
+            String::new()
+        }
         "ls" | "listFiles" => {
             let mut entries: Vec<Value> = std::fs::read_dir(&arg)
                 .map_err(|e| fail(format!("{arg}: {e}")))?
@@ -376,6 +386,7 @@ fn shell_command(line: &str) -> Option<String> {
             (words.len() <= 2).then(|| format!("__shell.show({})", words.join(", ")))
         }
         "it" if arg.is_empty() => Some("__shell.it()".into()),
+        "cls" if arg.is_empty() => Some("console.clear()".into()),
         "help" if arg.is_empty() => Some("__shell.help()".into()),
         _ => None,
     }
@@ -441,7 +452,7 @@ impl Flavor for Mongo {
     }
 
     fn completions(&self) -> Completions {
-        let mut w: Vec<String> = ["show", "use", "it", "exit", "help", "db.", "ObjectId(", "ISODate("]
+        let mut w: Vec<String> = ["show", "use", "it", "cls", "exit", "help", "db.", "ObjectId(", "ISODate("]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -750,6 +761,8 @@ mod tests {
         assert_eq!(shell_command("show log startupWarnings").as_deref(), Some("__shell.show(\"log\", \"startupWarnings\")"));
         assert_eq!(shell_command("it").as_deref(), Some("__shell.it()"));
         assert_eq!(shell_command("it = 3"), None);
+        assert_eq!(shell_command("cls").as_deref(), Some("console.clear()"));
+        assert_eq!(shell_command("cls;").as_deref(), Some("console.clear()"));
         assert_eq!(shell_command("db.users.find()"), None);
     }
 }
