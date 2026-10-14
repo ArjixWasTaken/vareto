@@ -255,10 +255,10 @@ pub fn format_error_with(info: &Value, stmt: &str, verbosity: &str, context: &st
         // 1-based, in characters.
         let before: String = stmt.chars().take(pos.saturating_sub(1) as usize).collect();
         let line_no = before.matches('\n').count() + 1;
-        let col = before.rsplit('\n').next().unwrap_or("").chars().count();
+        let col = crate::textfmt::width(before.rsplit('\n').next().unwrap_or(""));
         let line = stmt.lines().nth(line_no - 1).unwrap_or("");
         let prefix = format!("LINE {line_no}: ");
-        out.push_str(&format!("\n{prefix}{line}\n{}^", " ".repeat(prefix.chars().count() + col)));
+        out.push_str(&format!("\n{prefix}{line}\n{}^", " ".repeat(prefix.len() + col)));
     }
     for (key, label) in [("detail", "DETAIL"), ("hint", "HINT"), ("where", "CONTEXT")] {
         if key == "where" && context == "never" {
@@ -666,7 +666,7 @@ impl Psql {
     /// `\copy`: COPY with the file on this side. The daemon reads or writes the
     /// file, program or output this process opened.
     fn meta_copy(&mut self, arg: &str, s: &mut Session) -> Result<()> {
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         let m = copy::parse_meta(arg)?;
         let sql = m.sql.clone();
         match (m.direction, &m.endpoint) {
@@ -678,7 +678,7 @@ impl Psql {
                 Ok(())
             }
             (Direction::In, Endpoint::Program(cmd)) => {
-                let mut child = Command::new("sh").arg("-c").arg(cmd).stdout(Stdio::piped()).spawn()?;
+                let mut child = super::shell_command(cmd).stdout(Stdio::piped()).spawn()?;
                 let stdout = child.stdout.take().expect("piped");
                 let res = self.query_with(&sql, s, &mut |s| s.copy_in(&sql, stdout.as_fd()));
                 drop(stdout);
@@ -696,7 +696,7 @@ impl Psql {
                 let dst: OwnedFd = match endpoint {
                     Endpoint::File(f) => std::fs::File::create(f).with_context(|| f.clone())?.into(),
                     Endpoint::Program(cmd) => {
-                        let mut c = Command::new("sh").arg("-c").arg(cmd).stdin(Stdio::piped()).spawn()?;
+                        let mut c = super::shell_command(cmd).stdin(Stdio::piped()).spawn()?;
                         let stdin = c.stdin.take().expect("piped");
                         child = Some(c);
                         stdin.into()
@@ -759,7 +759,7 @@ impl Psql {
             bail!("Passwords didn't match.");
         }
         let mut salt = [0u8; 16];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut salt)?;
+        getrandom::fill(&mut salt).map_err(|e| anyhow::anyhow!("no randomness for the salt: {e}"))?;
         let verifier = copy::scram_verifier(&pw, &salt, 4096);
         s.sql(&format!("ALTER USER {} PASSWORD {}", super::psql_vars::quote_ident(&user), lit(&verifier)))?;
         Ok(())
@@ -1768,7 +1768,7 @@ impl Psql {
                 }),
                 Some('p') => out.push_str(&s.backend_id.map(|p| p.to_string()).unwrap_or_default()),
                 Some('l') => out.push_str(&(self.buf.lines() + 1).to_string()),
-                Some('w') => out.push_str(&" ".repeat(self.expand_prompt(self.var("PROMPT1"), s).chars().count())),
+                Some('w') => out.push_str(&" ".repeat(crate::textfmt::width(&self.expand_prompt(self.var("PROMPT1"), s)))),
                 Some('%') => out.push('%'),
                 Some('[') | Some(']') => {}
                 Some(':') => {

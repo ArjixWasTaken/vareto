@@ -165,7 +165,7 @@ pub fn format(v: &Value, kind: &Value) -> String {
             for (i, (key, val)) in m.iter().enumerate() {
                 let sub = format(val, kind.get(key).unwrap_or(&Value::Null));
                 let prefix = format!("{:>w$}# {} => ", i + 1, bulk(&Value::String(key.clone()), "b"));
-                let pad = " ".repeat(prefix.chars().count());
+                let pad = " ".repeat(crate::textfmt::width(&prefix));
                 for (j, line) in sub.lines().enumerate() {
                     out.push(if j == 0 { format!("{prefix}{line}") } else { format!("{pad}{line}") });
                 }

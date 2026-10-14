@@ -358,9 +358,17 @@ impl SqlPool {
         self.run(sql, 10_000, true, t).await
     }
 
+    /// A string literal in this database's dialect.
+    fn lit(&self, s: &str) -> String {
+        match self {
+            SqlPool::Mysql(_) => quote_lit_mysql(s),
+            SqlPool::Postgres(_) | SqlPool::Sqlite(_) => quote_lit(s),
+        }
+    }
+
     /// `schema` = Postgres schema / MySQL database.
     pub async fn list_tables(&self, schema: Option<&str>, pattern: Option<&str>, t: Duration) -> Result<Output> {
-        let like = pattern.map(|p| format!(" AND table_name LIKE {}", quote_lit(&p.replace('*', "%"))));
+        let like = pattern.map(|p| format!(" AND table_name LIKE {}", self.lit(&p.replace('*', "%"))));
         let sql = match self {
             SqlPool::Postgres(_) => format!(
                 "SELECT table_schema AS schema, table_name AS name, table_type AS type \
@@ -374,7 +382,7 @@ impl SqlPool {
             SqlPool::Mysql(_) => format!(
                 "SELECT table_name AS name, table_type AS type, table_rows AS approx_rows \
                  FROM information_schema.tables WHERE table_schema = {}{} ORDER BY 1",
-                schema.map(quote_lit).unwrap_or_else(|| "DATABASE()".into()),
+                schema.map(quote_lit_mysql).unwrap_or_else(|| "DATABASE()".into()),
                 like.unwrap_or_default()
             ),
             SqlPool::Sqlite(_) => format!(
@@ -392,7 +400,7 @@ impl SqlPool {
             (None, Some((s, tb))) => (Some(s.to_string()), tb.to_string()),
             _ => (schema.map(str::to_string), table.to_string()),
         };
-        let tl = quote_lit(&table);
+        let tl = self.lit(&table);
         let (cols, idx, fks) = match self {
             SqlPool::Postgres(_) => {
                 let sl = quote_lit(schema.as_deref().unwrap_or("public"));
@@ -410,7 +418,7 @@ impl SqlPool {
                 )
             }
             SqlPool::Mysql(_) => {
-                let sl = schema.as_deref().map(quote_lit).unwrap_or_else(|| "DATABASE()".into());
+                let sl = schema.as_deref().map(quote_lit_mysql).unwrap_or_else(|| "DATABASE()".into());
                 (
                     format!(
                         "SELECT column_name AS name, column_type AS type, is_nullable AS nullable, column_default AS `default`, \
@@ -645,10 +653,24 @@ async fn restore_timeout(c: &mut sqlx::PgConnection, old: String) {
     sqlx::raw_sql(AssertSqlSafe(format!("SET statement_timeout = {}", quote_lit(&old)))).execute(&mut *c).await.ok();
 }
 
-/// Counts the rows in COPY output as it streams by: lines for text and CSV (less
-/// a CSV header), tuples for the binary format (recognised by its signature).
+/// COPY's `QUOTE 'c'` option, if any.
+fn copy_quote(sql: &str) -> Option<u8> {
+    let upper = sql.to_ascii_uppercase();
+    let at = upper.find("QUOTE")?;
+    let rest = sql[at + 5..].trim_start();
+    let rest = rest.strip_prefix("AS").or_else(|| rest.strip_prefix("as")).unwrap_or(rest).trim_start();
+    let b = rest.as_bytes();
+    (b.len() >= 3 && b[0] == b'\'' && b[2] == b'\'').then(|| b[1])
+}
+
+/// Counts the rows in COPY output as it streams by: lines for text, records for
+/// CSV (less a header; a quoted field may hold newlines), tuples for the binary
+/// format (recognised by its signature).
 pub struct RowCounter {
     csv_header: bool,
+    /// CSV format: records are counted by a CSV reader (a quoted field may hold
+    /// newlines), not by lines.
+    csv: Option<csv_core::Reader>,
     seen: u64,
     /// The first bytes, until there are enough to tell the format.
     head: Option<Vec<u8>>,
@@ -677,8 +699,32 @@ enum Part {
 const PG_BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
 
 impl RowCounter {
-    pub fn new(csv_header: bool) -> Self {
-        Self { csv_header, seen: 0, head: Some(Vec::new()), binary: None }
+    /// `sql`: the COPY statement, for its format options (CSV, HEADER, QUOTE).
+    pub fn new(sql: &str) -> Self {
+        let upper = sql.to_ascii_uppercase();
+        let csv = upper.contains("CSV");
+        let csv_header = csv && upper.contains("HEADER");
+        let csv = csv.then(|| csv_core::ReaderBuilder::new().quote(copy_quote(sql).unwrap_or(b'"')).build());
+        Self { csv_header, csv, seen: 0, head: Some(Vec::new()), binary: None }
+    }
+
+    /// Count the CSV records in `data` (`None`: the end of the data).
+    fn csv_feed(&mut self, data: Option<&[u8]>) {
+        let Some(r) = self.csv.as_mut() else { return };
+        let (mut out, mut ends) = ([0u8; 4096], [0usize; 256]);
+        let mut input = data.unwrap_or(&[]);
+        loop {
+            let (res, nin, _, _) = r.read_record(input, &mut out, &mut ends);
+            input = &input[nin..];
+            match res {
+                csv_core::ReadRecordResult::Record => self.seen += 1,
+                // Field bytes don't matter, only record ends: keep going.
+                csv_core::ReadRecordResult::OutputFull | csv_core::ReadRecordResult::OutputEndsFull => {}
+                csv_core::ReadRecordResult::InputEmpty if data.is_some() => return,
+                csv_core::ReadRecordResult::InputEmpty => {}
+                csv_core::ReadRecordResult::End => return,
+            }
+        }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
@@ -695,7 +741,11 @@ impl RowCounter {
     }
 
     fn count_in(&mut self, mut data: &[u8]) {
+        if self.binary.is_none() && self.csv.is_some() {
+            return self.csv_feed(Some(data));
+        }
         let Some(b) = self.binary.as_mut() else {
+            // Text format: escapes keep newlines in data off the line ends.
             self.seen += data.iter().filter(|&&c| c == b'\n').count() as u64;
             return;
         };
@@ -745,17 +795,19 @@ impl RowCounter {
         }
     }
 
-    pub fn count(&self) -> u64 {
-        // Output shorter than the signature is text.
-        if let Some(head) = &self.head {
-            let lines = head.iter().filter(|&&c| c == b'\n').count() as u64;
-            return if self.csv_header { lines.saturating_sub(1) } else { lines };
+    /// The rows, once all the data was fed.
+    pub fn count(&mut self) -> u64 {
+        // Output shorter than the signature is text or CSV.
+        if let Some(head) = self.head.take() {
+            self.count_in(&head);
         }
-        match self.binary {
-            Some(_) => self.seen,
-            None if self.csv_header => self.seen.saturating_sub(1),
-            None => self.seen,
+        if self.binary.is_some() {
+            return self.seen;
         }
+        // A last record without a line end.
+        self.csv_feed(None);
+        self.csv.take();
+        if self.csv_header { self.seen.saturating_sub(1) } else { self.seen }
     }
 }
 
@@ -887,11 +939,11 @@ impl SqlConn {
     /// Returns the rows copied.
     pub async fn copy_out(&mut self, sql: &str, readonly: bool, dst: OwnedFd, timeout: Duration) -> Result<u64> {
         let SqlConn::Postgres(c) = self else { anyhow::bail!("COPY TO STDOUT is Postgres-only") };
-        async fn write(c: &mut sqlx::PgConnection, sql: &str, dst: OwnedFd, csv_header: bool) -> Result<u64> {
+        async fn write(c: &mut sqlx::PgConnection, sql: &str, dst: OwnedFd) -> Result<u64> {
             use tokio::io::AsyncWriteExt as _;
             let mut dst = tokio::fs::File::from_std(std::fs::File::from(dst));
             let mut stream = c.copy_out_raw(sql).await?;
-            let mut rows = RowCounter::new(csv_header);
+            let mut rows = RowCounter::new(sql);
             let mut failed = None;
             while let Some(chunk) = stream.try_next().await? {
                 rows.feed(&chunk);
@@ -913,20 +965,18 @@ impl SqlConn {
                 _ => Ok(rows.count()),
             }
         }
-        let upper = sql.to_ascii_uppercase();
-        let csv_header = upper.contains("CSV") && upper.contains("HEADER");
         let restore = pg_long_timeout(c, timeout).await?;
         let res = if readonly {
             match c.begin_with("BEGIN READ ONLY").await {
                 Ok(mut tx) => {
-                    let r = write(&mut tx, sql, dst, csv_header).await;
+                    let r = write(&mut tx, sql, dst).await;
                     tx.rollback().await.ok();
                     r
                 }
                 Err(e) => Err(e.into()),
             }
         } else {
-            write(c, sql, dst, csv_header).await
+            write(c, sql, dst).await
         };
         restore_timeout(c, restore).await;
         res.map_err(server_message)
@@ -982,10 +1032,21 @@ pub fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Standard-SQL string literal (also valid for MySQL with default sql_mode when
-/// backslashes are escaped).
+/// A standard-SQL string literal (Postgres, SQLite): quotes doubled; a backslash
+/// is an ordinary character.
 pub fn quote_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A MySQL string literal: backslashes escaped too (the default sql_mode reads
+/// them as escapes).
+pub fn quote_lit_mysql(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// A MySQL identifier: backquoted.
+pub fn quote_ident_mysql(s: &str) -> String {
+    format!("`{}`", s.replace('`', "``"))
 }
 
 #[cfg(test)]
@@ -1024,12 +1085,22 @@ mod tests {
 
     #[test]
     fn copy_row_counts() {
-        let mut c = RowCounter::new(false);
+        let mut c = RowCounter::new("COPY t TO STDOUT");
         c.feed(b"1\tone\n2\t");
         c.feed(b"two\n");
         assert_eq!(c.count(), 2);
-        let mut c = RowCounter::new(true);
+        let mut c = RowCounter::new("COPY t TO STDOUT WITH (FORMAT csv, HEADER)");
         c.feed(b"id,name\n1,one\n");
+        assert_eq!(c.count(), 1);
+        // CSV: a quoted newline is inside a record, and the last record may lack
+        // its line end; split across chunks.
+        let mut c = RowCounter::new("copy t to stdout csv");
+        c.feed(b"1,\"multi\nli");
+        c.feed(b"ne\"\n2,\"x\"\"\n\"\n3,last");
+        assert_eq!(c.count(), 3);
+        // A custom quote character.
+        let mut c = RowCounter::new("COPY t TO STDOUT (FORMAT csv, QUOTE '|')");
+        c.feed(b"1,|a\nb|\n");
         assert_eq!(c.count(), 1);
 
         // Binary format: header, then (int2 fields, [int4 len, bytes]...) per tuple,
@@ -1049,10 +1120,10 @@ mod tests {
         data.extend_from_slice(&(-1i16).to_be_bytes());
         // Fed byte by byte, so every state crosses a chunk boundary; a `\n` byte
         // inside the binary data must not count.
-        let mut c = RowCounter::new(false);
+        let mut c = RowCounter::new("COPY t TO STDOUT (FORMAT binary)");
         data.chunks(1).for_each(|b| c.feed(b));
         assert_eq!(c.count(), 3);
-        let mut c = RowCounter::new(false);
+        let mut c = RowCounter::new("COPY t TO STDOUT (FORMAT binary)");
         c.feed(&data);
         assert_eq!(c.count(), 3);
     }
@@ -1066,5 +1137,9 @@ mod tests {
         assert_eq!(json_from_text("NUMERIC", "1.10"), json!("1.10"));
         assert_eq!(json_from_text("FLOAT8", "NaN"), json!("NaN"));
         assert_eq!(quote_lit("it's"), "'it''s'");
+        // Postgres and SQLite read a backslash as itself; MySQL as an escape.
+        assert_eq!(quote_lit("a\\b"), "'a\\b'");
+        assert_eq!(quote_lit_mysql("a\\b'c"), "'a\\\\b''c'");
+        assert_eq!(quote_ident_mysql("we`ird"), "`we``ird`");
     }
 }

@@ -110,9 +110,7 @@ pub fn quote_literal(v: &str) -> String {
 }
 
 /// A value as an SQL identifier.
-pub fn quote_ident(v: &str) -> String {
-    format!("\"{}\"", v.replace('"', "\"\""))
-}
+pub use crate::db::sql::quote_ident;
 
 fn is_name(c: char) -> bool {
     c.is_alphanumeric() || c == '_'

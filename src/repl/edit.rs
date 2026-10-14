@@ -12,11 +12,19 @@ fn editor() -> String {
 
 /// Open `text` in the editor and return what was saved.
 pub fn edit_text(text: &str, extension: &str) -> Result<String> {
-    let path = std::env::temp_dir().join(format!("vareto-edit-{}.{extension}", std::process::id()));
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    let res = edit_file(&path.to_string_lossy(), None).and_then(|()| Ok(std::fs::read_to_string(&path)?));
-    std::fs::remove_file(&path).ok();
-    res
+    use std::io::Write as _;
+    // A fresh, private file with a random name (never a predictable path in a
+    // shared temp directory). It's removed when `file` drops.
+    let mut file = tempfile::Builder::new()
+        .prefix("vareto-edit-")
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .context("creating a file to edit")?;
+    file.write_all(text.as_bytes()).and_then(|()| file.flush()).context("writing the file to edit")?;
+    let path = file.path().to_path_buf();
+    edit_file(&path.to_string_lossy(), None)?;
+    // By path: editors often save by replacing the file.
+    Ok(std::fs::read_to_string(&path)?)
 }
 
 /// Open a file in the editor (at `line`, for editors that take `+N`).

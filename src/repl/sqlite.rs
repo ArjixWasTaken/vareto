@@ -308,9 +308,9 @@ impl Sqlite {
                     like("name")
                 );
                 let names: Vec<String> = self.rows(s, &sql)?.iter().map(|r| table::cell(&r[0], "")).collect();
-                let w = names.iter().map(|n| n.chars().count()).max().unwrap_or(0) + 2;
+                let w = names.iter().map(|n| crate::textfmt::width(n)).max().unwrap_or(0) + 2;
                 for chunk in names.chunks((80 / w.max(1)).max(1)) {
-                    outln!("{}", chunk.iter().map(|n| format!("{n:<w$}")).collect::<String>().trim_end());
+                    outln!("{}", chunk.iter().map(|n| crate::textfmt::pad_right(n, w)).collect::<String>().trim_end());
                 }
             }
             "schema" => {

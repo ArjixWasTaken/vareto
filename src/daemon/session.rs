@@ -64,9 +64,6 @@ impl Session {
     }
 }
 
-fn mysql_ident(s: &str) -> String {
-    format!("`{}`", s.replace('`', "``"))
-}
 
 /// Pin a connection on `live`, switched to `database` when given. Returns the
 /// connection, its current database and its server-side id (for cancelling).
@@ -78,7 +75,7 @@ async fn pin(live: &Live, kind: Kind, cfg_db: Option<&str>, database: Option<&st
                 _ => p.detach(timeout).await?,
             };
             if let (Kind::Mysql, Some(db)) = (kind, database) {
-                c.run(&format!("USE {}", mysql_ident(db)), 1, false).await?;
+                c.run(&format!("USE {}", crate::db::sql::quote_ident_mysql(db)), 1, false).await?;
             }
             let (db, id) = match kind {
                 Kind::Postgres => (c.scalar("SELECT current_database()").await?, c.scalar("SELECT pg_backend_pid()").await?),
@@ -435,7 +432,7 @@ pub async fn use_db(state: &State, owner: u64, id: u64, database: &str) -> Resul
         }
         Kind::Mysql => {
             let Pinned::Sql(c) = &mut inner.pinned else { unreachable!() };
-            c.run(&format!("USE {}", mysql_ident(database)), 1, false).await?;
+            c.run(&format!("USE {}", crate::db::sql::quote_ident_mysql(database)), 1, false).await?;
             inner.database = c.scalar("SELECT DATABASE()").await?.as_str().map(str::to_string);
         }
         Kind::Mongodb => inner.database = Some(database.to_string()),

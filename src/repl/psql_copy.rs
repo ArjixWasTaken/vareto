@@ -167,21 +167,17 @@ pub fn scram_verifier(password: &str, salt: &[u8], iterations: u32) -> String {
     use hmac::{KeyInit as _, Mac as _};
     use sha2::Digest as _;
     type Hmac = hmac::Hmac<sha2::Sha256>;
-    let mac = |key: &[u8], data: &[u8]| -> Vec<u8> {
-        let mut m = Hmac::new_from_slice(key).expect("HMAC takes any key length");
+    // SASLprep, as clients do at login (sqlx, libpq). Like libpq, a password it
+    // rejects is used as it is.
+    let prepared = stringprep::saslprep(password).unwrap_or(std::borrow::Cow::Borrowed(password));
+    let salted: [u8; 32] = pbkdf2::pbkdf2_hmac_array::<sha2::Sha256, 32>(prepared.as_bytes(), salt, iterations);
+    let mac = |data: &[u8]| -> Vec<u8> {
+        let mut m = Hmac::new_from_slice(&salted).expect("HMAC takes any key length");
         m.update(data);
         m.finalize().into_bytes().to_vec()
     };
-    // PBKDF2-HMAC-SHA-256 with a single output block.
-    let mut u = mac(password.as_bytes(), &[salt, &1u32.to_be_bytes()].concat());
-    let mut salted = u.clone();
-    for _ in 1..iterations {
-        u = mac(password.as_bytes(), &u);
-        salted.iter_mut().zip(&u).for_each(|(a, b)| *a ^= b);
-    }
-    let client_key = mac(&salted, b"Client Key");
-    let stored_key = sha2::Sha256::digest(&client_key);
-    let server_key = mac(&salted, b"Server Key");
+    let stored_key = sha2::Sha256::digest(mac(b"Client Key"));
+    let server_key = mac(b"Server Key");
     let b64 = base64::engine::general_purpose::STANDARD;
     format!("SCRAM-SHA-256${iterations}:{}${}:{}", b64.encode(salt), b64.encode(stored_key), b64.encode(server_key))
 }
@@ -224,5 +220,10 @@ mod tests {
             scram_verifier("pencil", &salt, 4096),
             "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU="
         );
+        // SASLprep first: a non-ASCII space maps to a space, so both give the
+        // same verifier (what a client computes at login).
+        assert_eq!(scram_verifier("pen\u{00A0}cil", &salt, 4096), scram_verifier("pen cil", &salt, 4096));
+        // A password SASLprep rejects (a prohibited control character) is used as is.
+        assert_ne!(scram_verifier("pen\u{0007}", &salt, 4096), scram_verifier("pen", &salt, 4096));
     }
 }

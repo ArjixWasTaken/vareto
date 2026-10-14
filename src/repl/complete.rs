@@ -173,9 +173,13 @@ impl Candidate {
 
 /// The word at `pos`: (where it starts, the word).
 pub fn word_at(line: &str, pos: usize) -> (usize, &str) {
+    // After the last character that can't be part of a word (which may be
+    // several bytes long: `’`, `–`).
     let start = line[..pos]
-        .rfind(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '.' | '\\' | '$' | '+')))
-        .map(|i| i + 1)
+        .char_indices()
+        .rev()
+        .find(|&(_, ch)| !(ch.is_alphanumeric() || matches!(ch, '_' | '.' | '\\' | '$' | '+')))
+        .map(|(i, ch)| i + ch.len_utf8())
         .unwrap_or(0);
     (start, &line[start..pos])
 }
@@ -618,6 +622,13 @@ mod tests {
         assert_eq!(texts("GET user:1 "), Vec::<String>::new());
         assert_eq!(texts("DEL user:1 "), vec!["user:1", "user:2"]);
         assert_eq!(texts("INFO "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn multibyte_separators() {
+        // A multi-byte character before the word must not split it mid-character.
+        assert_eq!(word_at("select ’us", "select ’us".len()), ("select ’".len(), "us"));
+        assert_eq!(first("select * from –us"), "users");
     }
 
     #[test]

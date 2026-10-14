@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use super::psql_vars::bool_value;
 use super::table;
+use crate::textfmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -261,7 +262,7 @@ impl PrintOpts {
             || self.expanded == Expanded::On
             || (self.expanded == Expanded::Auto
                 && matches!(self.format, Format::Aligned | Format::Wrapped)
-                && self.aligned(columns, rows, None).lines().map(|l| l.chars().count()).max().unwrap_or(0) > width);
+                && self.aligned(columns, rows, None).lines().map(textfmt::width).max().unwrap_or(0) > width);
         match self.format {
             Format::Aligned | Format::Wrapped if expanded => self.expanded_aligned(columns, rows),
             Format::Aligned => self.with_title_footer(self.aligned(columns, rows, None), rows.len(), true),
@@ -282,8 +283,8 @@ impl PrintOpts {
         let mut out = String::new();
         if let (Some(t), false) = (&self.title, self.tuples_only) {
             if centered {
-                let w = body.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-                out.push_str(format!("{t:^w$}").trim_end());
+                let w = body.lines().map(textfmt::width).max().unwrap_or(0);
+                out.push_str(textfmt::center(t, w).trim_end());
             } else {
                 out.push_str(t);
             }
@@ -363,8 +364,8 @@ impl PrintOpts {
         }
         let sep = if self.unicode { '│' } else { '|' };
         let dash = if self.unicode { '─' } else { '-' };
-        let w = columns.iter().map(|c| c.chars().count()).max().unwrap_or(0);
-        let vw = rows.iter().flatten().map(|v| self.cell(v).chars().count()).max().unwrap_or(0);
+        let w = columns.iter().map(|c| textfmt::width(c)).max().unwrap_or(0);
+        let vw = rows.iter().flatten().map(|v| textfmt::width(&self.cell(v))).max().unwrap_or(0);
         let mut out = Vec::new();
         if let (Some(t), false) = (&self.title, self.tuples_only) {
             out.push(t.clone());
@@ -373,12 +374,12 @@ impl PrintOpts {
             if !self.tuples_only {
                 let head = format!("{dash}[ RECORD {} ]", n + 1);
                 let total = w + 3 + vw;
-                out.push(format!("{head}{}", dash.to_string().repeat(total.saturating_sub(head.chars().count()).max(1))));
+                out.push(format!("{head}{}", dash.to_string().repeat(total.saturating_sub(textfmt::width(&head)).max(1))));
             } else if n > 0 {
                 out.push(String::new());
             }
             for (c, v) in columns.iter().zip(r) {
-                out.push(format!("{c:<w$} {sep} {}", self.cell(v)).trim_end().to_string());
+                out.push(format!("{} {sep} {}", textfmt::pad_right(c, w), self.cell(v)).trim_end().to_string());
             }
         }
         out.join("\n")

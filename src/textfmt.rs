@@ -28,6 +28,29 @@ pub enum StreamFormat {
     SqliteJson,
 }
 
+/// Terminal columns `s` takes: CJK and most emoji take two, combining marks none.
+/// What clients line columns up by (psql's `pg_wcswidth`); `chars().count()` and
+/// `format!` padding count characters instead.
+pub fn width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// `s` padded with spaces on the right to `w` columns.
+pub fn pad_right(s: &str, w: usize) -> String {
+    format!("{s}{}", " ".repeat(w.saturating_sub(width(s))))
+}
+
+/// `s` padded with spaces on the left to `w` columns.
+pub fn pad_left(s: &str, w: usize) -> String {
+    format!("{}{s}", " ".repeat(w.saturating_sub(width(s))))
+}
+
+/// `s` centred in `w` columns (an odd space goes to the right).
+pub fn center(s: &str, w: usize) -> String {
+    let free = w.saturating_sub(width(s));
+    format!("{}{s}{}", " ".repeat(free / 2), " ".repeat(free - free / 2))
+}
+
 /// SQL types whose values are bytes (MySQL).
 pub fn is_binary_type(t: &str) -> bool {
     let t = t.to_ascii_uppercase();
@@ -205,9 +228,9 @@ impl RecordFormatter {
                 if !first {
                     out.push(b'\n');
                 }
-                let w = self.columns.iter().map(|c| c.chars().count()).max().unwrap_or(0);
+                let w = self.columns.iter().map(|c| width(c)).max().unwrap_or(0);
                 for (c, v) in self.columns.iter().zip(row) {
-                    out.extend_from_slice(format!("{c:>w$} = {}\n", cell(v, "")).as_bytes());
+                    out.extend_from_slice(format!("{} = {}\n", pad_left(c, w), cell(v, "")).as_bytes());
                 }
             }
             StreamFormat::SqliteJson => {
@@ -281,6 +304,17 @@ mod tests {
         let t = StreamFormat::PsqlUnaligned { fieldsep, recordsep, null, header: false, footer: true, title, expanded: true };
         assert_eq!(render(&t, &c, &[], &r), "id|1\nnote|a\tb\n\nid|2\nnote|∅\n");
         assert_eq!(render(&t, &c, &[], &[]), "");
+    }
+
+    #[test]
+    fn display_width() {
+        assert_eq!((width("abc"), width("名前"), width("🦀")), (3, 4, 2));
+        assert_eq!(pad_right("名前", 6), "名前  ");
+        assert_eq!(pad_left("名前", 6), "  名前");
+        assert_eq!(center("ab", 5), " ab  ");
+        // sqlite line mode lines the `=` up by columns.
+        let cols = vec!["名前".to_string(), "id".to_string()];
+        assert_eq!(render(&StreamFormat::SqliteLine, &cols, &[], &[vec![json!("a"), json!(1)]]), "名前 = a\n  id = 1\n");
     }
 
     #[test]

@@ -591,7 +591,7 @@ impl Mysql {
                     || self.opts.vertical
                     || (self.opts.auto_vertical && {
                         let t = table::table(&columns, &rows, Style::Mysql, headers, &|v| table::cell(v, "NULL"));
-                        t.lines().next().map(|l| l.chars().count()).unwrap_or(0) > out::width()
+                        t.lines().next().map(crate::textfmt::width).unwrap_or(0) > out::width()
                     });
                 let text = if vertical {
                     table::vertical_mysql(&columns, &rows)

@@ -39,9 +39,7 @@ pub struct Listing {
 }
 
 /// A string literal (standard_conforming_strings: backslashes are literal).
-pub fn lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
+pub use crate::db::sql::quote_lit as lit;
 
 /// A psql pattern (`*`, `?`, optional `schema.`) as conditions on the schema and
 /// name columns. Without a pattern: `visible` (and no system schemas unless S).

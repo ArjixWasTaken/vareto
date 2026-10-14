@@ -680,9 +680,6 @@ fn plain_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn backquote(s: &str) -> String {
-    format!("`{}`", s.replace('`', "``"))
-}
 
 /// Split `db.t` / `` `db`.`t` `` into its unquoted parts.
 fn name_parts(s: &str) -> Vec<String> {
@@ -970,8 +967,8 @@ pub async fn load(c: &mut MySqlConnection, req: LoadRequest<'_>) -> Result<Value
     let columns = if d.targets.is_empty() {
         let parts = name_parts(&d.table);
         let (schema, table) = match parts.as_slice() {
-            [db, t] => (crate::db::sql::quote_lit(db), crate::db::sql::quote_lit(t)),
-            [t] => ("DATABASE()".to_string(), crate::db::sql::quote_lit(t)),
+            [db, t] => (crate::db::sql::quote_lit_mysql(db), crate::db::sql::quote_lit_mysql(t)),
+            [t] => ("DATABASE()".to_string(), crate::db::sql::quote_lit_mysql(t)),
             _ => bail!("unexpected table name {}", d.table),
         };
         let rows = sqlx::raw_sql(AssertSqlSafe(format!(
@@ -980,7 +977,7 @@ pub async fn load(c: &mut MySqlConnection, req: LoadRequest<'_>) -> Result<Value
         )))
         .fetch_all(&mut *c)
         .await?;
-        rows.iter().map(|r| Target::Column(backquote(r.try_get_unchecked::<&str, _>(0).unwrap_or_default()))).collect()
+        rows.iter().map(|r| Target::Column(crate::db::sql::quote_ident_mysql(r.try_get_unchecked::<&str, _>(0).unwrap_or_default()))).collect()
     } else {
         d.targets.clone()
     };

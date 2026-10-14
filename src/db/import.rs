@@ -37,9 +37,6 @@ pub struct ImportRequest<'a> {
     pub peer: Option<OwnedFd>,
 }
 
-fn ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
 
 /// Records as they are read: (line where the record starts, fields).
 type Lines = Vec<(u64, Vec<String>)>;
@@ -100,7 +97,7 @@ async fn insert(c: &mut SqliteConnection, target: &str, ncols: usize, rows: &[(u
 /// Run `.import`. Returns `{"rows", "errors", "lines", "messages": [...]}`.
 pub async fn import(c: &mut SqliteConnection, req: ImportRequest<'_>) -> Result<Value> {
     let schema = req.schema.clone().unwrap_or_else(|| "main".into());
-    let target = format!("{}.{}", ident(&schema), ident(&req.table));
+    let target = format!("{}.{}", crate::db::sql::quote_ident(&schema), crate::db::sql::quote_ident(&req.table));
     let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_table_info(?1, ?2)")
         .bind(&req.table)
         .bind(&schema)
@@ -132,10 +129,10 @@ pub async fn import(c: &mut SqliteConnection, req: ImportRequest<'_>) -> Result<
                     Some(n) => n,
                     None => {
                         // A new table: its columns are the first row.
-                        let cols: Vec<String> = fields.iter().map(|f| ident(f)).collect();
+                        let cols: Vec<String> = fields.iter().map(|f| crate::db::sql::quote_ident(f)).collect();
                         let create = match &req.schema {
-                            Some(s) => format!("CREATE TABLE {}.{}(\n{})", ident(s), ident(&req.table), cols.join(", ")),
-                            None => format!("CREATE TABLE {}(\n{})", ident(&req.table), cols.join(", ")),
+                            Some(s) => format!("CREATE TABLE {}.{}(\n{})", crate::db::sql::quote_ident(s), crate::db::sql::quote_ident(&req.table), cols.join(", ")),
+                            None => format!("CREATE TABLE {}(\n{})", crate::db::sql::quote_ident(&req.table), cols.join(", ")),
                         };
                         sqlx::raw_sql(AssertSqlSafe(create)).execute(&mut *c).await?;
                         ncols = Some(fields.len());

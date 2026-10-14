@@ -332,13 +332,13 @@ struct ShellCompleter {
 impl reedline::Completer for ShellCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> reedline::CompletionResult {
         let (start, cands) = complete::complete(&self.words.lock().unwrap(), line, pos);
-        let width = cands.iter().map(|c| c.text.chars().count()).max().unwrap_or(0).min(48);
+        let width = cands.iter().map(|c| crate::textfmt::width(&c.text)).max().unwrap_or(0).min(48);
         let suggestions: Vec<reedline::Suggestion> = cands
             .into_iter()
             .map(|c| {
                 let note = c.note();
                 reedline::Suggestion {
-                    display_override: Some(format!("{:<width$}  {note}", c.text)),
+                    display_override: Some(format!("{}  {note}", crate::textfmt::pad_right(&c.text, width))),
                     value: c.text,
                     span: reedline::Span::new(start, pos),
                     append_whitespace: false,
@@ -480,7 +480,7 @@ impl skim::SkimItem for Pick {
         let mut line = context.to_line(Cow::Borrowed(&self.text));
         if !self.note.is_empty() {
             let dim = ratatui_core::style::Style::default().add_modifier(ratatui_core::style::Modifier::DIM);
-            let pad = self.width.saturating_sub(self.text.chars().count()) + 2;
+            let pad = self.width.saturating_sub(crate::textfmt::width(&self.text)) + 2;
             line.push_span(ratatui_core::text::Span::styled(format!("{:pad$}{}", "", self.note), dim));
         }
         line
@@ -516,7 +516,7 @@ fn run_finder(ed: &mut reedline::Reedline, which: &str, words: &Mutex<Completion
     let pos = ed.current_insertion_point();
     let (new, cursor) = if which == FIND_COMPLETION {
         let (start, typed, all) = complete::complete_all(&words.lock().unwrap(), &buffer, pos);
-        let width = all.iter().map(|c| c.text.chars().count()).max().unwrap_or(0).min(48);
+        let width = all.iter().map(|c| crate::textfmt::width(&c.text)).max().unwrap_or(0).min(48);
         let picks = all.into_iter().map(|c| Pick { note: c.note(), value: c.text.clone(), text: c.text, width }).collect();
         let Some(v) = finder(picks, typed) else { return };
         (format!("{}{v}{}", &buffer[..start], &buffer[pos..]), start + v.len())

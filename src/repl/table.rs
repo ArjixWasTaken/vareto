@@ -79,6 +79,7 @@ impl QueryResult {
 }
 
 pub use crate::textfmt::{cell, is_binary_type};
+use crate::textfmt::{pad_left, pad_right, width};
 
 /// psql prints booleans as `t`/`f`.
 pub fn psql_cell(v: &Value) -> String {
@@ -128,14 +129,14 @@ pub fn table(columns: &[String], rows: &[Vec<Value>], style: Style, headers: boo
 fn column(columns: &[String], rows: &[Vec<Value>], headers: bool, fmt: &dyn Fn(&Value) -> String) -> String {
     let cells: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(fmt).collect()).collect();
     let widths: Vec<usize> = (0..columns.len())
-        .map(|i| cells.iter().map(|r| r.get(i).map_or(0, |c| c.chars().count())).chain([columns[i].chars().count()]).max().unwrap_or(0))
+        .map(|i| cells.iter().map(|r| r.get(i).map_or(0, |c| width(c))).chain([width(&columns[i])]).max().unwrap_or(0))
         .collect();
     let right: Vec<bool> = (0..columns.len()).map(|i| numeric(rows, i)).collect();
     let line = |r: &[String]| {
         r.iter()
             .zip(&widths)
             .zip(&right)
-            .map(|((c, &w), &right)| if right { format!("{c:>w$}") } else { format!("{c:<w$}") })
+            .map(|((c, &w), &right)| if right { pad_left(c, w) } else { pad_right(c, w) })
             .collect::<Vec<_>>()
             .join("  ")
             .trim_end()
@@ -152,12 +153,12 @@ fn column(columns: &[String], rows: &[Vec<Value>], headers: bool, fmt: &dyn Fn(&
 
 /// MySQL `\G`.
 pub fn vertical_mysql(columns: &[String], rows: &[Vec<Value>]) -> String {
-    let w = columns.iter().map(|c| c.chars().count()).max().unwrap_or(0);
+    let w = columns.iter().map(|c| width(c)).max().unwrap_or(0);
     let mut out = String::new();
     for (n, r) in rows.iter().enumerate() {
         out.push_str(&format!("{} {}. row {}\n", "*".repeat(27), n + 1, "*".repeat(27)));
         for (c, v) in columns.iter().zip(r) {
-            out.push_str(&format!("{c:>w$}: {}\n", cell(v, "NULL")));
+            out.push_str(&format!("{}: {}\n", pad_left(c, w), cell(v, "NULL")));
         }
     }
     out.trim_end().to_string()
@@ -187,6 +188,15 @@ mod tests {
             vertical_mysql(&c, &r[..1]),
             "*************************** 1. row ***************************\n  id: 1\nname: ann"
         );
+    }
+
+    #[test]
+    fn wide_text_aligns() {
+        let c = vec!["name".to_string(), "n".to_string()];
+        let r = vec![vec![json!("名前"), json!(1)], vec![json!("ab"), json!(22)]];
+        // Two spaces between columns, measured in terminal columns.
+        assert_eq!(table(&c, &r, Style::Column, true, &|v| cell(v, "")), "name   n\n----  --\n名前   1\nab    22");
+        assert_eq!(vertical_mysql(&["名前".into(), "id".into()], &[vec![json!("x"), json!(1)]]).lines().nth(1), Some("名前: x"));
     }
 
     #[test]
