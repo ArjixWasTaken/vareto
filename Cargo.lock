@@ -6173,6 +6173,7 @@ dependencies = [
  "keyring",
  "mongodb",
  "nix 0.31.3",
+ "nu-ansi-term",
  "nucleo-matcher",
  "pbkdf2",
  "percent-encoding",

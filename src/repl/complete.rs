@@ -536,13 +536,6 @@ fn level_words<'a>(c: &Completions, line: &'a str, pos: usize) -> (usize, &'a st
     (start + cut, &word[cut..], words)
 }
 
-/// Every word that fits at `pos`, unranked, for the fzf finder to rank (Ctrl-T):
-/// (where the word starts, the word typed so far, the words).
-pub fn complete_all<'a>(c: &Completions, line: &'a str, pos: usize) -> (usize, &'a str, Vec<Candidate>) {
-    let (start, typed, words) = level_words(c, line, pos);
-    (start, typed, words.into_iter().map(|w| Candidate { text: w.text, kind: w.kind, owner: w.owner, indices: Vec::new() }).collect())
-}
-
 /// Candidates for the word at `pos`, best first: fzf-style fuzzy matches, with
 /// those that start with the word ahead. Completion is per word: in a dotted path
 /// (`db.product.fi`, `users.em`) only the part after the last dot is completed and

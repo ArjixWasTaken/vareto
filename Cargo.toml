@@ -58,6 +58,7 @@ csv-core = { version = "0.1.13", default-features = false }
 hex = "0.4.3"
 uuid = "1.28.0"
 backon = "1.6.0"
+nu-ansi-term = "=0.50.3"
 
 [profile.release]
 strip = true

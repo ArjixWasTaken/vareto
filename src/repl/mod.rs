@@ -320,8 +320,8 @@ fn finish_script(f: &mut dyn Flavor, r: Result<Flow>) -> i32 {
     }
 }
 
-/// Our candidates, reedline's popup: each one shows its kind as a second column,
-/// with the characters that matched highlighted.
+/// Our candidates, reedline's popup: each one shows its kind, dimmed, as a second
+/// column, with the characters that matched highlighted.
 struct ShellCompleter {
     words: Arc<Mutex<Completions>>,
 }
@@ -335,7 +335,12 @@ impl reedline::Completer for ShellCompleter {
             .map(|c| {
                 let note = c.note();
                 reedline::Suggestion {
-                    display_override: Some(format!("{}  {note}", crate::textfmt::pad_right(&c.text, width))),
+                    // The menu measures widths without escapes, so the dim kind lines up.
+                    display_override: Some(format!(
+                        "{}  {}",
+                        crate::textfmt::pad_right(&c.text, width),
+                        nu_ansi_term::Style::new().dimmed().paint(note)
+                    )),
                     value: c.text,
                     span: reedline::Span::new(start, pos),
                     append_whitespace: false,
@@ -455,32 +460,18 @@ fn migrate_history(path: &std::path::Path) {
     std::fs::write(path, body).ok();
 }
 
-/// The host commands Ctrl-T and Ctrl-R send: they open the fzf finder (skim).
-const FIND_COMPLETION: &str = "vareto:find-completion";
+/// The host command Ctrl-R sends: it opens the fzf history finder (skim).
 const FIND_HISTORY: &str = "vareto:find-history";
 
-/// One entry of the fzf finder: matched on `text`, shown with `note`, inserts `value`.
+/// One history entry in the finder: matched on `text` (one line), inserts `value`.
 struct Pick {
     text: String,
     value: String,
-    note: String,
-    /// Width the text is padded to, so the notes line up.
-    width: usize,
 }
 
 impl skim::SkimItem for Pick {
     fn text(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.text)
-    }
-
-    fn display(&self, context: skim::DisplayContext) -> ratatui_core::text::Line<'_> {
-        let mut line = context.to_line(Cow::Borrowed(&self.text));
-        if !self.note.is_empty() {
-            let dim = ratatui_core::style::Style::default().add_modifier(ratatui_core::style::Modifier::DIM);
-            let pad = self.width.saturating_sub(crate::textfmt::width(&self.text)) + 2;
-            line.push_span(ratatui_core::text::Span::styled(format!("{:pad$}{}", "", self.note), dim));
-        }
-        line
     }
 
     fn output(&self) -> Cow<'_, str> {
@@ -505,35 +496,25 @@ fn finder(picks: Vec<Pick>, query: &str) -> Option<String> {
     out.selected_items.first().map(|m| m.item.output().into_owned())
 }
 
-/// Ctrl-T / Ctrl-R: open the finder on completions for the word at the cursor, or
-/// on the history, then put its pick into the buffer reedline kept.
-fn run_finder(ed: &mut reedline::Reedline, which: &str, words: &Mutex<Completions>) {
+/// Ctrl-R: open the finder on the history, newest first, then put the pick into
+/// the buffer reedline kept (without running it).
+fn find_history(ed: &mut reedline::Reedline) {
     use reedline::EditCommand;
     let buffer = ed.current_buffer_contents().to_string();
-    let pos = ed.current_insertion_point();
-    let (new, cursor) = if which == FIND_COMPLETION {
-        let (start, typed, all) = complete::complete_all(&words.lock().unwrap(), &buffer, pos);
-        let width = all.iter().map(|c| crate::textfmt::width(&c.text)).max().unwrap_or(0).min(48);
-        let picks = all.into_iter().map(|c| Pick { note: c.note(), value: c.text.clone(), text: c.text, width }).collect();
-        let Some(v) = finder(picks, typed) else { return };
-        (format!("{}{v}{}", &buffer[..start], &buffer[pos..]), start + v.len())
-    } else {
-        let query = reedline::SearchQuery::everything(reedline::SearchDirection::Backward, None);
-        let mut seen = std::collections::HashSet::new();
-        let picks: Vec<Pick> = ed
-            .history()
-            .search(query)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|h| h.command_line)
-            .filter(|c| seen.insert(c.clone()))
-            .map(|c| Pick { text: c.replace('\n', " ↵ "), value: c, note: String::new(), width: 0 })
-            .collect();
-        let Some(v) = finder(picks, buffer.trim()) else { return };
-        let len = v.len();
-        (v, len)
-    };
-    ed.run_edit_commands(&[EditCommand::Clear, EditCommand::InsertString(new), EditCommand::MoveToPosition { position: cursor, select: false }]);
+    let query = reedline::SearchQuery::everything(reedline::SearchDirection::Backward, None);
+    let mut seen = std::collections::HashSet::new();
+    let picks: Vec<Pick> = ed
+        .history()
+        .search(query)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|h| h.command_line)
+        .filter(|c| seen.insert(c.clone()))
+        .map(|c| Pick { text: c.replace('\n', " ↵ "), value: c })
+        .collect();
+    let Some(v) = finder(picks, buffer.trim()) else { return };
+    let end = v.len();
+    ed.run_edit_commands(&[EditCommand::Clear, EditCommand::InsertString(v), EditCommand::MoveToPosition { position: end, select: false }]);
 }
 
 fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32 {
@@ -559,14 +540,21 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
         ReedlineEvent::UntilFound(vec![ReedlineEvent::Menu("completion_menu".into()), ReedlineEvent::MenuNext]),
     );
     keys.add_binding(KeyModifiers::SHIFT, KeyCode::BackTab, ReedlineEvent::MenuPrevious);
-    // fzf's bindings: Ctrl-T finds a completion, Ctrl-R a history entry.
-    keys.add_binding(KeyModifiers::CONTROL, KeyCode::Char('t'), ReedlineEvent::ExecuteHostCommand(FIND_COMPLETION.into()));
+    // fzf's binding: Ctrl-R finds a history entry.
     keys.add_binding(KeyModifiers::CONTROL, KeyCode::Char('r'), ReedlineEvent::ExecuteHostCommand(FIND_HISTORY.into()));
-    // The whole line, not just up to the cursor: `select | from users u` needs the FROM.
+    // A plain list under the cursor: no border, the selection in reverse video
+    // (readable on light and dark themes), matched characters bold cyan.
+    use nu_ansi_term::{Color, Style};
     let menu = IdeMenu::default()
         .with_name("completion_menu")
         .with_marker("")
-        .with_default_border()
+        .with_padding(1)
+        .with_max_completion_height(10)
+        .with_text_style(Style::new())
+        .with_selected_text_style(Style::new().reverse())
+        .with_match_text_style(Style::new().fg(Color::Cyan).bold())
+        .with_selected_match_text_style(Style::new().reverse().bold())
+        // The whole line, not just up to the cursor: `select | from users u` needs the FROM.
         .with_input_mode(reedline::InputMode::FullBuffer);
     let mut ed = Reedline::create()
         .with_history(Box::new(StatementHistory { inner: history, accept: accept.clone() }))
@@ -633,7 +621,7 @@ fn run_interactive(f: &mut dyn Flavor, s: &mut Session, connection: &str) -> i32
                 *words.lock().unwrap() = f.completions();
             }
             // The editor is suspended with its buffer kept; the next read_line resumes it.
-            Signal::HostCommand(which) => run_finder(&mut ed, &which, &words),
+            Signal::HostCommand(which) if which == FIND_HISTORY => find_history(&mut ed),
             Signal::CtrlC => {
                 f.reset(s);
                 entry.clear();

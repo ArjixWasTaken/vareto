@@ -321,14 +321,9 @@ Tab opens a completion popup under the cursor:
   - Redis keys only where a command takes a key
   - in mongosh, databases after `use` and targets after `show`
 
-Two fzf-style finders open below the line:
-- **Ctrl-T** finds a completion for the word at the cursor, searching all of
-  them, not only those starting with what you've typed.
-- **Ctrl-R** finds a past statement.
-
-Both show a query line and ranked matches with the matched characters
-highlighted. Enter puts the pick into the line, and Esc leaves the line as it
-was. A multi-line statement is one history entry, and Up brings it back whole.
+Ctrl-R opens an fzf-style finder over past statements, below the line. It
+shows a query line and ranked matches with the matched characters highlighted.
+Enter puts the pick into the line, and Esc leaves the line as it was. A multi-line statement is one history entry, and Up brings it back whole.
 
 The shell pins one connection in the daemon for as long as it runs, so session state
 behaves as it does in the native client: `USE`, `SET`, `\c`, transactions and Redis
